@@ -1,0 +1,9 @@
+format,configuration,physical_unit,bytes,artifact,performance_claim
+CSV,UTF-8 table,one 5-column table,386,artifacts/example.csv,false
+Raw i64,RAWI64V1 validity + dense LE64,sum of 5 self-contained columns,638,artifacts/rawi64.manifest.tsv,false
+Raw i64 + Zstd,level 3 per column,sum of 5 self-contained columns,326,artifacts/rawi64-zstd.manifest.tsv,false
+PCodec,level 8 + validity wrapper,sum of 5 self-contained columns,341,artifacts/pcodec.manifest.tsv,false
+Parquet,dictionary + Snappy,one 5-column table,1920,artifacts/example.dictionary-snappy.parquet,false
+Parquet,DELTA_BINARY_PACKED + Zstd,one 5-column table,1648,artifacts/example.delta-zstd.parquet,false
+ORC,ORC-Rust RLEv2; no outer compression,one 5-column table,287,artifacts/example.orc,false
+Witness,five selected direct .acp pages,sum of 5 self-contained columns; no table container,2896,artifacts/witness.manifest.tsv,false

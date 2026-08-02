@@ -1,0 +1,19 @@
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+Linux e1-g0001 6.8.0-88-generic #89-Ubuntu SMP PREEMPT_DYNAMIC Sat Oct 11 01:02:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+CPU(s):                               64
+Model name:                           AMD EPYC 9124 16-Core Processor
+L3 cache:                             128 MiB (8 instances)
+NUMA node0 CPU(s):                    0-7,32-39
+NUMA node1 CPU(s):                    8-15,40-47
+NUMA node2 CPU(s):                    16-23,48-55
+NUMA node3 CPU(s):                    24-31,56-63
+TARGET SOURCE   FSTYPE OPTIONS
+/data  /dev/sda xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=128,swidth=640,noquota
+TARGET SOURCE                            FSTYPE OPTIONS
+/      /dev/mapper/ubuntu--vg-ubuntu--lv ext4   rw,relatime,stripe=16
+TARGET   SOURCE FSTYPE OPTIONS
+/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64
+NAME ROTA TYPE  SIZE MODEL
+sda     0 disk 17,5T MR408i-o Gen11
+sdb     0 disk  1,5T MR408i-o Gen11

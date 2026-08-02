@@ -1,0 +1,7 @@
+column	bytes	artifact
+event_time	480	event_time.acp
+meter	384	meter.acp
+status	608	status.acp
+sparse_event	720	sparse_event.acp
+reading	704	reading.acp
+TOTAL	2896	-

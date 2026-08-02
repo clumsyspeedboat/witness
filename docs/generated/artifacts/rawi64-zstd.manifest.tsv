@@ -1,0 +1,7 @@
+column	bytes	artifact
+event_time	84	event_time.rawi64.zst
+meter	68	meter.rawi64.zst
+status	45	status.rawi64.zst
+sparse_event	45	sparse_event.rawi64.zst
+reading	84	reading.rawi64.zst
+TOTAL	326	-

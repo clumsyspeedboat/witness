@@ -1,0 +1,8 @@
+column,certificate,target,metadata_bytes,candidate_blocks,candidate_rows,exact_matches_after_refinement,probe_guarantee
+status,Bloom,99,128,empty,0,empty,CandidateBitmap
+status,min/max,99,64,empty,0,empty,CandidateBitmap
+status,Bloom,3,128,2,4,"[9,12)",CandidateBitmap
+status,min/max,3,64,2,4,"[9,12)",CandidateBitmap
+status,Bloom,1,128,0|1|2|3,16,"[0,3)|[7,9)|[14,16)",CandidateBitmap
+status,min/max,1,64,0|1|2|3,16,"[0,3)|[7,9)|[14,16)",CandidateBitmap
+event_time,sparse fence,1700000420,128,3,2,"[7,8)",CandidateBitmap

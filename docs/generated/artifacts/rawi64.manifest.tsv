@@ -1,0 +1,7 @@
+column	bytes	artifact
+event_time	148	event_time.rawi64
+meter	148	meter.rawi64
+status	148	status.rawi64
+sparse_event	46	sparse_event.rawi64
+reading	148	reading.rawi64
+TOTAL	638	-

@@ -1,0 +1,17 @@
+feature_mode,tier,query,heldout_cells,accuracy,median_regret,p95_regret,max_regret,mean_regret,guard
+preflight_free_estimate,memory_warm,SUM,85,0.952941,1.000000,1.000000,1.065861,1.002671,1000000000.000
+preflight_free_estimate,memory_warm,BETWEEN,85,0.941176,1.000000,1.001195,1.108565,1.002116,2.000
+preflight_free_estimate,mmap_hot,SUM,85,0.952941,1.000000,1.000000,1.061267,1.002464,1000000000.000
+preflight_free_estimate,mmap_hot,BETWEEN,85,0.952941,1.000000,1.000000,1.112017,1.002297,2.000
+preflight_free_estimate,buffered_hot,SUM,85,0.917647,1.000000,1.078419,1.246941,1.008851,1.250
+preflight_free_estimate,buffered_hot,BETWEEN,85,0.905882,1.000000,1.079072,1.244629,1.009172,1.250
+preflight_free_estimate,buffered_drop_cache,SUM,85,0.929412,1.000000,1.001660,1.306147,1.007133,1.000
+preflight_free_estimate,buffered_drop_cache,BETWEEN,85,0.929412,1.000000,1.008610,1.323615,1.007792,1.000
+exact_closure_features,memory_warm,SUM,85,0.964706,1.000000,1.000000,1.065861,1.002164,2.000
+exact_closure_features,memory_warm,BETWEEN,85,0.964706,1.000000,1.000000,1.071390,1.001568,2.000
+exact_closure_features,mmap_hot,SUM,85,0.964706,1.000000,1.000000,1.061267,1.001956,2.000
+exact_closure_features,mmap_hot,BETWEEN,85,0.976471,1.000000,1.000000,1.066573,1.001408,2.000
+exact_closure_features,buffered_hot,SUM,85,0.941176,1.000000,1.030095,1.304849,1.007183,1.020
+exact_closure_features,buffered_hot,BETWEEN,85,0.952941,1.000000,1.000000,1.310722,1.006713,1.020
+exact_closure_features,buffered_drop_cache,SUM,85,0.929412,1.000000,1.022386,1.306147,1.007395,1.020
+exact_closure_features,buffered_drop_cache,BETWEEN,85,0.941176,1.000000,1.004753,1.323615,1.006889,1.000
