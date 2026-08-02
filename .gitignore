@@ -1,0 +1,24 @@
+# Local manuscript; never publish from this repository.
+/paper/
+
+# Rust build output.
+/target/
+
+# Downloaded third-party corpora.
+/experiments/eval/data/
+
+# Regenerated measurement bodies. Canonical CSV summaries remain versioned.
+/experiments/results/predicate_pipeline/pages/
+/experiments/results/predicate_pipeline/parquet/
+/experiments/results/predicate_pipeline_rows16k/pages/
+/experiments/results/predicate_pipeline_rows16k/parquet/
+/experiments/results/real_access/pages/
+/experiments/results/real_access/*.acp
+/experiments/results/real_access/storage_*/
+/experiments/results/access_crossover/*.acp
+
+# Local tools and editor state.
+**/__pycache__/
+*.py[cod]
+*.swp
+.DS_Store

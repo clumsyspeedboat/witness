@@ -1,0 +1,25 @@
+column,recipe,page_bytes,field_id,field,logical_bytes,location,read_granularity,content
+event_time,UnsignedDelta(BitPack),480,0,metadata,320,"[0,320) direct",64,"magic=ACPAGE01, version=3, fields=3, frames=0, dependencies=3, file_length=480"
+event_time,UnsignedDelta(BitPack),480,1,delta.restarts,8,"[320,328) direct",64,i64=[1700000000]
+event_time,UnsignedDelta(BitPack),480,2,bitpack.miniblocks,96,"[384,480) direct",96,"width=6, values=16, block_rows=128, block_bytes=96, hex=00 cf f3 3c cf f3 3c cf f3 3c cf f3 00 00 00 00 00 00 00 00 00 00 00 00 ..."
+meter,FOR(BitPack),384,0,metadata,256,"[0,256) direct",64,"magic=ACPAGE01, version=3, fields=3, frames=0, dependencies=2, file_length=384"
+meter,FOR(BitPack),384,1,for.base,8,"[256,264) direct",8,base=10
+meter,FOR(BitPack),384,2,bitpack.miniblocks,64,"[320,384) direct",64,"width=4, values=16, block_rows=128, block_bytes=64, hex=10 21 22 43 43 55 76 86 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ..."
+status,Dictionary(RLE(BitPack)),608,0,metadata,448,"[0,448) direct",64,"magic=ACPAGE01, version=3, fields=5, frames=0, dependencies=5, file_length=608"
+status,Dictionary(RLE(BitPack)),608,1,dictionary.values,24,"[448,472) direct",64,"i64=[1,2,3]"
+status,Dictionary(RLE(BitPack)),608,2,rle.lengths,24,"[472,496) direct",128,"u32=[3,4,2,3,2,2]"
+status,Dictionary(RLE(BitPack)),608,3,rle.index,24,"[496,520) direct",64,"u32 pairs=[(0, 0),(12, 4),(16, 6)]"
+status,Dictionary(RLE(BitPack)),608,4,bitpack.miniblocks,32,"[576,608) direct",32,"width=2, values=6, block_rows=128, block_bytes=32, hex=84 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ..."
+sparse_event,Nullable(Dictionary(RLE(BitPack))),720,0,metadata,640,"[0,640) direct",64,"magic=ACPAGE01, version=3, fields=7, frames=0, dependencies=8, file_length=720"
+sparse_event,Nullable(Dictionary(RLE(BitPack))),720,1,nullable.validity,2,"[640,642) direct",1,bitmap=0x88 10
+sparse_event,Nullable(Dictionary(RLE(BitPack))),720,2,nullable.rank,12,"[644,656) direct",64,"u32=[0,2,3]"
+sparse_event,Nullable(Dictionary(RLE(BitPack))),720,3,dictionary.values,16,"[656,672) direct",64,"i64=[7,9]"
+sparse_event,Nullable(Dictionary(RLE(BitPack))),720,4,rle.lengths,8,"[672,680) direct",128,"u32=[2,1]"
+sparse_event,Nullable(Dictionary(RLE(BitPack))),720,5,rle.index,16,"[680,696) direct",64,"u32 pairs=[(0, 0),(3, 2)]"
+sparse_event,Nullable(Dictionary(RLE(BitPack))),720,6,bitpack.miniblocks,16,"[704,720) direct",16,"width=1, values=2, block_rows=128, block_bytes=16, hex=02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+reading,Patch(FOR(BitPack)),704,0,metadata,576,"[0,576) direct",64,"magic=ACPAGE01, version=3, fields=6, frames=0, dependencies=6, file_length=704"
+reading,Patch(FOR(BitPack)),704,1,patch.positions,4,"[576,580) direct",128,u32=[9]
+reading,Patch(FOR(BitPack)),704,2,patch.index,16,"[584,600) direct",64,"u32 pairs=[(9, 0),(16, 1)]"
+reading,Patch(FOR(BitPack)),704,3,patch.exceptions,8,"[600,608) direct",64,i64=[10000]
+reading,Patch(FOR(BitPack)),704,4,for.base,8,"[608,616) direct",8,base=100
+reading,Patch(FOR(BitPack)),704,5,bitpack.miniblocks,64,"[640,704) direct",64,"width=4, values=16, block_rows=128, block_bytes=64, hex=10 32 54 76 88 ba dc fe 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ..."

@@ -1,0 +1,5 @@
+# Pinned to the compiler the reported results were produced with, so a fresh
+# clone reproduces the tested build exactly.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

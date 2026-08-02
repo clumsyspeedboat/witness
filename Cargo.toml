@@ -1,0 +1,150 @@
+[package]
+name = "witness"
+version = "0.2.0"
+edition = "2024"
+description = "Research demonstrator: deriving typed invariants from composed columnar encodings and compiling queries that exploit them."
+license = "Apache-2.0"
+repository = "https://github.com/clumsyspeedboat/witness"
+rust-version = "1.96"
+readme = "README.md"
+keywords = ["compression", "columnar", "index", "zonemap", "parquet"]
+categories = ["compression", "database-implementations", "data-structures"]
+
+# Measurements are taken from this profile. Link-time optimization and a
+# single codegen unit apply identically to the Witness arms and to the
+# Parquet/Arrow reference, since both are linked into the same study binary.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# The default build is dependency-free. Physical comparison formats (Arrow,
+# Parquet, ORC, pco, zstd) and the canonical study live behind `experiment`.
+[features]
+default = []
+experiment = [
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:chrono",
+    "dep:parquet",
+    "dep:pco",
+    "dep:zstd",
+    "dep:libc",
+    "dep:bytes",
+    "dep:orc-rust",
+    "dep:csv",
+]
+
+[dependencies]
+arrow-array = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+parquet = { version = "58", features = ["arrow"], optional = true }
+pco = { version = "1.0.2", optional = true }
+zstd = { version = "0.13", optional = true }
+libc = { version = "0.2", optional = true }
+bytes = { version = "1", optional = true }
+orc-rust = { version = "0.8.0", default-features = false, optional = true }
+csv = { version = "1", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[[test]]
+name = "access_compiler_ir"
+path = "tests/access_compiler_ir.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "access_compiler_exec"
+path = "tests/access_compiler_exec.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "access_compiler_generated"
+path = "tests/access_compiler_generated.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "invariant_calculus"
+path = "tests/invariant_calculus.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "certificate_plans"
+path = "tests/certificate_plans.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "documentation_example"
+path = "tests/documentation_example.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "generate_access_compiler"
+path = "src/bin/generate_access_compiler.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "access_compiler_study"
+path = "src/bin/access_compiler_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "access_crossover_study"
+path = "src/bin/access_crossover_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "generate_real_access"
+path = "src/bin/generate_real_access.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "real_access_study"
+path = "src/bin/real_access_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "generate_predicate_access"
+path = "src/bin/generate_predicate_access.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "predicate_pipeline_study"
+path = "src/bin/predicate_pipeline_study.rs"
+required-features = ["experiment"]
+
+# A JSON bridge onto the real pipeline, for the companion notebook and any other
+# interactive driver. Lives outside src/access_compiler/, so it cannot perturb
+# the exact source fingerprint or refreeze a generated kernel.
+[[bin]]
+name = "witness_explore"
+path = "src/bin/witness_explore.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "claim_manifest"
+path = "src/bin/claim_manifest.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "invariant_census_study"
+path = "src/bin/invariant_census_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "certificate_study"
+path = "src/bin/certificate_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "generate_documentation_example"
+path = "src/bin/generate_documentation_example.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "documentation_example"
+path = "src/bin/documentation_example.rs"
+required-features = ["experiment"]
+
+# examples live under experiments/ (single empirical parent dir)

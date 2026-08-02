@@ -1,0 +1,15 @@
+column,group,source,name,rows,nulls,selected_recipe,file_bytes,runner_up_bytes,margin_bytes
+0,"clickbench","hits","c1_CounterID_x1",131072,0,"Frame(Dictionary(BitPack))",351,355,4
+1,"clickbench","hits","c2_RegionID_x1",131072,0,"Frame(Dictionary(RLE(BitPack)))",18507,19606,1099
+2,"clickbench","hits","c3_ResolutionWidth_x1",131072,0,"Frame(Dictionary(RLE(BitPack)))",15534,15885,351
+3,"nab","ambient_temperature","timestamp",7267,0,"Frame(UnsignedDelta(BitPack))",559,565,6
+4,"nab","nyc_taxi","timestamp",10320,0,"Frame(Delta(BitPack))",503,510,7
+5,"nab","nyc_taxi","value_x1",10320,0,"Frame(Delta(BitPack))",18855,18984,129
+6,"nab","twitter_aapl","timestamp",15902,0,"Frame(Delta(BitPack))",521,526,5
+7,"nab","twitter_aapl","value_x1",15902,0,"Frame(Delta(BitPack))",18983,19110,127
+8,"publicbi","Bimbo","c0_Agencia_ID_x1",131072,0,"Frame(Dictionary(BitPack))",690,710,20
+9,"publicbi","Bimbo","c2_Cliente_ID_x1",131072,0,"Frame(FOR(BitPack))",66966,75875,8909
+10,"publicbi","Bimbo","c3_Demanda_uni_equil_x1",131072,0,"Frame(Dictionary(BitPack))",73139,95458,22319
+11,"tpch","lineitem","c0_l_orderkey_x1",131072,0,"Frame(UnsignedDelta(BitPack))",26188,26312,124
+12,"tpch","lineitem","c3_l_linenumber_x1",131072,0,"Frame(FOR(BitPack))",21036,21058,22
+13,"tpch","lineitem","c4_l_quantity_x1",131072,0,"FOR(BitPack)",98624,98700,76

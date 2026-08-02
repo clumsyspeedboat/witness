@@ -1,0 +1,7 @@
+column,query,answer,strategy,guarantee,logical_bytes,delivered_bytes,transferred_bytes,decoded_rows,fused_full_stream_delivered_bytes
+event_time,FILTER BETWEEN 1700000180 AND 1700000360,"[3,7)",SearchMonotone { nulls: NoNulls } -> RefineCandidates,ExactBitmap,336,424,424,8,424
+meter,"SUM rows [4,12)",108,"ReadRange { field: FieldId(1), bytes: Span { start: 0, end: 8 } } -> ReadRange { field: FieldId(2), bytes: Span { start: 2, end: 6 } } -> AggregateEncoded",ExactScalar,268,328,328,8,328
+status,FILTER status = 2,"[3,7)|[12,14)","TranslateDictionaryRange { dictionary: FieldId(1), entries: 3 } -> RefineCandidates -> ReadRange { field: FieldId(4), bytes: Span { start: 0, end: 2 } } -> RefineCandidates",ExactBitmap,510,552,552,16,552
+sparse_event,GET row 7,7,"RefineCandidates -> RefineCandidates -> ReadRange { field: FieldId(6), bytes: Span { start: 0, end: 1 } } -> RefineCandidates -> MaterializeRows",ExactScalar,670,709,709,1,710
+sparse_event,GET row 8 (null),NULL,"RefineCandidates -> RefineCandidates -> ReadRange { field: FieldId(6), bytes: Span { start: 0, end: 1 } } -> RefineCandidates -> MaterializeRows",ExactScalar,641,641,641,1,710
+reading,GET patched row 9,10000,"RefineCandidates -> ReadRange { field: FieldId(4), bytes: Span { start: 0, end: 8 } } -> ReadRange { field: FieldId(5), bytes: Span { start: 4, end: 5 } } -> MaterializeRows",ExactScalar,596,604,604,1,676

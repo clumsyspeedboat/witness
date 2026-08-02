@@ -1,0 +1,8 @@
+generated_utc=2026-08-03T07:46:37Z
+system=Linux e1-g0001 6.8.0-88-generic #89-Ubuntu SMP PREEMPT_DYNAMIC Sat Oct 11 01:02:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+rustc=rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo=cargo 1.96.0 (30a34c682 2026-05-25)
+python=Python 3.13.9
+rows_per_column=131072
+scale_reference_rows=16384
+timing_scope=resident buffers plus cold XFS mechanism control; single-threaded

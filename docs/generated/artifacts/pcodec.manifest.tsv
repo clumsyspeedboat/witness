@@ -1,0 +1,7 @@
+column	bytes	artifact
+event_time	83	event_time.pco
+meter	64	meter.pco
+status	60	status.pco
+sparse_event	58	sparse_event.pco
+reading	76	reading.pco
+TOTAL	341	-
