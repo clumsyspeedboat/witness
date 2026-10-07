@@ -566,17 +566,32 @@ pub fn sum_where(
     {
         return Err("SUM WHERE needs two columns paged alike".into());
     }
-    let page_results = run_pages(selector.pages.len(), threads, |index| {
-        let selector_page = &selector.pages[index];
-        let value_page = &value.pages[index];
+    // Planning reads a few bytes per page, so every page is planned first,
+    // on one thread; only pages left with work are spread over threads, and
+    // a query whose pages are nearly all skipped never pays to start any.
+    let mut counts = PageCounts::default();
+    let mut work = Vec::new();
+    for (index, (selector_page, value_page)) in selector.pages.iter().zip(&value.pages).enumerate()
+    {
         if selector_page.start != value_page.start || selector_page.rows() != value_page.rows() {
             return Err("SUM WHERE pages cover different rows".into());
         }
-        let mut counts = PageCounts::default();
         let mut session =
             ReadSession::new_untracked(&selector_page.column.page, ClosureMode::Selective);
         let action = plan_between(selector_page, &mut session, low, high, planning)?;
         counts.record(&action);
+        if !matches!(action, PageAction::Skip(_)) {
+            work.push((index, action));
+        }
+    }
+    let page_results = run_pages(work.len(), threads, |slot| {
+        let (index, action) = &work[slot];
+        let selector_page = &selector.pages[*index];
+        let value_page = &value.pages[*index];
+        let mut counts = PageCounts::default();
+        let mut session =
+            ReadSession::new_untracked(&selector_page.column.page, ClosureMode::Selective);
+        let action = action.clone();
         // Search and acceptance select a few contiguous spans; a scan or a
         // code translation may select rows anywhere, which a bitmap carries
         // at one bit per row and the value page consumes in one pass.
@@ -625,7 +640,6 @@ pub fn sum_where(
     })?;
     let mut total = 0_i128;
     let mut matched = 0;
-    let mut counts = PageCounts::default();
     for (sum, rows, page_counts) in page_results {
         total = total.checked_add(sum).ok_or("SUM WHERE overflow")?;
         matched += rows;
