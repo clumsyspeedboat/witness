@@ -265,10 +265,10 @@ The research distinction under test is not that Witness has uniquely invented co
 | evidence | current generated result | interpretation |
 |---|---|---|
 | invariant census | 1784 columns, 93 independent sources, 112.3 million rows; 10.4% globally monotone | useful order evidence exists, but is not universal |
-| access-ready predicate path vs Parquet | source median 0.13x; 95% bootstrap CI [0.07, 0.14] | point estimate favors Witness, interval crosses parity |
+| access-ready predicate path vs Parquet | source median 0.14x; 95% bootstrap CI [0.08, 0.14] | point estimate favors Witness, interval crosses parity |
 | access-ready vs size-selected Witness | source median 0.07x; byte premium 2.10x | lower delivered access is purchased with larger files |
 | Bloom absent / rare / frequent | candidate fractions 0.000 / 0.013 / 1.000; modeled-byte ratios 0.172 / 0.186 / 1.172 | membership helps absent and rare probes, then converges to no pruning |
-| cold XFS schedule | 20.44 MiB required in a 27.68 MiB file; 1083 page reads vs 119 coalesced vs 1 full read; latency ratios 1.31x / 1.00x / 1x | byte-minimal page reads lose to call overhead; coalescing recovers sequential behavior |
+| cold XFS schedule | 20.44 MiB required in a 27.68 MiB file; 1083 page reads vs 119 coalesced vs 1 full read; latency ratios 1.28x / 1.00x / 1x | byte-minimal page reads lose to call overhead; coalescing recovers sequential behavior |
 
 Canonical evidence lives in `experiments/results/invariant_census/`, `predicate_pipeline/`, `predicate_pipeline_rows16k/`, `additional_plans.csv`, `certificate_study/`, and `real_access/`. `./reproduce.sh` rebuilds those files, the claim manifest, and this walkthrough.
 
