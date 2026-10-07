@@ -349,7 +349,8 @@ pub fn between(
 }
 
 /// Rows of `rows` that hold a value rather than a null. A nullable root
-/// answers from its validity bits alone; any other root has no nulls.
+/// answers from its validity bits alone, and a tree with no nullable node
+/// has no nulls at all.
 pub fn non_null(
     decoder: &DecoderIr,
     session: &mut ReadSession<'_>,
@@ -374,8 +375,17 @@ pub fn non_null(
             }
             return Ok(ranges);
         }
-        DecoderNode::Rle { .. } | DecoderNode::Patch { .. } => {}
-        _ => return Ok(vec![rows]),
+        // Only a nullable node yields nulls; a tree without one is dense, so
+        // asking a run-length or patched page for its non-null rows decodes
+        // nothing.
+        _ if !decoder
+            .nodes()
+            .iter()
+            .any(|node| matches!(node, DecoderNode::Nullable { .. })) =>
+        {
+            return Ok(vec![rows]);
+        }
+        _ => {}
     }
     scan(decoder, session, rows, &mut |_, row, chunk| {
         if !matches!(chunk, Chunk::Nulls { .. }) {
