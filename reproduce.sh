@@ -14,6 +14,10 @@ need() {
 for command in cargo rustc make python3 sha256sum; do
   need "$command"
 done
+python3 -c 'import duckdb' 2>/dev/null || {
+  printf 'Missing Python package: duckdb (pip install duckdb)\n' >&2
+  exit 1
+}
 
 DATA=experiments/eval/data
 make --no-print-directory fetch-study
@@ -63,9 +67,13 @@ printf '3/8 membership-certificate controls\n'
 printf '4/8 physical access and storage schedules\n'
 ./experiments/run_real_access.sh
 
-printf '5/8 paged queries and 60 M-row scaling\n'
+printf '5/8 paged queries, page sizes, 60 M-row scaling, and DuckDB\n'
 cargo run --locked --release --features experiment --bin paged_study
+for rows in 4096 65536; do
+  WITNESS_PAGE_ROWS=$rows cargo run --locked --release --features experiment --bin paged_study
+done
 cargo run --locked --release --features experiment --bin paged_scale_study
+python3 experiments/duckdb_baseline.py
 
 printf '6/8 auxiliary plans and claim manifest\n'
 cargo run --locked --release --features experiment --bin claim_manifest -- --measure-additional
@@ -85,6 +93,7 @@ printf '8/8 provenance and checksums\n'
   printf 'rustc='; rustc --version
   printf 'cargo='; cargo --version
   printf 'python='; python3 --version
+  printf 'duckdb='; python3 -c 'import duckdb; print(duckdb.__version__)'
   printf 'rows_per_column=131072\nscale_reference_rows=16384\n'
   printf 'timing_scope=resident buffers plus cold XFS mechanism control; single-threaded\n'
 } > "$RESULTS/PROVENANCE.txt"
@@ -95,7 +104,9 @@ printf '8/8 provenance and checksums\n'
     experiments/results/certificate_study/*.csv \
     experiments/results/real_access/*.csv \
     experiments/results/paged_study/*.csv \
+    experiments/results/paged_study_rows*/*.csv \
     experiments/results/paged_scale/*.csv \
+    experiments/results/duckdb/*.csv \
     "$PAIRED_16K"/*.csv \
     experiments/results/additional_plans.csv \
     experiments/results/claim_manifest.csv \
