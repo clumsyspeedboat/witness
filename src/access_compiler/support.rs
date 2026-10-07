@@ -1,4 +1,4 @@
-use super::{FieldId, ReadSession, SerializedPage, Span};
+use super::{BoundSource, FieldId, ReadSession, SerializedPage, Span};
 
 pub fn load_metadata(page: &SerializedPage, session: &mut ReadSession<'_>) -> Result<(), String> {
     let metadata = &page.layout().fields[page.layout().metadata.0];
@@ -160,6 +160,33 @@ pub fn push_range(ranges: &mut Vec<Span>, start: usize, end: usize) {
         last.end = end;
     } else {
         ranges.push(Span { start, end });
+    }
+}
+
+/// The interval a structural bound proves, read from the fields it names.
+/// Reads go through `session`, so the evidence a plan consults is accounted
+/// like any other access.
+pub fn bound_interval(
+    session: &mut ReadSession<'_>,
+    source: BoundSource,
+) -> Result<(i128, i128), String> {
+    match source {
+        BoundSource::OffsetFromBase { base, width } => {
+            if width > 64 {
+                return Err("bound width exceeds 64 bits".into());
+            }
+            let low = i128::from(session.read_i64(base, 0)?);
+            Ok((low, low + ((1_i128 << width) - 1)))
+        }
+        BoundSource::TableEnds { table, entries } => {
+            if entries == 0 {
+                return Err("bounded dictionary is empty".into());
+            }
+            Ok((
+                i128::from(session.read_i64(table, 0)?),
+                i128::from(session.read_i64(table, entries - 1)?),
+            ))
+        }
     }
 }
 

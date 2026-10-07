@@ -616,9 +616,6 @@ fn encode_nullable(
             compact.push(value);
         }
     }
-    if compact.is_empty() {
-        return Err("all-null pages are outside this compiler microprototype".into());
-    }
     let mut rank_bytes = Vec::new();
     let mut rank = 0_u32;
     for block_start in (0..logical_len).step_by(rank_interval) {

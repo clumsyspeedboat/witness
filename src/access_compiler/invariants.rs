@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{CheckedInvariants, DecoderIr, DecoderNode, DeltaCoding, LayoutIr, NodeId};
+use super::{CheckedInvariants, DecoderIr, DecoderNode, DeltaCoding, FieldId, LayoutIr, NodeId};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum NullPlacement {
@@ -37,9 +37,29 @@ pub enum Assumption {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ValueInvariant {
     NonDecreasing,
-    PiecewiseNonDecreasing { max_rows: usize },
+    PiecewiseNonDecreasing {
+        max_rows: usize,
+    },
     NullPlacement(NullPlacement),
-    UnsignedRange { width: u8 },
+    UnsignedRange {
+        width: u8,
+    },
+    /// Every non-null value lies in an interval the page itself spells out;
+    /// `BoundSource` names the fields a plan reads to learn it.
+    Bounded(BoundSource),
+    /// No row of the node is non-null.
+    AllNull,
+}
+
+/// Where a structural value bound lives in the page. Neither source stores a
+/// bound for its own sake: both are fields the decoder already needs.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BoundSource {
+    /// `[base, base + 2^width - 1]`: a frame-of-reference base over unsigned
+    /// codes of at most `width` bits.
+    OffsetFromBase { base: FieldId, width: u8 },
+    /// `[table[0], table[entries - 1]]`: a sorted, deduplicated dictionary.
+    TableEnds { table: FieldId, entries: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -256,7 +276,19 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
                 [],
             );
         }
-        DecoderNode::For { values, .. } => {
+        DecoderNode::For { base, values } => {
+            if let Some(width) = unsigned_width(output, *values) {
+                output.insert(
+                    node_id,
+                    FactScope::AllRows,
+                    Property::Value(ValueInvariant::Bounded(BoundSource::OffsetFromBase {
+                        base: *base,
+                        width,
+                    })),
+                    Evidence::Structural("for_base_over_unsigned_width"),
+                    [Assumption::CheckedArithmetic],
+                );
+            }
             output.insert(
                 node_id,
                 FactScope::Mapping,
@@ -314,9 +346,22 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
             }
         }
         DecoderNode::Dictionary {
-            ids, sorted_unique, ..
+            ids,
+            dictionary,
+            entries,
+            sorted_unique,
         } => {
             if *sorted_unique {
+                output.insert(
+                    node_id,
+                    FactScope::AllRows,
+                    Property::Value(ValueInvariant::Bounded(BoundSource::TableEnds {
+                        table: *dictionary,
+                        entries: *entries,
+                    })),
+                    Evidence::Structural("sorted_dictionary_ends"),
+                    [Assumption::SortedUniqueDictionary],
+                );
                 output.insert(
                     node_id,
                     FactScope::Mapping,
@@ -340,6 +385,7 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
             ..
         } => {
             transfer_monotone(*values, node_id, FactScope::AllRows, output);
+            transfer_bounds(*values, node_id, FactScope::AllRows, output);
             output.insert(
                 node_id,
                 FactScope::Physical,
@@ -362,9 +408,20 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
         DecoderNode::Nullable {
             values,
             rank_interval,
+            nonnull_len,
             ..
         } => {
             transfer_monotone(*values, node_id, FactScope::NonNullRows, output);
+            transfer_bounds(*values, node_id, FactScope::NonNullRows, output);
+            if *nonnull_len == 0 {
+                output.insert(
+                    node_id,
+                    FactScope::AllRows,
+                    Property::Value(ValueInvariant::AllNull),
+                    Evidence::Structural("nullable_without_values"),
+                    [],
+                );
+            }
             output.insert(
                 node_id,
                 FactScope::Physical,
@@ -391,6 +448,35 @@ fn transfer_monotone(
             Property::Value(ValueInvariant::NonDecreasing),
             Evidence::Structural("order_preserving_composition"),
             [Assumption::CheckedArithmetic],
+        );
+    }
+}
+
+/// A parent that only selects or repeats child values (run-length expansion,
+/// null placement) keeps every child bound, with the child's assumptions.
+fn transfer_bounds(
+    child: NodeId,
+    parent: NodeId,
+    parent_scope: FactScope,
+    output: &mut InvariantSet,
+) {
+    let bounds = output
+        .iter()
+        .filter(|fact| fact.node == child && fact.scope == FactScope::AllRows)
+        .filter_map(|fact| match fact.property {
+            Property::Value(ValueInvariant::Bounded(source)) => {
+                Some((source, fact.assumptions.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (source, assumptions) in bounds {
+        output.insert(
+            parent,
+            parent_scope,
+            Property::Value(ValueInvariant::Bounded(source)),
+            Evidence::Structural("bounded_composition"),
+            assumptions,
         );
     }
 }

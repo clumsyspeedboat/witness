@@ -34,7 +34,7 @@ pub use interpreter::{
     execute_interpreted,
 };
 pub use invariants::{
-    AccessInvariant, Assumption, Evidence, FactScope, InvariantFact, InvariantSet,
+    AccessInvariant, Assumption, BoundSource, Evidence, FactScope, InvariantFact, InvariantSet,
     MappingInvariant, NullPlacement, Property, ValueInvariant, derive_invariants,
 };
 pub use layout::{
@@ -53,7 +53,7 @@ pub use static_baseline::{
     static_monotone_filter, static_piecewise_monotone_filter, static_sum,
 };
 pub use support::{
-    BATCH_ROWS, find_position, load_metadata, locate_indexed, lower_bound_position,
+    BATCH_ROWS, bound_interval, find_position, load_metadata, locate_indexed, lower_bound_position,
     nullable_is_valid, nullable_prefix_rank, nullable_rank, push_batch_matches, push_range,
     sum_batch, unzigzag,
 };
