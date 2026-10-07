@@ -74,6 +74,7 @@ python3 experiments/duckdb_baseline.py
 
 printf '6/8 auxiliary plans and claim manifest\n'
 cargo run --locked --release --features experiment --bin claim_manifest -- --measure-additional
+python3 experiments/render_paper_claims.py
 
 printf '7/8 numerical walkthrough and physical artifacts\n'
 cargo run --locked --release --features experiment --bin generate_documentation_example

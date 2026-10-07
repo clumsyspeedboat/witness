@@ -19,6 +19,7 @@ fetch-study:
 
 claims:
 	cargo run --locked --release --features experiment --bin claim_manifest
+	python3 experiments/render_paper_claims.py
 
 walkthrough: claims
 	cargo run --locked --release --features experiment --bin generate_documentation_example

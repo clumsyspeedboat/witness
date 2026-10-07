@@ -106,21 +106,27 @@ fn paper_macros(tex: &str) -> Vec<(String, String)> {
 /// block is the one place a number could drift from the evidence without any
 /// study failing, so bind every `\Wit` macro to the generated manifest.
 ///
-/// Every `.tex` in `paper/` is read, so it does not matter whether the claim
-/// block lives in the manuscript or in a generated file it inputs.
+/// Every `.tex` below `paper/` is read, including conference subdirectories,
+/// so it does not matter where the manuscript's generated claim file lives.
 ///
 /// The manuscript is not part of the public artifact, so this check is a no-op
 /// wherever `paper/` is absent rather than a failure for anyone reproducing.
 #[test]
 fn claim_bearing_paper_macros_match_the_manifest() {
-    let Ok(entries) = fs::read_dir("paper") else {
+    if !std::path::Path::new("paper").exists() {
         return;
-    };
+    }
     let mut sources: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|suffix| suffix == "tex") {
-            sources.push(fs::read_to_string(&path).unwrap());
+    let mut directories = vec![std::path::PathBuf::from("paper")];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                directories.push(path);
+            } else if path.extension().is_some_and(|suffix| suffix == "tex") {
+                sources.push(fs::read_to_string(&path).unwrap());
+            }
         }
     }
     if sources.is_empty() {
@@ -148,11 +154,20 @@ fn claim_bearing_paper_macros_match_the_manifest() {
             None => wrong.push(format!(
                 "{name}: defined in the paper, absent from the manifest"
             )),
-            Some(expected) if normalized(expected) != normalized(value) => wrong.push(format!(
-                "{name}: paper has {:?}, manifest has {:?}",
-                normalized(value),
-                normalized(expected)
-            )),
+            // Rendering an integer with thousands separators does not change
+            // the claim. Only normalize whole integer values, not table CSVs.
+            Some(expected)
+                if normalized(expected) != normalized(value)
+                    && !(expected.chars().all(|ch| ch.is_ascii_digit() || ch == ',')
+                        && value.chars().all(|ch| ch.is_ascii_digit() || ch == ',')
+                        && expected.replace(',', "") == value.replace(',', "")) =>
+            {
+                wrong.push(format!(
+                    "{name}: paper has {:?}, manifest has {:?}",
+                    normalized(value),
+                    normalized(expected)
+                ))
+            }
             Some(_) => {}
         }
     }
