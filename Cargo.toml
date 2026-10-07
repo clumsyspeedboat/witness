@@ -32,6 +32,7 @@ experiment = [
     "dep:bytes",
     "dep:orc-rust",
     "dep:csv",
+    "dep:rayon",
 ]
 
 [dependencies]
@@ -45,6 +46,7 @@ libc = { version = "0.2", optional = true }
 bytes = { version = "1", optional = true }
 orc-rust = { version = "0.8.0", default-features = false, optional = true }
 csv = { version = "1", optional = true }
+rayon = { version = "1.12", optional = true }
 
 [dev-dependencies]
 proptest = "1"

@@ -9,8 +9,7 @@
 //! a fact that holds on some pages but not the column, a column that grows
 //! by appending pages, and work that runs on pages in parallel.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use super::{
     Authorization, ClosureMode, DecoderNode, EncodedColumn, FactScope, InputColumn, InvariantSet,
@@ -866,8 +865,28 @@ pub fn sum_where(
     Ok((total, matched, counts))
 }
 
-/// Fewest pages a thread is started for.
+/// Fewest pages assigned per worker; smaller queries stay on the caller.
 const MIN_PAGES_PER_THREAD: usize = 16;
+
+/// Small batches amortize queue locking while balancing uneven page work.
+const PAGES_PER_BATCH: usize = 4;
+
+/// One bounded pool shared by queries. Single-threaded and small queries do
+/// not initialize it. Explicit sizing avoids inheriting Rayon environment
+/// settings, and query task counts still honor the requested thread limit.
+fn page_workers() -> Result<&'static rayon::ThreadPool, String> {
+    static WORKERS: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+    WORKERS
+        .get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(std::thread::available_parallelism().map_or(1, usize::from))
+                .thread_name(|index| format!("witness-page-{index}"))
+                .build()
+                .map_err(|error| format!("cannot start page workers: {error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 /// Rows a fused pass may decode per span it saves: a span costs one scan
 /// dispatch, about as much as decoding this many rows in a batch.
@@ -919,31 +938,32 @@ where
     T: Send,
     F: Fn(usize) -> Result<T, String> + Sync,
 {
-    // A thread costs about as much to start as a few pages cost to plan and
-    // scan, so small columns use fewer threads than asked.
+    // Dispatch and synchronization still cost more than tiny page searches,
+    // even with persistent workers, so small queries run on the caller.
     let threads = threads.min(pages / MIN_PAGES_PER_THREAD).max(1);
     if threads <= 1 {
         return (0..pages).map(&work).collect();
     }
-    let next = AtomicUsize::new(0);
-    let slots = Mutex::new((0..pages).map(|_| None).collect::<Vec<_>>());
-    std::thread::scope(|scope| {
-        for _ in 0..threads.min(pages) {
-            scope.spawn(|| {
+    let workers = page_workers()?;
+    let mut slots = (0..pages).map(|_| None).collect::<Vec<_>>();
+    let batches = Mutex::new(slots.chunks_mut(PAGES_PER_BATCH).enumerate());
+    workers.in_place_scope(|scope| {
+        for _ in 0..threads.min(workers.current_num_threads()) {
+            scope.spawn(|_| {
                 loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= pages {
+                    // Each worker owns its output slice until the scope ends;
+                    // no lock is needed to publish individual page results.
+                    let Some((batch, slots)) = batches.lock().unwrap().next() else {
                         break;
+                    };
+                    for (offset, slot) in slots.iter_mut().enumerate() {
+                        *slot = Some(work(batch * PAGES_PER_BATCH + offset));
                     }
-                    let result = work(index);
-                    slots.lock().unwrap()[index] = Some(result);
                 }
             });
         }
     });
     slots
-        .into_inner()
-        .unwrap()
         .into_iter()
         .map(|slot| slot.unwrap_or_else(|| Err("page was not executed".into())))
         .collect()
@@ -1028,4 +1048,60 @@ fn reread(
         return Err("page bound changed between planning and checking".into());
     }
     Ok(interval)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_pages;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn page_workers_preserve_order_and_visit_each_page_once() {
+        let visits = (0..131).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let results = run_pages(visits.len(), 3, |page| {
+            let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(running, Ordering::SeqCst);
+            visits[page].fetch_add(1, Ordering::Relaxed);
+            std::thread::yield_now();
+            active.fetch_sub(1, Ordering::SeqCst);
+            // Results need only be Send, not Sync.
+            Ok(Cell::new(page))
+        })
+        .unwrap();
+        assert_eq!(
+            results
+                .into_iter()
+                .map(Cell::into_inner)
+                .collect::<Vec<_>>(),
+            (0..131).collect::<Vec<_>>()
+        );
+        assert!(
+            visits
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 1)
+        );
+        assert!((1..=3).contains(&peak.load(Ordering::SeqCst)));
+    }
+
+    #[test]
+    fn page_workers_return_the_first_error_in_page_order_and_remain_usable() {
+        let result = run_pages(131, 4, |page| {
+            if page == 17 || page == 117 {
+                Err(format!("failed page {page}"))
+            } else {
+                Ok(page)
+            }
+        });
+        assert_eq!(result.unwrap_err(), "failed page 17");
+        assert_eq!(run_pages(131, 4, Ok).unwrap(), (0..131).collect::<Vec<_>>());
+        assert_eq!(run_pages(3, 0, Ok).unwrap(), vec![0, 1, 2]);
+        assert!(
+            run_pages::<usize, _>(0, 64, |_| panic!("empty query"))
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
