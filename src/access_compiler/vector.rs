@@ -173,15 +173,16 @@ pub fn between_selection(
     }
     let (low, high) = (i128::from(low), i128::from(high));
     let mut selection = Selection::empty(rows);
-    // Bit-packed codes, under a frame-of-reference base or not, are compared
-    // against the predicate shifted by the base, which is exact and skips
-    // adding the base to every value.
-    if let Some(packed) = Packed::at_root(decoder, session)? {
+    // Bit-packed codes, under a frame-of-reference base or not and with or
+    // without nulls, are compared against the predicate shifted by the base,
+    // which is exact and skips adding the base to every value.
+    if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)? {
         if rows.end > decoder.len()? {
             return Err("vector scan exceeds the column".into());
         }
-        if let Some((first, last)) = packed.code_range(low - packed.base, high - packed.base) {
-            packed.select(session, rows, first, last, &mut selection)?;
+        let base = lane.packed.base;
+        if let Some(range) = lane.packed.code_range(low - base, high - base) {
+            lane.select(session, rows, range, &mut selection)?;
         }
         return Ok(selection);
     }
@@ -218,6 +219,13 @@ pub fn dictionary_selection(
     let mut selection = Selection::empty(rows);
     let low_id = table_bound(session, dictionary, entries, low, false)?;
     let high_id = table_bound(session, dictionary, entries, high, true)?;
+    if let Some(lane) = Lane::at_root(decoder, session, Codes::SortedDictionary)? {
+        // Ids are read even when none can match, to confirm that every one
+        // lies inside the table, as a decode would.
+        let range = (low_id < high_id).then_some((low_id as u64, high_id as u64 - 1));
+        lane.select_ids(session, rows, range, entries as u64, &mut selection)?;
+        return Ok(selection);
+    }
     if low_id < high_id {
         let (low_id, last_id) = (low_id as i128, high_id as i128 - 1);
         scan_node(
@@ -259,8 +267,8 @@ pub fn sum_selection(
     let Some(hull) = selection.hull() else {
         return Ok(0);
     };
-    if let Some(packed) = Packed::at_root(decoder, session)? {
-        return packed.sum_selection(session, hull, selection);
+    if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)? {
+        return lane.sum_selection(session, hull, selection);
     }
     let mut total = 0_i128;
     scan(decoder, session, hull, &mut |_, row, chunk| {
@@ -302,10 +310,11 @@ pub enum CodeCompare {
 }
 
 /// SUM and count of `value` over the rows in `rows` whose `selector` value
-/// lies in `[low, high] = bounds`, in one pass over both pages' codes: each row is
-/// compared, masked and added without a branch, and no selection is built.
-/// `None` when either page is not bit-packed codes in the form `compare`
-/// names, and the caller decodes instead.
+/// lies in `[low, high] = bounds`, in one pass over both pages' codes: each
+/// row is compared, masked and added without a branch, and no selection is
+/// built. Either page may hold nulls. `None` when either page is not
+/// bit-packed codes in the form `compare` names, and the caller decodes
+/// instead.
 pub fn fused_sum_between(
     selector: &DecoderIr,
     selector_session: &mut ReadSession<'_>,
@@ -321,78 +330,92 @@ pub fn fused_sum_between(
     if rows.end > selector.len()? || rows.end > value.len()? {
         return Err("vector scan exceeds the column".into());
     }
-    let Some(sums) = Packed::at_root(value, value_session)? else {
+    if rows.start >= rows.end {
+        return Ok(Some((0, 0)));
+    }
+    let Some(sums) = Lane::at_root(value, value_session, Codes::Offset)? else {
         return Ok(None);
     };
     let (codes, range, entries) = match compare {
         CodeCompare::Offset => {
-            let Some(codes) = Packed::at_root(selector, selector_session)? else {
+            let Some(codes) = Lane::at_root(selector, selector_session, Codes::Offset)? else {
                 return Ok(None);
             };
-            let range =
-                codes.code_range(i128::from(low) - codes.base, i128::from(high) - codes.base);
+            let base = codes.packed.base;
+            let range = codes
+                .packed
+                .code_range(i128::from(low) - base, i128::from(high) - base);
             (codes, range, None)
         }
         CodeCompare::SortedDictionary => {
-            let &DecoderNode::Dictionary {
-                ids,
-                dictionary,
-                entries,
-                sorted_unique: true,
-            } = selector.node(selector.root())?
+            let Some(codes) = Lane::at_root(selector, selector_session, Codes::SortedDictionary)?
             else {
                 return Ok(None);
             };
-            let Some(codes) = Packed::at_node(selector, ids)? else {
-                return Ok(None);
-            };
+            let (dictionary, entries) =
+                codes.dictionary.ok_or("dictionary lane lacks its table")?;
             let first = table_bound(selector_session, dictionary, entries, low, false)?;
             let end = table_bound(selector_session, dictionary, entries, high, true)?;
-            let range = (first < end).then(|| (first as u64, end as u64 - 1));
+            let range = (first < end).then_some((first as u64, end as u64 - 1));
             (codes, range, Some(entries as u64))
         }
     };
     // With no code in range nothing matches, but dictionary ids are still
     // read to confirm they lie inside the table, as a decode would.
+    if range.is_none() && entries.is_none() {
+        return Ok(Some((0, 0)));
+    }
     let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
     let mut selected = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
+    let mut value_batch = LaneBatch::default();
+    let mut value_cursor = sums.cursor(value_session, rows.start)?;
     let mut total = 0_i128;
     let mut matched = 0_usize;
-    let mut outside = false;
-    codes.scan(selector_session, rows, |row, selector_codes| {
+    let mut outside = 0_u64;
+    let mut selector_cursor = codes.cursor(selector_session, rows.start)?;
+    let mut selector_batch = LaneBatch::default();
+    let mut row = rows.start;
+    while row < rows.end {
+        let end = (row + BATCH_ROWS).min(rows.end);
+        let batch = Span::new(row, end)?;
+        codes.fill(
+            selector_session,
+            &mut selector_cursor,
+            batch,
+            &mut selector_batch,
+        )?;
         if let Some(entries) = entries {
-            outside |= selector_codes.iter().any(|&id| id >= entries);
+            outside |= selector_batch.fold(0, |bad, code, valid| {
+                bad | (u64::from(code >= entries) & valid)
+            });
         }
-        if range.is_none() {
-            return Ok(());
-        }
-        selected.clear();
-        selected.extend(
-            selector_codes
-                .iter()
-                .map(|&code| u64::from(code.wrapping_sub(first) <= spread)),
-        );
-        let batch = Span::new(row, row + selector_codes.len())?;
-        let mut taken = 0_u64;
-        let mut sum = 0_u64;
-        sums.scan(value_session, batch, |_, value_codes| {
-            for (&take, &code) in selected.iter().zip(value_codes) {
-                sum += code & take.wrapping_neg();
+        if range.is_some() {
+            selected.clear();
+            selected.extend(
+                selector_batch
+                    .map(|code, valid| u64::from(code.wrapping_sub(first) <= spread) & valid),
+            );
+            sums.fill(value_session, &mut value_cursor, batch, &mut value_batch)?;
+            let (mut sum, mut summed, mut taken) = (0_u64, 0_u64, 0_u64);
+            for (index, &take) in selected.iter().enumerate() {
+                let (code, valid) = value_batch.at(index);
+                let add = take & valid;
+                sum += code & add.wrapping_neg();
+                summed += add;
                 taken += take;
             }
-            Ok(())
-        })?;
-        total = sums.add(total, taken as usize, sum)?;
-        matched += taken as usize;
-        Ok(())
-    })?;
-    if outside {
+            total = sums.packed.add(total, summed as usize, sum)?;
+            matched += taken as usize;
+        }
+        row = end;
+    }
+    if outside != 0 {
         return Err("dictionary id is outside table".into());
     }
     Ok(Some((total, matched)))
 }
 
-/// A root of bit-packed codes, optionally offset by a frame-of-reference
+/// A node of bit-packed codes, optionally offset by a frame-of-reference
 /// base: the shape most pages take. Its kernels work on 64-bit codes and add
 /// the base once per batch rather than once per row. Codes at most
 /// `SUMMABLE_WIDTH` bits wide sum without overflow over a batch.
@@ -400,6 +423,7 @@ struct Packed {
     base: i128,
     stream: FieldId,
     width: u8,
+    len: usize,
     miniblock_rows: usize,
     miniblock_bytes: usize,
 }
@@ -409,9 +433,18 @@ const SUMMABLE_WIDTH: u8 = 53;
 
 impl Packed {
     fn at_root(decoder: &DecoderIr, session: &mut ReadSession<'_>) -> Result<Option<Self>, String> {
-        let (base, codes) = match *decoder.node(decoder.root())? {
+        Self::at_offset(decoder, session, decoder.root())
+    }
+
+    /// Codes at `node`, under a frame-of-reference base or bare.
+    fn at_offset(
+        decoder: &DecoderIr,
+        session: &mut ReadSession<'_>,
+        node: NodeId,
+    ) -> Result<Option<Self>, String> {
+        let (base, codes) = match *decoder.node(node)? {
             DecoderNode::For { base, values } => (Some(base), values),
-            _ => (None, decoder.root()),
+            _ => (None, node),
         };
         let Some(mut packed) = Self::at_node(decoder, codes)? else {
             return Ok(None);
@@ -427,9 +460,9 @@ impl Packed {
         let DecoderNode::BitUnpack {
             stream,
             width,
+            len,
             miniblock_rows,
             miniblock_bytes,
-            ..
         } = *decoder.node(node)?
         else {
             return Ok(None);
@@ -438,6 +471,7 @@ impl Packed {
             base: 0,
             stream,
             width,
+            len,
             miniblock_rows,
             miniblock_bytes,
         }))
@@ -449,6 +483,26 @@ impl Packed {
         let largest = (1_i128 << self.width) - 1;
         let (first, last) = (low.max(0), high.min(largest));
         (first <= last).then_some((first as u64, last as u64))
+    }
+
+    /// Replaces `codes` with the codes of `rows`.
+    fn unpack(
+        &self,
+        session: &mut ReadSession<'_>,
+        rows: Span,
+        codes: &mut Vec<u64>,
+    ) -> Result<(), String> {
+        if rows.end > self.len {
+            return Err("bit-unpack scan exceeds its stream".into());
+        }
+        session.unpack_bits_into(
+            self.stream,
+            rows,
+            self.width,
+            self.miniblock_rows,
+            self.miniblock_bytes,
+            codes,
+        )
     }
 
     /// Streams `rows` as batches of codes, each with the row it starts at.
@@ -472,14 +526,7 @@ impl Packed {
         let mut row = rows.start;
         while row < rows.end {
             let end = (row + BATCH_ROWS).min(rows.end);
-            session.unpack_bits_into(
-                self.stream,
-                Span::new(row, end)?,
-                self.width,
-                self.miniblock_rows,
-                self.miniblock_bytes,
-                &mut codes,
-            )?;
+            self.unpack(session, Span::new(row, end)?, &mut codes)?;
             sink(row, &codes)?;
             row = end;
         }
@@ -505,6 +552,203 @@ impl Packed {
         }
         Ok(total)
     }
+}
+
+/// Which codes a lane carries: values offset from a base, or ids into a
+/// sorted dictionary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Codes {
+    Offset,
+    SortedDictionary,
+}
+
+/// Where a nullable page records which rows hold a value.
+#[derive(Clone, Copy, Debug)]
+struct Validity {
+    bits: FieldId,
+    rank_index: FieldId,
+    rank_interval: usize,
+}
+
+/// Bit-packed codes per row, maybe behind a validity bitmap: a page stores
+/// the codes of its non-null rows only, and a lane expands them to row
+/// positions one batch at a time, so a page with scattered nulls costs one
+/// unpack per batch rather than one per run of values.
+struct Lane {
+    packed: Packed,
+    validity: Option<Validity>,
+    /// The sorted table the codes index, for `Codes::SortedDictionary`.
+    dictionary: Option<(FieldId, usize)>,
+}
+
+/// One batch of a lane: a code per row, and per row 1 if it holds a value
+/// and 0 if it is null. A null row's code is meaningless. A dense batch
+/// leaves `valid` empty.
+#[derive(Default)]
+struct LaneBatch {
+    codes: Vec<u64>,
+    valid: Vec<u64>,
+    compact: Vec<u64>,
+}
+
+impl LaneBatch {
+    fn at(&self, index: usize) -> (u64, u64) {
+        (
+            self.codes[index],
+            self.valid.get(index).copied().unwrap_or(1),
+        )
+    }
+
+    fn map<'a>(&'a self, f: impl Fn(u64, u64) -> u64 + 'a) -> impl Iterator<Item = u64> + 'a {
+        let dense = self.valid.is_empty();
+        self.codes
+            .iter()
+            .enumerate()
+            .map(move |(index, &code)| f(code, if dense { 1 } else { self.valid[index] }))
+    }
+
+    fn fold(&self, init: u64, f: impl Fn(u64, u64, u64) -> u64) -> u64 {
+        if self.valid.is_empty() {
+            self.codes.iter().fold(init, |acc, &code| f(acc, code, 1))
+        } else {
+            self.codes
+                .iter()
+                .zip(&self.valid)
+                .fold(init, |acc, (&code, &valid)| f(acc, code, valid))
+        }
+    }
+}
+
+/// A lane's position: the next row's index among the stored codes.
+struct LaneCursor {
+    compact: usize,
+}
+
+impl Lane {
+    fn at_root(
+        decoder: &DecoderIr,
+        session: &mut ReadSession<'_>,
+        codes: Codes,
+    ) -> Result<Option<Self>, String> {
+        let mut node = decoder.root();
+        let mut validity = None;
+        if let DecoderNode::Nullable {
+            validity: bits,
+            rank_index,
+            values,
+            rank_interval,
+            ..
+        } = *decoder.node(node)?
+        {
+            validity = Some(Validity {
+                bits,
+                rank_index,
+                rank_interval,
+            });
+            node = values;
+        }
+        let (packed, dictionary) = match codes {
+            Codes::Offset => (Packed::at_offset(decoder, session, node)?, None),
+            Codes::SortedDictionary => {
+                let &DecoderNode::Dictionary {
+                    ids,
+                    dictionary,
+                    entries,
+                    sorted_unique: true,
+                } = decoder.node(node)?
+                else {
+                    return Ok(None);
+                };
+                (Packed::at_node(decoder, ids)?, Some((dictionary, entries)))
+            }
+        };
+        Ok(packed.map(|packed| Self {
+            packed,
+            validity,
+            dictionary,
+        }))
+    }
+
+    fn cursor(&self, session: &mut ReadSession<'_>, row: usize) -> Result<LaneCursor, String> {
+        let compact = match self.validity {
+            Some(validity) => nullable_prefix_rank(
+                session,
+                validity.bits,
+                validity.rank_index,
+                row,
+                validity.rank_interval,
+            )?,
+            None => row,
+        };
+        Ok(LaneCursor { compact })
+    }
+
+    /// Fills `batch` with the rows `rows`, which must follow the rows the
+    /// cursor last filled.
+    fn fill(
+        &self,
+        session: &mut ReadSession<'_>,
+        cursor: &mut LaneCursor,
+        rows: Span,
+        batch: &mut LaneBatch,
+    ) -> Result<(), String> {
+        let Some(validity) = self.validity else {
+            batch.valid.clear();
+            self.packed.unpack(session, rows, &mut batch.codes)?;
+            cursor.compact = rows.end;
+            return Ok(());
+        };
+        let first_byte = rows.start / 8;
+        let bytes = session.read_range(
+            validity.bits,
+            Span::new(first_byte, (rows.end - 1) / 8 + 1)?,
+        )?;
+        batch.valid.clear();
+        batch.valid.extend(
+            (rows.start..rows.end)
+                .map(|row| u64::from(bytes[row / 8 - first_byte] >> (row % 8) & 1)),
+        );
+        let present = batch.valid.iter().sum::<u64>() as usize;
+        let compact = Span::new(cursor.compact, cursor.compact + present)?;
+        self.packed.unpack(session, compact, &mut batch.compact)?;
+        cursor.compact = compact.end;
+        batch.codes.clear();
+        if present == 0 {
+            batch.codes.resize(rows.len(), 0);
+            return Ok(());
+        }
+        // Each row takes the next stored code; a null row repeats the one
+        // before it, which the validity mask then discards.
+        let last = present - 1;
+        let mut next = 0_usize;
+        for &valid in &batch.valid {
+            batch.codes.push(batch.compact[next.min(last)]);
+            next += valid as usize;
+        }
+        Ok(())
+    }
+
+    /// Streams `rows` in batches, each with the row it starts at.
+    fn scan(
+        &self,
+        session: &mut ReadSession<'_>,
+        rows: Span,
+        mut sink: impl FnMut(usize, &LaneBatch) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if rows.start >= rows.end {
+            return Ok(());
+        }
+        let mut cursor = self.cursor(session, rows.start)?;
+        let mut batch = LaneBatch::default();
+        let mut row = rows.start;
+        while row < rows.end {
+            let end = (row + BATCH_ROWS).min(rows.end);
+            self.fill(session, &mut cursor, Span::new(row, end)?, &mut batch)?;
+            sink(row, &batch)?;
+            row = end;
+        }
+        Ok(())
+    }
 
     fn sum_selection(
         &self,
@@ -513,51 +757,92 @@ impl Packed {
         selection: &Selection,
     ) -> Result<i128, String> {
         let mut total = 0_i128;
-        self.scan(session, hull, |row, codes| {
+        self.scan(session, hull, |row, batch| {
             let offset = row - selection.rows.start;
             let (mut sum, mut count) = (0_u64, 0_u64);
-            for (index, &code) in codes.iter().enumerate() {
+            for index in 0..batch.codes.len() {
                 let bit = offset + index;
-                let take = selection.words[bit / 64] >> (bit % 64) & 1;
+                let (code, valid) = batch.at(index);
+                let take = selection.words[bit / 64] >> (bit % 64) & 1 & valid;
                 sum += code & take.wrapping_neg();
                 count += take;
             }
-            total = self.add(total, count as usize, sum)?;
+            total = self.packed.add(total, count as usize, sum)?;
             Ok(())
         })?;
         Ok(total)
     }
 
-    /// Sets the bit of every row in `rows` whose code lies in
+    /// Sets the bit of every non-null row in `rows` whose code lies in
     /// `[first, last]`, with one unsigned comparison per code.
     fn select(
         &self,
         session: &mut ReadSession<'_>,
         rows: Span,
-        first: u64,
-        last: u64,
+        (first, last): (u64, u64),
         selection: &mut Selection,
     ) -> Result<(), String> {
         let spread = last - first;
-        self.scan(session, rows, |row, codes| {
-            let offset = row - selection.rows.start;
-            if offset.is_multiple_of(64) {
-                for (word, block) in codes.chunks(64).enumerate() {
-                    let mut bits = 0_u64;
-                    for (index, &code) in block.iter().enumerate() {
-                        bits |= u64::from(code.wrapping_sub(first) <= spread) << index;
-                    }
-                    selection.words[offset / 64 + word] |= bits;
-                }
-            } else {
-                for (index, &code) in codes.iter().enumerate() {
-                    let bit = offset + index;
-                    selection.words[bit / 64] |=
-                        u64::from(code.wrapping_sub(first) <= spread) << (bit % 64);
-                }
+        self.scan(session, rows, |row, batch| {
+            set_bits(
+                selection,
+                row,
+                batch.map(|code, valid| u64::from(code.wrapping_sub(first) <= spread) & valid),
+            );
+            Ok(())
+        })
+    }
+
+    /// `select` over dictionary ids, failing if a non-null row's id lies
+    /// outside the table. With no range, ids are only checked.
+    fn select_ids(
+        &self,
+        session: &mut ReadSession<'_>,
+        rows: Span,
+        range: Option<(u64, u64)>,
+        entries: u64,
+        selection: &mut Selection,
+    ) -> Result<(), String> {
+        let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
+        self.scan(session, rows, |row, batch| {
+            if batch.fold(0, |bad, id, valid| bad | (u64::from(id >= entries) & valid)) != 0 {
+                return Err("dictionary id is outside table".into());
+            }
+            if range.is_some() {
+                set_bits(
+                    selection,
+                    row,
+                    batch.map(|id, valid| u64::from(id.wrapping_sub(first) <= spread) & valid),
+                );
             }
             Ok(())
         })
+    }
+}
+
+/// ORs one bit per row, starting at `row`, into `selection`, a whole word at
+/// a time when the row is word-aligned.
+fn set_bits(selection: &mut Selection, row: usize, bits: impl Iterator<Item = u64>) {
+    let offset = row - selection.rows.start;
+    if offset.is_multiple_of(64) {
+        let mut word = 0_u64;
+        let mut index = 0_usize;
+        for bit in bits {
+            word |= bit << (index % 64);
+            index += 1;
+            if index.is_multiple_of(64) {
+                selection.words[offset / 64 + index / 64 - 1] |= word;
+                word = 0;
+            }
+        }
+        if !index.is_multiple_of(64) {
+            selection.words[offset / 64 + index / 64] |= word;
+        }
+    } else {
+        for (index, bit) in bits.enumerate() {
+            let at = offset + index;
+            selection.words[at / 64] |= bit << (at % 64);
+        }
     }
 }
 
@@ -587,6 +872,34 @@ pub fn sum_ranges(
     validate_ranges(decoder, ranges)?;
     if let Some(packed) = Packed::at_root(decoder, session)? {
         return packed.sum_ranges(session, ranges);
+    }
+    // Nulls add nothing, so a nullable page of codes sums the stored codes
+    // of each range's non-null rows: a contiguous run of them.
+    if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)?
+        && let Some(validity) = lane.validity
+    {
+        let rows = decoder.len()?;
+        let mut stored = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            // Every row's rank comes from the rank index, except the end
+            // of the column, which ranks after every stored code.
+            let mut rank = |row| {
+                if row == rows {
+                    Ok(lane.packed.len)
+                } else {
+                    nullable_prefix_rank(
+                        session,
+                        validity.bits,
+                        validity.rank_index,
+                        row,
+                        validity.rank_interval,
+                    )
+                }
+            };
+            let (start, end) = (rank(range.start)?, rank(range.end)?);
+            stored.push(Span::new(start, end)?);
+        }
+        return lane.packed.sum_ranges(session, &stored);
     }
     let mut total = 0_i128;
     for range in ranges {

@@ -422,3 +422,137 @@ fn fused_sums_agree_with_the_truth() {
     .unwrap();
     assert_eq!(declined, None);
 }
+
+/// Pages with scattered and clustered nulls, under frame-of-reference and
+/// sorted-dictionary codes: selections, sums, and fused sums over them equal
+/// the truth from any first row.
+#[test]
+fn nullable_code_kernels_agree_with_the_truth() {
+    let mut state = 4_242_u64;
+    let rows = 6_000;
+    let mut column = |gap: usize, range: usize, offset: i64| {
+        (0..rows)
+            .map(|row| {
+                let value = (next(&mut state) % range) as i64 + offset;
+                let null = if gap == 0 {
+                    (1_500..2_700).contains(&row)
+                } else {
+                    next(&mut state).is_multiple_of(gap)
+                };
+                (!null).then_some(value)
+            })
+            .collect::<Vec<_>>()
+    };
+    let selectors = [
+        column(3, 400, -50),
+        column(0, 400, 7),
+        column(29, 90, 1_000),
+    ];
+    let values = [column(5, 50_000, -20_000), column(0, 1 << 30, 0)];
+    let bitpack = || Box::new(Recipe::BitPack);
+    let nullable = |values: Recipe| Recipe::Nullable {
+        rank_interval: 512,
+        values: Box::new(values),
+    };
+    let encoded = |recipe: &Recipe, values: &[Option<i64>]| {
+        encode(
+            recipe,
+            InputColumn {
+                values: values.to_vec(),
+                patch_rows: Default::default(),
+            },
+        )
+        .unwrap()
+    };
+    let truth = |selector: &[Option<i64>], value: &[Option<i64>], span: Span, low, high| {
+        let (mut sum, mut matched) = (0_i128, 0_usize);
+        for row in span.start..span.end {
+            if selector[row].is_some_and(|selected| low <= selected && selected <= high) {
+                matched += 1;
+                sum += value[row].map_or(0, i128::from);
+            }
+        }
+        (sum, matched)
+    };
+    let spans = [
+        Span::new(0, rows).unwrap(),
+        Span::new(1_499, 2_701).unwrap(),
+        Span::new(777, 5_123).unwrap(),
+        Span::new(2_000, 2_001).unwrap(),
+    ];
+    for value in &values {
+        let value_column = encoded(&nullable(Recipe::For(bitpack())), value);
+        for span in spans {
+            let sum =
+                vector::sum(&value_column.decoder, &mut session(&value_column), span).unwrap();
+            let expected = value[span.start..span.end]
+                .iter()
+                .flatten()
+                .map(|&value| i128::from(value))
+                .sum::<i128>();
+            assert_eq!(sum, expected, "nullable range sum {span:?}");
+        }
+        for selector in &selectors {
+            for (recipe, compare) in [
+                (
+                    nullable(Recipe::For(bitpack())),
+                    vector::CodeCompare::Offset,
+                ),
+                (
+                    nullable(Recipe::Dictionary(bitpack())),
+                    vector::CodeCompare::SortedDictionary,
+                ),
+            ] {
+                let selector_column = encoded(&recipe, selector);
+                for (low, high) in [
+                    (-50, 349),
+                    (0, 40),
+                    (1_010, 1_011),
+                    (5_000, 6_000),
+                    (100, 100),
+                ] {
+                    for span in spans {
+                        let expected = truth(selector, value, span, low, high);
+                        let fused = vector::fused_sum_between(
+                            &selector_column.decoder,
+                            &mut session(&selector_column),
+                            &value_column.decoder,
+                            &mut session(&value_column),
+                            span,
+                            (low, high),
+                            compare,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            fused,
+                            Some(expected),
+                            "{} {low}..={high} {span:?}",
+                            recipe.name()
+                        );
+                        // A translation licence needs a dictionary root, so
+                        // nullable dictionary pages reach only the fused pass.
+                        if compare == vector::CodeCompare::SortedDictionary {
+                            continue;
+                        }
+                        let selection = vector::between_selection(
+                            &selector_column.decoder,
+                            &mut session(&selector_column),
+                            span,
+                            low,
+                            high,
+                        )
+                        .unwrap();
+                        assert_eq!(selection.count(), expected.1, "{} {span:?}", recipe.name());
+                        let summed = vector::sum_selection(
+                            &value_column.decoder,
+                            &mut session(&value_column),
+                            &selection,
+                        )
+                        .unwrap();
+                        assert_eq!(summed, expected.0, "{} {span:?}", recipe.name());
+                    }
+                }
+            }
+        }
+    }
+}
