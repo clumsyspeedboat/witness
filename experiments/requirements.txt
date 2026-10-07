@@ -1,0 +1,2 @@
+# Version used by experiments/results/duckdb/freeze.csv and corpus exporters.
+duckdb==1.5.3

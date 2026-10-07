@@ -15,7 +15,7 @@ for command in cargo rustc make python3 sha256sum; do
   need "$command"
 done
 python3 -c 'import duckdb' 2>/dev/null || {
-  printf 'Missing Python package: duckdb (pip install duckdb)\n' >&2
+  printf 'Missing Python package: duckdb (pip install -r experiments/requirements.txt)\n' >&2
   exit 1
 }
 
@@ -47,10 +47,7 @@ for file in "${required[@]}"; do
   }
 done
 
-(cd "$DATA" && sha256sum --quiet --check "$ROOT/INPUTS.sha256") || {
-  printf 'Corpus input does not match INPUTS.sha256; refusing to measure.\n' >&2
-  exit 1
-}
+python3 experiments/eval/scripts/verify_inputs.py
 
 PAIRED_16K=experiments/results/predicate_pipeline_rows16k
 RESULTS=experiments/results/predicate_pipeline
@@ -95,10 +92,12 @@ printf '8/8 provenance and checksums\n'
   printf 'python='; python3 --version
   printf 'duckdb='; python3 -c 'import duckdb; print(duckdb.__version__)'
   printf 'rows_per_column=131072\nscale_reference_rows=16384\n'
-  printf 'timing_scope=resident buffers plus cold XFS mechanism control; single-threaded\n'
+  printf 'timing_scope=resident buffers plus cold XFS mechanism control; single-threaded except paged scaling (1-64 threads)\n'
 } > "$RESULTS/PROVENANCE.txt"
 {
-  for file in "${required[@]}"; do sha256sum "$DATA/$file"; done
+  # These hashes were checked before measurement; preserve the complete
+  # inventory here with paths relative to the repository root.
+  sed -n "s@  @  $DATA/@p" INPUTS.sha256
   sha256sum "$RESULTS"/*.csv \
     experiments/results/invariant_census/*.csv \
     experiments/results/certificate_study/*.csv \
