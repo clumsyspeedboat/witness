@@ -14,6 +14,7 @@ fetch-study:
 	./experiments/fetch_nab_real.sh
 	./experiments/eval/scripts/fetch_data.sh
 	python3 experiments/eval/scripts/fetch_bench_data.py
+	python3 experiments/eval/scripts/fetch_census_corpora.py
 
 claims:
 	cargo run --locked --release --features experiment --bin claim_manifest

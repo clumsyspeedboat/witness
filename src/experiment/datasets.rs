@@ -5,6 +5,7 @@ use chrono::{NaiveDateTime, TimeZone, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::error::Error;
 use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -70,24 +71,21 @@ pub fn invariant_census_columns(max_rows: usize) -> Result<Vec<Column>, Box<dyn 
             .into_iter()
             .filter(|column| column.exact_i64),
     );
-    for (group, directory) in [
-        ("publicbi", "eval/data/publicbi"),
-        ("tpch", "eval/data/tpch"),
-        ("clickbench", "eval/data/clickbench"),
-    ] {
-        for mut column in dir_columns(group, directory)? {
-            column.values.truncate(max_rows);
-            if column.exact_i64 {
-                columns.push(column);
-            }
-        }
+    for (group, directory) in CENSUS_DIRECTORIES {
+        columns.extend(
+            dir_columns_prefix(group, directory, Some(max_rows))?
+                .into_iter()
+                .filter(|column| column.exact_i64),
+        );
     }
     columns.extend(
         yellow_columns(Some(max_rows))?
             .into_iter()
             .filter(|column| column.exact_i64),
     );
-    columns.retain(|column| column.values.len() >= 1_024);
+    // An all-NULL column has no values to encode or to order.
+    columns
+        .retain(|column| column.values.len() >= 1_024 && column.values.iter().any(Option::is_some));
     columns.sort_by(|left, right| {
         (&left.group, &left.source, &left.name).cmp(&(&right.group, &right.source, &right.name))
     });
@@ -96,6 +94,16 @@ pub fn invariant_census_columns(max_rows: usize) -> Result<Vec<Column>, Box<dyn 
     });
     Ok(columns)
 }
+
+/// Breadth corpora exported by `scripts/fetch_census_corpora.py`: every exact
+/// numeric and temporal column of the first table of each Public BI workbook,
+/// of every TPC-H and TPC-DS SF1 table, and of the ClickBench hits partition.
+const CENSUS_DIRECTORIES: [(&str, &str); 4] = [
+    ("clickbench", "eval/data/census/clickbench"),
+    ("publicbi", "eval/data/census/publicbi"),
+    ("tpcds", "eval/data/census/tpcds"),
+    ("tpch", "eval/data/census/tpch"),
+];
 
 /// Bounded, named corpus slice used by the canonical study. Large
 /// benchmark columns use their first one million rows so a laptop can reproduce
@@ -797,6 +805,16 @@ fn breadth_columns() -> Result<Vec<Column>, Box<dyn Error>> {
 /// seconds and enter the timestamp path; everything else goes through the
 /// verified-scaling rule (column_from_tokens) like every other corpus.
 fn dir_columns(group: &str, dir: &str) -> Result<Vec<Column>, Box<dyn Error>> {
+    dir_columns_prefix(group, dir, None)
+}
+
+/// `dir_columns` over the first `max_rows` rows of every file. Exactness and
+/// decimal scale are decided on the rows read, which are the rows analyzed.
+fn dir_columns_prefix(
+    group: &str,
+    dir: &str,
+    max_rows: Option<usize>,
+) -> Result<Vec<Column>, Box<dyn Error>> {
     let dir = study_data_path(dir);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -811,21 +829,32 @@ fn dir_columns(group: &str, dir: &str) -> Result<Vec<Column>, Box<dyn Error>> {
     for path in paths {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("col");
         let (table, col) = stem.split_once("__").unwrap_or(("table", stem));
-        let toks: Vec<Option<String>> = fs::read_to_string(&path)?
+        let toks: Vec<Option<String>> = BufReader::new(File::open(&path)?)
             .lines()
-            .map(|l| {
-                let t = l.trim();
-                if t.is_empty() {
+            .take(max_rows.unwrap_or(usize::MAX))
+            .map(|line| {
+                let line = line?;
+                let t = line.trim();
+                Ok(if t.is_empty() {
                     None
                 } else {
                     Some(t.to_string())
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, std::io::Error>>()?;
         if toks.len() < 128 {
             continue;
         }
         if col.ends_with("_timestamp") || col == "timestamp" {
+            // Single-timestamp exports name the file `c<i>_timestamp`; tables
+            // with several temporal columns keep each column's own name.
+            let name = match col.strip_suffix("_timestamp") {
+                Some(prefix) if prefix.starts_with('c') && prefix[1..].parse::<usize>().is_ok() => {
+                    "timestamp".to_string()
+                }
+                None => "timestamp".to_string(),
+                Some(_) => col.to_string(),
+            };
             let values: Vec<Option<i64>> = toks
                 .iter()
                 .map(|t| t.as_ref().and_then(|s| s.parse::<i64>().ok()))
@@ -833,7 +862,7 @@ fn dir_columns(group: &str, dir: &str) -> Result<Vec<Column>, Box<dyn Error>> {
             out.push(Column {
                 group: group.to_string(),
                 source: table.to_string(),
-                name: "timestamp".to_string(),
+                name,
                 mode: "timestamp_epoch_s".to_string(),
                 values,
                 float_values: None,
