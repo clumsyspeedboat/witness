@@ -647,7 +647,25 @@ fn unpack_into(
         // Miniblocks abut without padding, so row r starts at bit r * width
         // and the cursor advances without per-row division.
         let first_bit = rows.start * width_bits - first_byte * 8;
-        out.extend((0..rows.len()).map(|index| {
+        // Rows whose 8-byte window lies inside the slice take a branch-free
+        // load; only the last few rows of a span need the careful path.
+        let fast = if width_bits <= 57 && bytes.len() >= 8 {
+            let limit = (bytes.len() - 8) * 8 + 7;
+            if first_bit > limit {
+                0
+            } else {
+                ((limit - first_bit) / width_bits + 1).min(rows.len())
+            }
+        } else {
+            0
+        };
+        out.extend((0..fast).map(|index| {
+            let bit = first_bit + index * width_bits;
+            let offset = bit >> 3;
+            let word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            i128::from((word >> (bit & 7)) & mask)
+        }));
+        out.extend((fast..rows.len()).map(|index| {
             let bit = first_bit + index * width_bits;
             i128::from(extract(bit >> 3, bit & 7))
         }));
