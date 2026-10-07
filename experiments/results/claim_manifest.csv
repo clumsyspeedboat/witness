@@ -192,6 +192,7 @@ WitScaleQueries,35
 WitScaleOneThreadOverParquet,0.62
 WitScaleOneThreadWins,35
 WitScaleSpeedupSixtyFour,15.5
+WitScaleSpeedupPlot,"(1,1.00)(2,1.98)(4,3.87)(8,7.58)(16,8.51)(32,11.65)(64,15.46)"
 WitScaleOrderkeyTenthMs,0.13
 WitScaleOrderkeyTenthParquetMs,0.57
 WitScaleOrderkeyFiftyPctMs,55.92

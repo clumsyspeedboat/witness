@@ -1318,6 +1318,18 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         "WitScaleSpeedupSixtyFour",
         &format!("{:.1}", median(&speedup)),
     );
+    let mut curve = String::new();
+    for threads in ["1", "2", "4", "8", "16", "32", "64"] {
+        let speedups = timing
+            .iter()
+            .filter(|((_, _, arm, count), _)| arm == "witness_direct_facts" && count == threads)
+            .map(|((selector, predicate, arm, _), nanos)| {
+                timing[&(selector.clone(), predicate.clone(), arm.clone(), "1".into())] / nanos
+            })
+            .collect::<Vec<_>>();
+        curve.push_str(&format!("({threads},{:.2})", median(&speedups)));
+    }
+    define(out, "WitScaleSpeedupPlot", &curve);
     for (predicate, suffix) in [("0.1pct", "Tenth"), ("50pct", "FiftyPct")] {
         let key = |arm: &str| {
             (
