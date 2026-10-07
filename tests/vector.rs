@@ -480,8 +480,15 @@ fn nullable_code_kernels_agree_with_the_truth() {
         Span::new(777, 5_123).unwrap(),
         Span::new(2_000, 2_001).unwrap(),
     ];
-    for value in &values {
-        let value_column = encoded(&nullable(Recipe::For(bitpack())), value);
+    let value_recipes = [
+        nullable(Recipe::For(bitpack())),
+        nullable(Recipe::Dictionary(bitpack())),
+    ];
+    for (value, value_recipe) in values
+        .iter()
+        .flat_map(|value| value_recipes.iter().map(move |recipe| (value, recipe)))
+    {
+        let value_column = encoded(value_recipe, value);
         for span in spans {
             let sum =
                 vector::sum(&value_column.decoder, &mut session(&value_column), span).unwrap();

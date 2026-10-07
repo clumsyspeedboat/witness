@@ -110,9 +110,26 @@ impl Selection {
             .sum()
     }
 
-    /// Selected rows in `start..end`.
+    /// Selected rows in `start..end`, a word at a time.
     pub fn count_range(&self, start: usize, end: usize) -> usize {
-        (start..end).filter(|&row| self.contains(row)).count()
+        if start >= end {
+            return 0;
+        }
+        let (first, last) = (start - self.rows.start, end - self.rows.start);
+        let (first_word, last_word) = (first / 64, (last - 1) / 64);
+        let mut count = 0;
+        for index in first_word..=last_word {
+            let mut word = self.words[index];
+            if index == first_word {
+                word &= !0 << (first % 64);
+            }
+            let high = last - index * 64;
+            if index == last_word && high < 64 {
+                word &= (1 << high) - 1;
+            }
+            count += word.count_ones() as usize;
+        }
+        count
     }
 
     /// The selected rows as ordered, disjoint spans.
@@ -267,7 +284,7 @@ pub fn sum_selection(
     let Some(hull) = selection.hull() else {
         return Ok(0);
     };
-    if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)? {
+    if let Some(lane) = Lane::summable(decoder, session)? {
         return lane.sum_selection(session, hull, selection);
     }
     let mut total = 0_i128;
@@ -333,7 +350,7 @@ pub fn fused_sum_between(
     if rows.start >= rows.end {
         return Ok(Some((0, 0)));
     }
-    let Some(sums) = Lane::at_root(value, value_session, Codes::Offset)? else {
+    let Some(sums) = Lane::summable(value, value_session)? else {
         return Ok(None);
     };
     let (codes, range, entries) = match compare {
@@ -367,6 +384,7 @@ pub fn fused_sum_between(
     }
     let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
     let mut selected = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
+    let mut gathered = Vec::new();
     let mut value_batch = LaneBatch::default();
     let mut value_cursor = sums.cursor(value_session, rows.start)?;
     let mut total = 0_i128;
@@ -385,27 +403,16 @@ pub fn fused_sum_between(
             &mut selector_batch,
         )?;
         if let Some(entries) = entries {
-            outside |= selector_batch.fold(0, |bad, code, valid| {
-                bad | (u64::from(code >= entries) & valid)
-            });
+            outside |= selector_batch.outside(entries);
         }
         if range.is_some() {
-            selected.clear();
-            selected.extend(
-                selector_batch
-                    .map(|code, valid| u64::from(code.wrapping_sub(first) <= spread) & valid),
-            );
+            selector_batch.test_into(&mut selected, |code| {
+                u64::from(code.wrapping_sub(first) <= spread)
+            });
             sums.fill(value_session, &mut value_cursor, batch, &mut value_batch)?;
-            let (mut sum, mut summed, mut taken) = (0_u64, 0_u64, 0_u64);
-            for (index, &take) in selected.iter().enumerate() {
-                let (code, valid) = value_batch.at(index);
-                let add = take & valid;
-                sum += code & add.wrapping_neg();
-                summed += add;
-                taken += take;
-            }
-            total = sums.packed.add(total, summed as usize, sum)?;
-            matched += taken as usize;
+            let sum = sums.sum_taken(value_session, &value_batch, &selected, &mut gathered)?;
+            total = total.checked_add(sum).ok_or("vector SUM overflow")?;
+            matched += selected.iter().sum::<u64>() as usize;
         }
         row = end;
     }
@@ -554,12 +561,13 @@ impl Packed {
     }
 }
 
-/// Which codes a lane carries: values offset from a base, or ids into a
-/// sorted dictionary.
+/// Which codes a lane carries: values offset from a base, ids into a sorted
+/// dictionary to compare, or ids into any dictionary to sum its entries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Codes {
     Offset,
     SortedDictionary,
+    DictionaryValues,
 }
 
 /// Where a nullable page records which rows hold a value.
@@ -577,13 +585,14 @@ struct Validity {
 struct Lane {
     packed: Packed,
     validity: Option<Validity>,
-    /// The sorted table the codes index, for `Codes::SortedDictionary`.
+    /// The table the codes index, and its entries, for dictionary codes.
     dictionary: Option<(FieldId, usize)>,
 }
 
-/// One batch of a lane: a code per row, and per row 1 if it holds a value
-/// and 0 if it is null. A null row's code is meaningless. A dense batch
-/// leaves `valid` empty.
+/// One batch of a lane: a code per row, and, for a page with nulls, per row
+/// 1 if it holds a value and 0 if it is null; a null row's code is
+/// meaningless. A dense batch leaves `valid` empty, and every kernel picks
+/// its loop once per batch rather than testing validity per row.
 #[derive(Default)]
 struct LaneBatch {
     codes: Vec<u64>,
@@ -592,30 +601,50 @@ struct LaneBatch {
 }
 
 impl LaneBatch {
-    fn at(&self, index: usize) -> (u64, u64) {
-        (
-            self.codes[index],
-            self.valid.get(index).copied().unwrap_or(1),
-        )
+    fn dense(&self) -> bool {
+        self.valid.is_empty()
     }
 
-    fn map<'a>(&'a self, f: impl Fn(u64, u64) -> u64 + 'a) -> impl Iterator<Item = u64> + 'a {
-        let dense = self.valid.is_empty();
-        self.codes
-            .iter()
-            .enumerate()
-            .map(move |(index, &code)| f(code, if dense { 1 } else { self.valid[index] }))
+    /// Replaces `out` with `test(code)` for each row, 0 at null rows.
+    fn test_into(&self, out: &mut Vec<u64>, test: impl Fn(u64) -> u64) {
+        out.clear();
+        if self.dense() {
+            out.extend(self.codes.iter().map(|&code| test(code)));
+        } else {
+            out.extend(
+                self.codes
+                    .iter()
+                    .zip(&self.valid)
+                    .map(|(&code, &valid)| test(code) & valid),
+            );
+        }
     }
 
-    fn fold(&self, init: u64, f: impl Fn(u64, u64, u64) -> u64) -> u64 {
-        if self.valid.is_empty() {
-            self.codes.iter().fold(init, |acc, &code| f(acc, code, 1))
+    /// Nonzero if a non-null row's id lies outside a table of `entries`.
+    fn outside(&self, entries: u64) -> u64 {
+        if self.dense() {
+            self.codes
+                .iter()
+                .fold(0, |bad, &id| bad | u64::from(id >= entries))
         } else {
             self.codes
                 .iter()
                 .zip(&self.valid)
-                .fold(init, |acc, (&code, &valid)| f(acc, code, valid))
+                .fold(0, |bad, (&id, &valid)| {
+                    bad | (u64::from(id >= entries) & valid)
+                })
         }
+    }
+
+    /// The bits a selection takes from rows `row..`, as one 0 or 1 per row
+    /// of the batch.
+    fn taken(&self, selection: &Selection, row: usize, take: &mut Vec<u64>) {
+        let offset = row - selection.rows.start;
+        take.clear();
+        take.extend((0..self.codes.len()).map(|index| {
+            let bit = offset + index;
+            selection.words[bit / 64] >> (bit % 64) & 1
+        }));
     }
 }
 
@@ -649,16 +678,19 @@ impl Lane {
         }
         let (packed, dictionary) = match codes {
             Codes::Offset => (Packed::at_offset(decoder, session, node)?, None),
-            Codes::SortedDictionary => {
+            Codes::SortedDictionary | Codes::DictionaryValues => {
                 let &DecoderNode::Dictionary {
                     ids,
                     dictionary,
                     entries,
-                    sorted_unique: true,
+                    sorted_unique,
                 } = decoder.node(node)?
                 else {
                     return Ok(None);
                 };
+                if codes == Codes::SortedDictionary && !sorted_unique {
+                    return Ok(None);
+                }
                 (Packed::at_node(decoder, ids)?, Some((dictionary, entries)))
             }
         };
@@ -667,6 +699,65 @@ impl Lane {
             validity,
             dictionary,
         }))
+    }
+
+    /// A lane whose values a SUM can add: offset codes or dictionary ids.
+    fn summable(
+        decoder: &DecoderIr,
+        session: &mut ReadSession<'_>,
+    ) -> Result<Option<Self>, String> {
+        match Self::at_root(decoder, session, Codes::Offset)? {
+            Some(lane) => Ok(Some(lane)),
+            None => Self::at_root(decoder, session, Codes::DictionaryValues),
+        }
+    }
+
+    /// SUM of the non-null values of `batch` at rows whose `take` is 1.
+    /// Dictionary ids become entries in `gathered`.
+    fn sum_taken(
+        &self,
+        session: &mut ReadSession<'_>,
+        batch: &LaneBatch,
+        take: &[u64],
+        gathered: &mut Vec<i128>,
+    ) -> Result<i128, String> {
+        let Some((table, entries)) = self.dictionary else {
+            let (mut sum, mut count) = (0_u64, 0_u64);
+            if batch.dense() {
+                for (&code, &take) in batch.codes.iter().zip(take) {
+                    sum += code & take.wrapping_neg();
+                    count += take;
+                }
+            } else {
+                for ((&code, &valid), &take) in batch.codes.iter().zip(&batch.valid).zip(take) {
+                    let take = take & valid;
+                    sum += code & take.wrapping_neg();
+                    count += take;
+                }
+            }
+            return self.packed.add(0, count as usize, sum);
+        };
+        if take.iter().all(|&take| take == 0) {
+            return Ok(0);
+        }
+        // A null row repeats a stored id, so every id names an entry unless
+        // the page is corrupt, which the gather reports.
+        gathered.clear();
+        gathered.extend(batch.codes.iter().map(|&id| i128::from(id)));
+        session.gather_i64_into(table, entries, gathered)?;
+        let mut sum = 0_i128;
+        let mut overflow = false;
+        let valid = |index: usize| batch.valid.get(index).copied().unwrap_or(1);
+        for (index, (&value, &take)) in gathered.iter().zip(take).enumerate() {
+            let take = i128::from(take & valid(index));
+            let (next, carried) = sum.overflowing_add(value & take.wrapping_neg());
+            sum = next;
+            overflow |= carried;
+        }
+        if overflow {
+            return Err("vector SUM overflow".into());
+        }
+        Ok(sum)
     }
 
     fn cursor(&self, session: &mut ReadSession<'_>, row: usize) -> Result<LaneCursor, String> {
@@ -733,7 +824,7 @@ impl Lane {
         &self,
         session: &mut ReadSession<'_>,
         rows: Span,
-        mut sink: impl FnMut(usize, &LaneBatch) -> Result<(), String>,
+        mut sink: impl FnMut(&mut ReadSession<'_>, usize, &LaneBatch) -> Result<(), String>,
     ) -> Result<(), String> {
         if rows.start >= rows.end {
             return Ok(());
@@ -744,7 +835,7 @@ impl Lane {
         while row < rows.end {
             let end = (row + BATCH_ROWS).min(rows.end);
             self.fill(session, &mut cursor, Span::new(row, end)?, &mut batch)?;
-            sink(row, &batch)?;
+            sink(session, row, &batch)?;
             row = end;
         }
         Ok(())
@@ -757,17 +848,13 @@ impl Lane {
         selection: &Selection,
     ) -> Result<i128, String> {
         let mut total = 0_i128;
-        self.scan(session, hull, |row, batch| {
-            let offset = row - selection.rows.start;
-            let (mut sum, mut count) = (0_u64, 0_u64);
-            for index in 0..batch.codes.len() {
-                let bit = offset + index;
-                let (code, valid) = batch.at(index);
-                let take = selection.words[bit / 64] >> (bit % 64) & 1 & valid;
-                sum += code & take.wrapping_neg();
-                count += take;
-            }
-            total = self.packed.add(total, count as usize, sum)?;
+        let (mut take, mut gathered) = (Vec::new(), Vec::new());
+        self.scan(session, hull, |session, row, batch| {
+            batch.taken(selection, row, &mut take);
+            let sum = self.sum_taken(session, batch, &take, &mut gathered)?;
+            total = total
+                .checked_add(sum)
+                .ok_or("vector selected SUM overflow")?;
             Ok(())
         })?;
         Ok(total)
@@ -783,12 +870,12 @@ impl Lane {
         selection: &mut Selection,
     ) -> Result<(), String> {
         let spread = last - first;
-        self.scan(session, rows, |row, batch| {
-            set_bits(
-                selection,
-                row,
-                batch.map(|code, valid| u64::from(code.wrapping_sub(first) <= spread) & valid),
-            );
+        let mut bits = Vec::new();
+        self.scan(session, rows, |_, row, batch| {
+            batch.test_into(&mut bits, |code| {
+                u64::from(code.wrapping_sub(first) <= spread)
+            });
+            set_bits(selection, row, &bits);
             Ok(())
         })
     }
@@ -804,16 +891,14 @@ impl Lane {
         selection: &mut Selection,
     ) -> Result<(), String> {
         let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
-        self.scan(session, rows, |row, batch| {
-            if batch.fold(0, |bad, id, valid| bad | (u64::from(id >= entries) & valid)) != 0 {
+        let mut bits = Vec::new();
+        self.scan(session, rows, |_, row, batch| {
+            if batch.outside(entries) != 0 {
                 return Err("dictionary id is outside table".into());
             }
             if range.is_some() {
-                set_bits(
-                    selection,
-                    row,
-                    batch.map(|id, valid| u64::from(id.wrapping_sub(first) <= spread) & valid),
-                );
+                batch.test_into(&mut bits, |id| u64::from(id.wrapping_sub(first) <= spread));
+                set_bits(selection, row, &bits);
             }
             Ok(())
         })
@@ -822,24 +907,18 @@ impl Lane {
 
 /// ORs one bit per row, starting at `row`, into `selection`, a whole word at
 /// a time when the row is word-aligned.
-fn set_bits(selection: &mut Selection, row: usize, bits: impl Iterator<Item = u64>) {
+fn set_bits(selection: &mut Selection, row: usize, bits: &[u64]) {
     let offset = row - selection.rows.start;
     if offset.is_multiple_of(64) {
-        let mut word = 0_u64;
-        let mut index = 0_usize;
-        for bit in bits {
-            word |= bit << (index % 64);
-            index += 1;
-            if index.is_multiple_of(64) {
-                selection.words[offset / 64 + index / 64 - 1] |= word;
-                word = 0;
-            }
-        }
-        if !index.is_multiple_of(64) {
-            selection.words[offset / 64 + index / 64] |= word;
+        for (word, block) in bits.chunks(64).enumerate() {
+            let packed = block
+                .iter()
+                .enumerate()
+                .fold(0_u64, |word, (index, &bit)| word | bit << index);
+            selection.words[offset / 64 + word] |= packed;
         }
     } else {
-        for (index, bit) in bits.enumerate() {
+        for (index, &bit) in bits.iter().enumerate() {
             let at = offset + index;
             selection.words[at / 64] |= bit << (at % 64);
         }
