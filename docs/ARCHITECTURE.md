@@ -176,12 +176,25 @@ licenses it and, for a bound, the interval it read; `check_between` and
 SUM over a dense value page whose bound has equal ends multiplies instead of
 decoding. Every page is planned on the calling thread; only pages left with
 work are spread over threads. `Planning::ScanOnly` is the ablation that turns
-every page into a scan.
+every page into a scan. `Planning::StoredStatistics` plans from an exact
+per-page minimum and maximum recorded when the page is sealed, as a zone map
+would: its licences cite `Authorization::StoredStatistics`, which the checker
+can hold only to the recorded values, never to the bytes.
 
 Pages execute on `vector.rs`, which reads the decoder IR at run time and
 dispatches once per chunk: up to 1,024 decoded values, one run, or a stretch
 of nulls. Scattered matches travel as a one-bit-per-row `Selection` consumed
 in one masked pass; few matches are summed span by span.
+
+Most pages are bit-packed codes under a frame-of-reference base, a
+dictionary, or null suppression. These run on *lanes*: the stored codes of a
+1,024-row batch are unpacked once as `u64` and spread over the rows the
+validity bitmap marks. Predicates compare codes with the predicate shifted by
+the base (or with a dictionary code range), sums add codes and the base once
+per batch, and dictionary sums gather from the table read once per page. A
+scanned or translated selector page over a value lane is answered by one
+fused, branch-free pass that compares, masks, and adds, without building a
+selection.
 
 ## Plan IR
 

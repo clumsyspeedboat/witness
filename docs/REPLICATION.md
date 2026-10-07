@@ -26,6 +26,10 @@ uses a fixed bootstrap seed.
 ./reproduce.sh
 ```
 
+It needs Rust, Python 3 with the `duckdb` package (`pip install duckdb`), and
+about 30 GB of free disk for the Parquet files the paged studies export for
+DuckDB (`experiments/results/paged_*/parquet/`, ignored by git).
+
 This one command fetches all corpus inputs, verifies `INPUTS.sha256`, applies
 the validation gates, reruns every claim-bearing experiment, regenerates the
 claim manifest and worked example, and writes provenance and checksums.
@@ -38,7 +42,7 @@ The eight stages are:
 | 2 | paired 16,384/131,072-row predicate studies |
 | 3 | Bloom, min/max, and sparse-fence controls |
 | 4 | logical, delivered, and transferred access measurements |
-| 5 | paged queries against Parquet page pruning, and 60 M-row thread scaling |
+| 5 | paged queries (facts, zone map, scan) against Parquet and DuckDB, checker fault injection, 4 Ki and 64 Ki page sizes, and 60 M-row thread scaling |
 | 6 | auxiliary-plan measurements and neutral claim manifest |
 | 7 | generated kernels, physical toy artifacts, and walkthrough |
 | 8 | host provenance and input/output checksums |
