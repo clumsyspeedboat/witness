@@ -17,7 +17,7 @@ These constraints are part of the result.
 - The canonical complete-query study contains 40 selector/value pairs and 152
   predicate cells. Sources, not cells or columns, are the resampling unit.
 - Access-ready Witness versus the Parquet boundary-search path has source
-  median 0.15x with a 95% bootstrap interval [0.08, 0.16]. The interval sits
+  median 0.13x with a 95% bootstrap interval [0.07, 0.14]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
   (families, then sources within each) gives [0.06, 0.30]. Collapsing each
@@ -65,7 +65,7 @@ These constraints are part of the result.
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.29x a full read; coalescing issued 119 calls and reached 1.00x. This is a
+  1.31x a full read; coalescing issued 119 calls and reached 1.00x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is

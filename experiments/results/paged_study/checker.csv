@@ -1,0 +1,14 @@
+family,checker,outcome,mutants
+kind,rejected,correct,47123
+kind,rejected,wrong,129473
+kind,rejected,error,30737
+evidence,rejected,correct,29475
+foreign_page,rejected,correct,8640
+foreign_page,rejected,wrong,1055
+foreign_page,rejected,error,5044
+foreign_page,accepted,correct,5979
+stale_plan,rejected,correct,87
+stale_plan,rejected,wrong,4111
+stale_plan,accepted,correct,1638
+forged_statistics,rejected,correct,18197
+forged_statistics,rejected,wrong,209333

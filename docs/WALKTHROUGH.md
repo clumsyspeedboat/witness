@@ -134,7 +134,7 @@ Witness reports three byte notions:
 
 A plan can minimize logical bytes and still perform poorly if it creates many
 small physical reads. The cold XFS experiment measures exactly this boundary:
-per-page closure read fewer bytes but issued 1,083 calls and took 1.29x a full
+per-page closure read fewer bytes but issued 1,083 calls and took 1.31x a full
 read; coalescing reached 119 calls and 1.00x.
 
 ## 5. Output guarantees
