@@ -19,6 +19,9 @@ git diff --exit-code experiments/results/claim_manifest.csv
 `claim_manifest.csv` contains every scalar, table row, and plot coordinate
 derived for the submitted study. The generator reads only canonical CSVs and
 uses a fixed bootstrap seed.
+If a local manuscript is present, `make claims` also refreshes every
+`paper/**/claim.tex` from that manifest, and the paper drift test checks every
+`.tex` file below `paper/`.
 
 ## Full remeasurement
 
@@ -26,7 +29,8 @@ uses a fixed bootstrap seed.
 ./reproduce.sh
 ```
 
-It needs Rust, Python 3 with the `duckdb` package (`pip install duckdb`), and
+It needs Rust, Python 3 with the pinned `duckdb` package
+(`pip install -r experiments/requirements.txt`), and
 about 30 GB of free disk for the Parquet files the paged studies export for
 DuckDB (`experiments/results/paged_*/parquet/`, ignored by git).
 
@@ -70,7 +74,17 @@ number, and are therefore outside the eight-stage checksum manifest.
 Downloaded inputs live under the ignored `experiments/eval/data/` directory.
 They cover NAB, UCI Household Power, TPC-H, ClickBench, Public BI, and NYC Taxi.
 Every consumed file is listed in `INPUTS.sha256`; acquisition fails if an
-upstream file has changed. Sources and licences are documented in
+upstream file has changed. Before measuring, the input gate also rejects
+missing or extra CSVs in the discovered corpus directories, including the
+NAB, census, and scale corpora. This prevents a partial download or a newly
+added column from silently changing the workload. Verify the cached inputs
+without rerunning a study with:
+
+```bash
+python3 experiments/eval/scripts/verify_inputs.py
+```
+
+Sources and licences are documented in
 [THIRD_PARTY_DATA.md](THIRD_PARTY_DATA.md).
 
 `WITNESS_MAX_ROWS` controls the predicate/access prefix and must be at least
@@ -88,6 +102,9 @@ uses 16,384.
 | `additional_plans.csv` | dictionary translation and run-length counting summaries |
 | `certificate_study/*.csv` | Bloom/min-max/fence controls |
 | `real_access/*.csv` | selected layouts and storage schedules |
+| `paged_study/*.csv` and `paged_study_rows*/*.csv` | page planning, checker mutations, bounds, and page-size controls |
+| `paged_scale/*.csv` | large-column queries and thread scaling |
+| `duckdb/*.csv` | checked DuckDB answers, timings, scan counts, and version |
 | `experiments/generated/` | frozen generated Rust kernels |
 | `docs/generated/` | worked example, exact layouts, and tiny artifacts |
 
@@ -104,6 +121,7 @@ and intentionally not versioned.
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Tests cover invariant soundness, restart seams, nullable and patched streams,

@@ -6,7 +6,8 @@ These constraints are part of the result.
 
 - Witness is an exploratory study of representation-derived facts, generated
   query paths, and physical access cost. It is not a production storage
-  engine, a universal format replacement, or a claim that it beats Parquet.
+  engine, a universal format replacement, or a performance claim about every
+  Parquet implementation and workload.
 - The census contains 1,784 columns from 93 public sources: every exact
   column of the first table of each Public BI workbook, of TPC-H and TPC-DS
   SF1, of the ClickBench hits partition, and of the NAB, household-power, and
@@ -14,8 +15,10 @@ These constraints are part of the result.
   columns are non-decreasing too; the summary reports them separately, and
   global order over non-constant columns is rare outside time series and
   benchmark keys.
-- The canonical complete-query study contains 40 selector/value pairs and 152
-  predicate cells. Sources, not cells or columns, are the resampling unit.
+- The single-page generated-kernel study contains 40 selector/value pairs and
+  152 predicate cells. Sources, not cells or columns, are its resampling unit.
+  The separate paged study compares complete queries across multiple pages;
+  its medians summarize the fixed workload rather than a population sample.
 - Access-ready Witness versus the Parquet boundary-search path has source
   median 0.13x with a 95% bootstrap interval [0.07, 0.14]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
@@ -84,8 +87,9 @@ These constraints are part of the result.
   performance counters.
 - Explicit SIMD specialization, concurrent readers, asynchronous I/O, cache
   contention, and NUMA are out of scope.
-- Values travel through the executors as `i128`, so checked arithmetic never
-  narrows them; a 64-bit value path would decode faster.
+- The generic executor widens values to `i128`; specialized code lanes operate
+  on 64-bit codes and widen aggregate results. Their costs differ, so generic
+  per-value overhead does not characterize every execution path.
 - Aggregation over a size-selected layout still trails Parquet row selection
   at the median, because a Zstd frame enclosing the whole column must be
   decompressed for any read; chunked frames remove that cost at about 2% more

@@ -21,22 +21,35 @@ Run the complete Rust suite with:
 cargo test --locked --all-features
 ~~~
 
-At this revision, the command runs 56 named tests. They are divided by
-failure domain so that a failure identifies whether the problem is semantic,
-physical, generated-code, experimental, or documentary.
+The suite is divided by failure domain so that a failure identifies whether
+the problem is semantic, physical, generated-code, experimental, or documentary.
+Use `cargo test --locked --all-features -- --list` for the current test inventory.
 
-| Layer | File | Cases | Primary oracle |
-|---|---|---:|---|
-| library units | modules under `src/` | 10 | local invariants and deterministic examples |
-| invariant calculus | `tests/invariant_calculus.rs` | 17 | derived fact versus decoded values and authorization checks |
-| Decoder/Layout/Plan IR | `tests/access_compiler_ir.rs` | 9 | validated DAGs, closure fixed points, and typed guarantees |
-| interpreted execution | `tests/access_compiler_exec.rs` | 4 | brute-force answers and malformed-input behavior |
-| generated execution | `tests/access_compiler_generated.rs` | 3 | interpreter, monomorphized control, and frozen generated Rust |
-| sidecar certificates | `tests/certificate_plans.rs` | 4 | brute-force membership with candidate refinement |
-| physical study formats | `tests/study_formats.rs` | 3 | round-trip values, null positions, and reference windows |
-| generated documentation | `tests/documentation_example.rs` | 2 | byte-for-byte regeneration and manifest-bound prose |
-| predicate workload units | `src/bin/predicate_pipeline/workload.rs` | 3 | row-wise truth and deterministic predicate construction |
-| crossover partition | `src/bin/access_crossover/measure.rs` | 1 | fixed 10-case training and 5-case evaluation split |
+| Layer | File | Primary oracle |
+|---|---|---|
+| library units | modules under `src/` | local invariants and deterministic examples |
+| invariant calculus | `tests/invariant_calculus.rs` | derived fact versus decoded values and authorization checks |
+| bounds | `tests/bounds.rs` | bounds contain decoded values; evidence reads are accounted |
+| Decoder/Layout/Plan IR | `tests/access_compiler_ir.rs` | validated DAGs, closure fixed points, and typed guarantees |
+| interpreted execution | `tests/access_compiler_exec.rs` | brute-force answers and malformed-input behavior |
+| vector execution | `tests/vector.rs`, `tests/vector_validation.rs` | decoded answers, code-lane equivalence, and malformed-selection rejection |
+| paged execution | `tests/paged.rs`, `tests/paged_edge_cases.rs` | row-wise answers, checked licences, append certificates, and serial/parallel equivalence |
+| chunked frames | `tests/chunked_frames.rs` | exact answers, chunk-level reads, and corruption handling |
+| generated execution | `tests/access_compiler_generated.rs` | interpreter, monomorphized control, and frozen generated Rust |
+| sidecar certificates | `tests/certificate_plans.rs` | brute-force membership with candidate refinement |
+| physical study formats | `tests/study_formats.rs` | round-trip values, null positions, and reference windows |
+| generated documentation | `tests/documentation_example.rs` | byte-for-byte regeneration, nested manuscript macros, and manifest-bound prose |
+| predicate workload units | `src/bin/predicate_pipeline/workload.rs` | row-wise truth and deterministic predicate construction |
+| crossover partition | `src/bin/access_crossover/measure.rs` | fixed training/evaluation split |
+
+The Python input-gate regressions run separately:
+
+~~~bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+~~~
+
+They check that unchanged inputs pass while modified, missing, and additional
+discovered corpus columns fail before measurement.
 
 ### Invariant cases
 
@@ -90,6 +103,13 @@ serialized page.
 Malformed descriptors, missing dependencies, invalid dictionary IDs, and
 arbitrary byte strings up to 8 KiB must return an error rather than panic.
 This is robustness testing, not a complete security audit.
+
+`tests/vector_validation.rs` and `tests/paged_edge_cases.rs` also check reversed
+and out-of-range selections, malformed bitmaps, predicates outside dictionary
+bounds, constant-page shortcuts, and empty columns. Parallel execution must
+preserve the serial answer and page trace order; an empty task set must not
+bypass predicate validation. `tests/paged.rs` covers mixed page costs and
+serial/parallel execution across thread counts.
 
 ### Generated-code cases
 
@@ -202,6 +222,9 @@ The full pipeline invokes these scripts after verifying input hashes.
 | `run_predicate_pipeline.sh` | at least 30 selector/value pairs, at least 60 logical columns, two kernels per column, exact answer agreement across four known-selection and ten complete-query arms, and all expected physical files |
 | `run_certificate_study.sh` | at least 1,700 cells, five plan classes, four query classes, and no non-scan candidate set larger than the scan domain |
 | `run_real_access.sh` | 14 columns, 178 candidates, 336 query cells, 72 storage scans, policy/query consistency, cross-policy checksum equality, and storage-counter sanity |
+| `paged_study` | exact answers across facts, zone-map, scan, and Parquet arms; no harmful checker mutant accepted |
+| `paged_scale_study` | exact answers against a row-wise oracle across requested thread counts |
+| `duckdb_baseline.py` | exact sum and row-count agreement with exported paged workloads before timing |
 | `claim_manifest` | fixed-seed source bootstrap, claim extraction from canonical CSV cells, and no hand-entered scalar values |
 | `documentation_example` | deterministic pages, layouts, plans, CSVs, and Markdown generated from actual 16-row files |
 
@@ -217,6 +240,7 @@ a fast but wrong arm cannot survive by reporting only latency.
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
+python3 -m unittest discover -s tests -p 'test_*.py'
 ~~~
 
 ### Exact reported values from committed evidence
@@ -245,7 +269,8 @@ closures, certificate behavior, and explanatory Markdown.
 ./reproduce.sh
 ~~~
 
-The script fetches inputs, verifies `INPUTS.sha256`, runs the claim-bearing
+The script fetches inputs, verifies `INPUTS.sha256` and the complete discovered
+input inventory, runs the claim-bearing
 studies, regenerates the walkthrough, records the environment, and writes
 `CHECKSUMS.sha256`.
 
@@ -267,6 +292,7 @@ nanoseconds.
 | generated-doc drift | the checked-in walkthrough does not match current code/results |
 | claim-prose drift | a hand-written summary no longer matches its named manifest cells |
 | input checksum failure | downloaded corpus bytes differ from the pinned study inputs |
+| input inventory failure | a pinned corpus column is missing or an unlisted column would enter the study |
 
 A changed cardinality should be explained from source structure before a gate
 is updated. For example, adding one composition changes several CSV counts;
