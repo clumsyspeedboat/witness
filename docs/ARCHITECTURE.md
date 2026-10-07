@@ -94,7 +94,9 @@ topologically ordered node arena:
 - `Nullable(validity, rank index, compact values)`
 
 `Recipe::Frame` changes physical placement without adding a logical decoder
-node. It places child fields in one Zstd frame.
+node. It places child fields in one Zstd frame. `Recipe::ChunkedFrame`
+compresses the same decoded stream in independent chunks of a fixed number
+of decoded bytes, so a read decompresses only the chunks it spans.
 
 ## Layout IR and serialized page
 
@@ -107,9 +109,11 @@ and dependency rules:
 
 `LayoutIr::closure` computes the least fixed point of those dependencies and
 then maps logical spans to delivered physical ranges. A framed field maps to
-the entire compressed frame.
+the compressed chunks covering its decoded range; an unchunked frame is a
+single chunk, so it maps to the whole frame.
 
-`format.rs` writes `ACPAGE01` version 3. Its header contains field, frame, and
+`format.rs` writes `ACPAGE01` version 4, in which a frame entry may continue
+the decoded stream of the entry before it; versions 2 and 3 still parse. Its header contains field, frame, and
 dependency directories plus checked-invariant flags and a descriptor
 checksum. Parse validates canonical IDs, offsets, lengths, alignment,
 dependencies, flags, and checksum before exposing facts.
@@ -120,7 +124,7 @@ dependencies, flags, and checksum before exposing facts.
 
 | Scope | Examples | Use |
 |---|---|---|
-| value | non-decreasing, piecewise non-decreasing, null placement | algorithm authorization |
+| value | non-decreasing, piecewise non-decreasing, null placement, value bounds, all-null | algorithm authorization, page skipping |
 | mapping | order preserving, injective, affine shift | predicate translation |
 | access | restart/run/patch/rank prerequisites, frame boundaries | byte closure |
 
@@ -139,6 +143,44 @@ proves global monotonicity. Multiple independent restart anchors prove only
 piecewise monotonicity unless the descriptor separately certifies ordered
 seams. The generated piecewise operator performs independent exact binary
 searches inside each block; it does not use nonexistent block bounds.
+
+Value bounds come from fields the decoder already needs. A frame-of-reference
+base over unsigned codes of at most `w` bits bounds every value by
+`[base, base + 2^w - 1]`; a sorted, deduplicated dictionary bounds every value
+by its first and last entries. Run-length and nullable parents keep their
+child's bounds, while patches and deltas derive none. `bound_interval` reads a
+bound through the read session, so consulting it is accounted. The census
+re-checks every derived bound against the decoded values.
+
+## Paged columns
+
+`paged.rs` stores a column as independently encoded pages. Each page takes
+the smallest encoding from a recipe menu and derives its own facts when it is
+sealed. Appending seals new pages and never rewrites existing ones.
+
+A predicate is planned page by page. Every action cites the fact that
+licenses it and, for a bound, the interval it read; `check_between` and
+`check_sum` re-verify both before execution.
+
+| Page evidence | Action |
+|---|---|
+| all-null | skip |
+| bound disjoint from the predicate | skip |
+| bound inside the predicate | accept every non-null row without decoding |
+| non-decreasing | boundary search |
+| piecewise non-decreasing | search inside each block |
+| order-preserving sorted dictionary | translate to a code range |
+| none | scan |
+
+SUM over a dense value page whose bound has equal ends multiplies instead of
+decoding. Every page is planned on the calling thread; only pages left with
+work are spread over threads. `Planning::ScanOnly` is the ablation that turns
+every page into a scan.
+
+Pages execute on `vector.rs`, which reads the decoder IR at run time and
+dispatches once per chunk: up to 1,024 decoded values, one run, or a stretch
+of nulls. Scattered matches travel as a one-bit-per-row `Selection` consumed
+in one masked pass; few matches are summed span by span.
 
 ## Plan IR
 
@@ -233,12 +275,13 @@ modeled bytes, latency, and source-bootstrap intervals.
 
 The rule set is frozen by content hash. `primitive_rule_fingerprint()`
 (`src/access_compiler/heldout.rs`) is an FNV-1a hash over the concatenated
-**source text** of twelve files:
+**source text** of fourteen files:
 
 ```
 decoder.rs  invariants.rs  layout.rs     plan.rs
 encode.rs   format.rs      runtime.rs    support.rs
 interpreter.rs  compiler.rs  codegen.rs  static_baseline.rs
+vector.rs   paged.rs
 ```
 
 Any edit to those files changes the fingerprint, including a comment, a
