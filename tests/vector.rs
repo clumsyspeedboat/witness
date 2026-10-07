@@ -296,7 +296,7 @@ fn packed_kernels_agree_with_the_truth_at_every_width() {
     for width in 1..=63_u32 {
         for base in [0_i64, -1_000_003] {
             let mut state = u64::from(width) * 31 + base.unsigned_abs();
-            let largest = (1_i64 << width) - 1;
+            let largest = ((1_u64 << width) - 1) as i64;
             let mut values = (0..3_000)
                 .map(|_| base + (next(&mut state) as i64 & largest))
                 .collect::<Vec<_>>();

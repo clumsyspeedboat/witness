@@ -50,9 +50,7 @@ pub fn scan<'p>(
     rows: Span,
     sink: &mut Sink<'_, 'p>,
 ) -> Result<(), String> {
-    if rows.end > decoder.len()? {
-        return Err("vector scan exceeds the column".into());
-    }
+    validate_rows(decoder, rows)?;
     scan_node(decoder, decoder.root(), session, rows.start, rows.end, sink)
 }
 
@@ -188,15 +186,13 @@ pub fn between_selection(
     if low > high {
         return Err("vector BETWEEN bounds are invalid".into());
     }
+    validate_rows(decoder, rows)?;
     let (low, high) = (i128::from(low), i128::from(high));
     let mut selection = Selection::empty(rows);
     // Bit-packed codes, under a frame-of-reference base or not and with or
     // without nulls, are compared against the predicate shifted by the base,
     // which is exact and skips adding the base to every value.
     if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)? {
-        if rows.end > decoder.len()? {
-            return Err("vector scan exceeds the column".into());
-        }
         let base = lane.packed.base;
         if let Some(range) = lane.packed.code_range(low - base, high - base) {
             lane.select(session, rows, range, &mut selection)?;
@@ -230,16 +226,14 @@ pub fn dictionary_selection(
     if low > high {
         return Err("vector dictionary range bounds are invalid".into());
     }
-    if rows.end > decoder.len()? {
-        return Err("vector scan exceeds the column".into());
-    }
+    validate_rows(decoder, rows)?;
     let mut selection = Selection::empty(rows);
     let low_id = table_bound(session, dictionary, entries, low, false)?;
     let high_id = table_bound(session, dictionary, entries, high, true)?;
     if let Some(lane) = Lane::at_root(decoder, session, Codes::SortedDictionary)? {
         // Ids are read even when none can match, to confirm that every one
         // lies inside the table, as a decode would.
-        let range = (low_id < high_id).then_some((low_id as u64, high_id as u64 - 1));
+        let range = (low_id < high_id).then(|| (low_id as u64, high_id as u64 - 1));
         lane.select_ids(session, rows, range, entries as u64, &mut selection)?;
         return Ok(selection);
     }
@@ -278,9 +272,7 @@ pub fn sum_selection(
     session: &mut ReadSession<'_>,
     selection: &Selection,
 ) -> Result<i128, String> {
-    if selection.rows.end > decoder.len()? {
-        return Err("vector selection exceeds the column".into());
-    }
+    validate_selection(decoder, selection)?;
     let Some(hull) = selection.hull() else {
         return Ok(0);
     };
@@ -344,9 +336,8 @@ pub fn fused_sum_between(
     if low > high {
         return Err("vector BETWEEN bounds are invalid".into());
     }
-    if rows.end > selector.len()? || rows.end > value.len()? {
-        return Err("vector scan exceeds the column".into());
-    }
+    validate_rows(selector, rows)?;
+    validate_rows(value, rows)?;
     if rows.start >= rows.end {
         return Ok(Some((0, 0)));
     }
@@ -373,7 +364,7 @@ pub fn fused_sum_between(
                 codes.dictionary.ok_or("dictionary lane lacks its table")?;
             let first = table_bound(selector_session, dictionary, entries, low, false)?;
             let end = table_bound(selector_session, dictionary, entries, high, true)?;
-            let range = (first < end).then_some((first as u64, end as u64 - 1));
+            let range = (first < end).then(|| (first as u64, end as u64 - 1));
             (codes, range, Some(entries as u64))
         }
     };
@@ -1069,9 +1060,7 @@ pub fn non_null(
     session: &mut ReadSession<'_>,
     rows: Span,
 ) -> Result<Vec<Span>, String> {
-    if rows.end > decoder.len()? {
-        return Err("vector scan exceeds the column".into());
-    }
+    validate_rows(decoder, rows)?;
     let mut ranges = Vec::new();
     if rows.is_empty() {
         return Ok(ranges);
@@ -1123,6 +1112,7 @@ pub fn search_monotone(
     if low > high || nulls == NullPlacement::Arbitrary {
         return Err("vector monotone search contract is invalid".into());
     }
+    validate_rows(decoder, rows)?;
     let start = boundary(decoder, session, rows, i128::from(low), false, nulls)?;
     let end = boundary(
         decoder,
@@ -1152,6 +1142,10 @@ pub fn search_piecewise(
     if max_rows == 0 {
         return Err("piecewise blocks must be non-empty".into());
     }
+    if low > high {
+        return Err("vector BETWEEN bounds are invalid".into());
+    }
+    validate_rows(decoder, rows)?;
     let mut ranges = Vec::new();
     let mut block_start = rows.start / max_rows * max_rows;
     while block_start < rows.end {
@@ -1189,9 +1183,7 @@ pub fn dictionary_range(
     if low > high {
         return Err("vector dictionary range bounds are invalid".into());
     }
-    if rows.end > decoder.len()? {
-        return Err("vector scan exceeds the column".into());
-    }
+    validate_rows(decoder, rows)?;
     let low_id = table_bound(session, dictionary, entries, low, false)?;
     let high_id = table_bound(session, dictionary, entries, high, true)?;
     let mut ranges = Vec::new();
@@ -1844,11 +1836,33 @@ fn add_chunk(total: i128, chunk: &Chunk<'_>) -> Result<i128, String> {
     }
 }
 
-fn validate_ranges(decoder: &DecoderIr, ranges: &[Span]) -> Result<(), String> {
+fn validate_rows(decoder: &DecoderIr, rows: Span) -> Result<(), String> {
+    if rows.start > rows.end || rows.end > decoder.len()? {
+        return Err("vector row range is invalid".into());
+    }
+    Ok(())
+}
+
+/// Validate externally supplied bitmap selections before using their hull,
+/// count, or words, including bits beyond the last logical row.
+pub(super) fn validate_selection(decoder: &DecoderIr, selection: &Selection) -> Result<(), String> {
+    validate_rows(decoder, selection.rows)?;
+    let len = selection.rows.len();
+    if selection.words.len() != len.div_ceil(64) {
+        return Err("vector selection bitmap length is invalid".into());
+    }
+    let tail = len % 64;
+    if tail != 0 && selection.words.last().is_some_and(|word| word >> tail != 0) {
+        return Err("vector selection contains rows beyond its range".into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_ranges(decoder: &DecoderIr, ranges: &[Span]) -> Result<(), String> {
     let len = decoder.len()?;
     let mut previous = 0;
     for range in ranges {
-        if range.start < previous || range.end > len {
+        if range.start > range.end || range.start < previous || range.end > len {
             return Err("vector selection ranges are invalid".into());
         }
         previous = range.end;

@@ -440,6 +440,9 @@ pub fn check_between(
     low: i64,
     high: i64,
 ) -> Result<(), String> {
+    if low > high {
+        return Err("BETWEEN needs low <= high".into());
+    }
     let (low, high) = (i128::from(low), i128::from(high));
     match action {
         PageAction::Scan => Ok(()),
@@ -629,6 +632,7 @@ pub fn execute_sum(
     match action {
         SumAction::Decode => vector::sum_ranges(&page.column.decoder, session, ranges),
         SumAction::Constant(licence) => {
+            vector::validate_ranges(&page.column.decoder, ranges)?;
             let (value, _) = licence.evidence.ok_or("constant SUM lost its evidence")?;
             let rows = ranges.iter().map(|range| range.len() as i128).sum::<i128>();
             value
@@ -673,6 +677,7 @@ pub fn execute_sum_selection(
     match action {
         SumAction::Decode => vector::sum_selection(&page.column.decoder, session, selection),
         SumAction::Constant(licence) => {
+            vector::validate_selection(&page.column.decoder, selection)?;
             let (value, _) = licence.evidence.ok_or("constant SUM lost its evidence")?;
             value
                 .checked_mul(selection.count() as i128)
@@ -724,6 +729,9 @@ pub fn sum_where(
     planning: Planning,
     threads: usize,
 ) -> Result<(i128, usize, PageCounts), String> {
+    if low > high {
+        return Err("BETWEEN needs low <= high".into());
+    }
     if selector.rows != value.rows
         || selector.page_rows != value.page_rows
         || selector.pages.len() != value.pages.len()
@@ -879,6 +887,9 @@ pub fn between(
     planning: Planning,
     threads: usize,
 ) -> Result<(Vec<Span>, PageCounts), String> {
+    if low > high {
+        return Err("BETWEEN needs low <= high".into());
+    }
     let page_results = run_pages(column.pages.len(), threads, |index| {
         let page = &column.pages[index];
         let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
