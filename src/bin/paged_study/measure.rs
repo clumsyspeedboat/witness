@@ -39,7 +39,7 @@ enum Arm {
     ParquetFull { compressed: bool },
 }
 
-const ARMS: [Arm; 6] = [
+const ARMS: [Arm; 8] = [
     Arm::Witness {
         compact: false,
         planning: Planning::Facts,
@@ -49,11 +49,16 @@ const ARMS: [Arm; 6] = [
         planning: Planning::ScanOnly,
     },
     Arm::Witness {
+        compact: false,
+        planning: Planning::StoredStatistics,
+    },
+    Arm::Witness {
         compact: true,
         planning: Planning::Facts,
     },
     Arm::ParquetIndexed { compressed: false },
     Arm::ParquetIndexed { compressed: true },
+    Arm::ParquetFull { compressed: false },
     Arm::ParquetFull { compressed: true },
 ];
 
@@ -76,6 +81,14 @@ impl Arm {
                 compact: true,
                 planning: Planning::ScanOnly,
             } => "witness_compact_scan",
+            Self::Witness {
+                compact: false,
+                planning: Planning::StoredStatistics,
+            } => "witness_direct_zonemap",
+            Self::Witness {
+                compact: true,
+                planning: Planning::StoredStatistics,
+            } => "witness_compact_zonemap",
             Self::ParquetIndexed { compressed: false } => "parquet_plain_indexed",
             Self::ParquetIndexed { compressed: true } => "parquet_zstd_indexed",
             Self::ParquetFull { compressed: false } => "parquet_plain_full",

@@ -83,10 +83,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     expected.1
                 )
             };
-            for planning in [Planning::Facts, Planning::ScanOnly] {
+            for planning in [
+                Planning::Facts,
+                Planning::ScanOnly,
+                Planning::StoredStatistics,
+            ] {
                 let arm = match planning {
                     Planning::Facts => "witness_direct_facts",
                     Planning::ScanOnly => "witness_direct_scan",
+                    Planning::StoredStatistics => "witness_direct_zonemap",
                 };
                 for threads in THREADS {
                     let run = || {
