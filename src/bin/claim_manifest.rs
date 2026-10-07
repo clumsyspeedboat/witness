@@ -5,7 +5,7 @@
 //! paired 16Ki-row run provides the scale-stability comparison; the live
 //! directories provide the current study, certificate controls, and census.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
@@ -824,6 +824,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // generated kernel.
     define(&mut out, "WitCertificateHeaderBytes", "16");
 
+    paged_claims(&mut out)?;
+
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
     Ok(())
@@ -1033,6 +1035,280 @@ fn require_matching_fingerprints(left: &str, right: &str) -> Result<(), Box<dyn 
     let right = read_csv(&format!("{right}/freeze.csv"))?;
     if left.field(&left[0], "rule_fingerprint")? != right.field(&right[0], "rule_fingerprint")? {
         return Err("scale runs use different rule fingerprints".into());
+    }
+    Ok(())
+}
+
+const PAGED: &str = "experiments/results/paged_study";
+const PAGED_SCALE: &str = "experiments/results/paged_scale";
+
+/// Claims from the paged studies: selective SUM over columns stored as
+/// independently encoded pages, planned per page from encoding-derived facts,
+/// against Parquet pruned by its page index; and the same on full-length
+/// TPC-H SF10 lineitem across thread counts.
+fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let pairs = read_csv(&format!("{PAGED}/pairs.csv"))?;
+    let queries = read_csv(&format!("{PAGED}/queries.csv"))?;
+    let costs = read_csv(&format!("{PAGED}/costs.csv"))?;
+    let freeze = read_csv(&format!("{PAGED}/freeze.csv"))?;
+
+    let tables = pairs
+        .iter()
+        .map(|row| Ok((pairs.field(row, "group")?, pairs.field(row, "source")?)))
+        .collect::<Result<BTreeSet<_>, Box<dyn Error>>>()?;
+    define(out, "WitPagedPairs", &pairs.len().to_string());
+    define(out, "WitPagedTables", &tables.len().to_string());
+    define(
+        out,
+        "WitPagedPageRows",
+        &group_digits(&freeze.field(&freeze[0], "page_rows")?),
+    );
+    let pages = pairs
+        .iter()
+        .map(|row| Ok(pairs.field(row, "pages")?.parse::<f64>()?))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    define(
+        out,
+        "WitPagedPagesMedian",
+        &format!("{:.0}", median(&pages)),
+    );
+
+    // Latency per (pair, predicate, arm), and the page decisions of the
+    // Witness arm with facts.
+    let mut latency = BTreeMap::<(String, String), BTreeMap<String, f64>>::new();
+    let mut decisions = [0_usize; 5]; // pages, skipped, accepted, exact skips, exact accepts
+    for row in &queries {
+        let cell = (
+            queries.field(row, "pair")?,
+            queries.field(row, "predicate")?,
+        );
+        let arm = queries.field(row, "arm")?;
+        latency
+            .entry(cell)
+            .or_default()
+            .insert(arm.clone(), queries.field(row, "median_ns")?.parse()?);
+        if arm == "witness_direct_facts" {
+            for (slot, name) in [
+                "pages",
+                "skipped",
+                "accepted",
+                "oracle_skipped",
+                "oracle_accepted",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                decisions[slot] += queries.field(row, name)?.parse::<usize>()?;
+            }
+        }
+    }
+    define(
+        out,
+        "WitPagedCells",
+        &group_digits(&latency.len().to_string()),
+    );
+    let ratios = |numerator: &str, denominator: &str, bucket: Option<&str>| {
+        latency
+            .iter()
+            .filter(|((_, predicate), _)| {
+                bucket.is_none_or(|bucket| predicate.split('+').next() == Some(bucket))
+            })
+            .filter_map(|(_, arms)| Some(arms.get(numerator)? / arms.get(denominator)?))
+            .collect::<Vec<_>>()
+    };
+    for (label, denominator) in [
+        ("Plain", "parquet_plain_indexed"),
+        ("Zstd", "parquet_zstd_indexed"),
+    ] {
+        let all = ratios("witness_direct_facts", denominator, None);
+        define(
+            out,
+            &format!("WitPaged{label}Median"),
+            &format!("{:.2}", median(&all)),
+        );
+        define(
+            out,
+            &format!("WitPaged{label}Wins"),
+            &group_digits(&all.iter().filter(|ratio| **ratio < 1.0).count().to_string()),
+        );
+        for (bucket, suffix) in [
+            ("0.1pct", "Tenth"),
+            ("1pct", "OnePct"),
+            ("10pct", "TenPct"),
+            ("50pct", "FiftyPct"),
+        ] {
+            let selected = ratios("witness_direct_facts", denominator, Some(bucket));
+            define(
+                out,
+                &format!("WitPaged{label}{suffix}"),
+                &format!("{:.2}", median(&selected)),
+            );
+        }
+    }
+    let ablation = ratios("witness_direct_facts", "witness_direct_scan", None);
+    let geometric =
+        (ablation.iter().map(|ratio| ratio.ln()).sum::<f64>() / ablation.len() as f64).exp();
+    define(out, "WitPagedFactsOverScanGeo", &format!("{geometric:.2}"));
+    let [
+        pages_total,
+        skipped,
+        accepted,
+        exact_skipped,
+        exact_accepted,
+    ] = decisions;
+    let percent = |part: usize, whole: usize| format!("{:.1}", part as f64 * 100.0 / whole as f64);
+    define(out, "WitPagedSkippedPages", &percent(skipped, pages_total));
+    define(
+        out,
+        "WitPagedBoundSkipRecovery",
+        &percent(skipped.min(exact_skipped), exact_skipped),
+    );
+    define(
+        out,
+        "WitPagedBoundAcceptRecovery",
+        &percent(accepted.min(exact_accepted), exact_accepted),
+    );
+
+    let per_page = |name: &str| {
+        costs
+            .iter()
+            .map(|row| {
+                Ok(costs.field(row, name)?.parse::<f64>()?
+                    / costs.field(row, "pages")?.parse::<f64>()?)
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()
+    };
+    define(
+        out,
+        "WitPagedDeriveNsPerPage",
+        &format!("{:.0}", median(&per_page("derive_ns")?)),
+    );
+    define(
+        out,
+        "WitPagedPlanNsPerPage",
+        &format!("{:.0}", median(&per_page("plan_ns")?)),
+    );
+    define(
+        out,
+        "WitPagedPlanBytesPerPage",
+        &format!("{:.1}", median(&per_page("plan_logical_bytes")?)),
+    );
+    let plan_share = costs
+        .iter()
+        .map(|row| {
+            Ok(costs.field(row, "plan_ns")?.parse::<f64>()?
+                / costs.field(row, "scan_ns")?.parse::<f64>()?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    define(
+        out,
+        "WitPagedPlanOverScanPercent",
+        &format!("{:.2}", median(&plan_share) * 100.0),
+    );
+    let bytes = pairs
+        .iter()
+        .map(|row| {
+            Ok(pairs.field(row, "witness_direct_bytes")?.parse::<f64>()?
+                / pairs.field(row, "parquet_plain_bytes")?.parse::<f64>()?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    define(
+        out,
+        "WitPagedDirectOverPlainBytes",
+        &format!("{:.2}", median(&bytes)),
+    );
+
+    let scale = read_csv(&format!("{PAGED_SCALE}/scaling.csv"))?;
+    let mut timing = BTreeMap::<(String, String, String, String), f64>::new();
+    for row in &scale {
+        timing.insert(
+            (
+                scale.field(row, "selector")?,
+                scale.field(row, "predicate")?,
+                scale.field(row, "arm")?,
+                scale.field(row, "threads")?,
+            ),
+            scale.field(row, "median_ns")?.parse()?,
+        );
+    }
+    define(
+        out,
+        "WitScaleRows",
+        &group_digits(&scale.field(&scale[0], "rows")?),
+    );
+    define(
+        out,
+        "WitScalePages",
+        &group_digits(&scale.field(&scale[0], "pages")?),
+    );
+    let mut one_thread = Vec::new();
+    let mut speedup = Vec::new();
+    for ((selector, predicate, arm, threads), nanos) in &timing {
+        if arm != "witness_direct_facts" || threads != "1" {
+            continue;
+        }
+        let parquet = timing[&(
+            selector.clone(),
+            predicate.clone(),
+            "parquet_plain_indexed".into(),
+            "1".into(),
+        )];
+        one_thread.push(nanos / parquet);
+        speedup.push(
+            nanos
+                / timing[&(
+                    selector.clone(),
+                    predicate.clone(),
+                    arm.clone(),
+                    "64".into(),
+                )],
+        );
+    }
+    define(out, "WitScaleQueries", &one_thread.len().to_string());
+    define(
+        out,
+        "WitScaleOneThreadOverParquet",
+        &format!("{:.2}", median(&one_thread)),
+    );
+    define(
+        out,
+        "WitScaleOneThreadWins",
+        &one_thread
+            .iter()
+            .filter(|ratio| **ratio < 1.0)
+            .count()
+            .to_string(),
+    );
+    define(
+        out,
+        "WitScaleSpeedupSixtyFour",
+        &format!("{:.1}", median(&speedup)),
+    );
+    for (predicate, suffix) in [("0.1pct", "Tenth"), ("50pct", "FiftyPct")] {
+        let key = |arm: &str| {
+            (
+                "c0_l_orderkey_x1".to_string(),
+                predicate.to_string(),
+                arm.to_string(),
+                "1".to_string(),
+            )
+        };
+        let witness = timing
+            .get(&key("witness_direct_facts"))
+            .ok_or("scale orderkey row is absent")?;
+        let parquet = timing
+            .get(&key("parquet_plain_indexed"))
+            .ok_or("scale orderkey row is absent")?;
+        define(
+            out,
+            &format!("WitScaleOrderkey{suffix}Ms"),
+            &format!("{:.2}", witness / 1e6),
+        );
+        define(
+            out,
+            &format!("WitScaleOrderkey{suffix}ParquetMs"),
+            &format!("{:.2}", parquet / 1e6),
+        );
     }
     Ok(())
 }

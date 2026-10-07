@@ -67,10 +67,16 @@ cells over **32** sources at 131,072 rows per column.
 | cold disk, fewest-bytes plan | **1.29x** slower than reading the whole file (1,083 scattered reads against one) |
 
 The paged study ([`experiments/results/paged_study/`](experiments/results/paged_study/))
-runs selective SUM queries over 364 column pairs paged at 16,384 rows against
-Parquet pruned by its page index, and
+runs **1,166** selective SUM queries over 364 column pairs paged at 16,384 rows,
+every page planned from its own facts, against Parquet pruned by its page index.
 [`experiments/results/paged_scale/`](experiments/results/paged_scale/) repeats
 them on TPC-H SF10 lineitem on 1 to 64 threads.
+
+| | |
+|---|---|
+| paged queries against uncompressed Parquet with page index | **0.59x** the time (median) |
+| page skips that bounds read from encodings recover | **96.8%** of what stored min/max allow |
+| sorted key, 0.1% of 60 M rows, one thread | **0.13 ms** against Parquet's 0.57 ms |
 
 Derived knowledge helps when it is present, cheap to reach, and not erased by the
 storage layer beneath it. A plain scan was always correct anyway.

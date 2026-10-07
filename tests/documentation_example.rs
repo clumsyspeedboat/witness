@@ -252,6 +252,26 @@ fn claim_bearing_prose_matches_the_manifest() {
             "WitColdPageCalls",
             grouped(claim(&manifest, "WitColdPageCalls")),
         ),
+        (
+            "WitPagedCells",
+            claim(&manifest, "WitPagedCells").to_string(),
+        ),
+        (
+            "WitPagedPlainMedian",
+            format!("{}x", claim(&manifest, "WitPagedPlainMedian")),
+        ),
+        (
+            "WitPagedBoundSkipRecovery",
+            format!("{}%", claim(&manifest, "WitPagedBoundSkipRecovery")),
+        ),
+        (
+            "WitScaleOrderkeyTenthMs",
+            format!("{} ms", claim(&manifest, "WitScaleOrderkeyTenthMs")),
+        ),
+        (
+            "WitScaleOrderkeyTenthParquetMs",
+            format!("{} ms", claim(&manifest, "WitScaleOrderkeyTenthParquetMs")),
+        ),
     ] {
         assert!(
             readme.contains(&rendered),

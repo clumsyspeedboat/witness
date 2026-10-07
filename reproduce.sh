@@ -51,22 +51,26 @@ done
 PAIRED_16K=experiments/results/predicate_pipeline_rows16k
 RESULTS=experiments/results/predicate_pipeline
 
-printf '1/7 invariant census\n'
+printf '1/8 invariant census\n'
 ./experiments/run_invariant_census.sh
 
-printf '2/7 paired predicate pipeline (16Ki and 128Ki rows)\n'
+printf '2/8 paired predicate pipeline (16Ki and 128Ki rows)\n'
 ./experiments/run_predicate_scale.sh
 
-printf '3/7 membership-certificate controls\n'
+printf '3/8 membership-certificate controls\n'
 ./experiments/run_certificate_study.sh
 
-printf '4/7 physical access and storage schedules\n'
+printf '4/8 physical access and storage schedules\n'
 ./experiments/run_real_access.sh
 
-printf '5/7 auxiliary plans and claim manifest\n'
+printf '5/8 paged queries and 60 M-row scaling\n'
+cargo run --locked --release --features experiment --bin paged_study
+cargo run --locked --release --features experiment --bin paged_scale_study
+
+printf '6/8 auxiliary plans and claim manifest\n'
 cargo run --locked --release --features experiment --bin claim_manifest -- --measure-additional
 
-printf '6/7 numerical walkthrough and physical artifacts\n'
+printf '7/8 numerical walkthrough and physical artifacts\n'
 cargo run --locked --release --features experiment --bin generate_documentation_example
 cargo run --locked --release --features experiment --bin documentation_example
 
@@ -74,7 +78,7 @@ cargo run --locked --release --features experiment --bin documentation_example
 # companion notebook produce no claim. They are covered because the notebook
 # demonstrates the compiler's behaviour next to the paper's prose, so a silent
 # drift in either could show a reader something the manuscript does not say.
-printf '7/7 provenance and checksums\n'
+printf '8/8 provenance and checksums\n'
 {
   printf 'generated_utc='; date -u +%Y-%m-%dT%H:%M:%SZ
   printf 'system='; uname -a
@@ -90,6 +94,8 @@ printf '7/7 provenance and checksums\n'
     experiments/results/invariant_census/*.csv \
     experiments/results/certificate_study/*.csv \
     experiments/results/real_access/*.csv \
+    experiments/results/paged_study/*.csv \
+    experiments/results/paged_scale/*.csv \
     "$PAIRED_16K"/*.csv \
     experiments/results/additional_plans.csv \
     experiments/results/claim_manifest.csv \
