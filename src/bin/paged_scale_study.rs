@@ -50,8 +50,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut output = csv(format!("{result_dir}/scaling.csv"))?;
     writeln!(
         output,
-        "selector,predicate,rows,pages,arm,threads,p25_ns,median_ns,p75_ns,matched_rows"
+        "selector,predicate,rows,pages,arm,threads,p25_ns,median_ns,p75_ns,matched_rows,low,high,expected_sum"
     )?;
+    let export = format!("{result_dir}/parquet");
+    fs::create_dir_all(&export)?;
     for (index, selector) in columns.iter().enumerate() {
         if index == value {
             continue;
@@ -62,6 +64,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             PAGE_ROWS,
             false,
         )?);
+        // The plain file, for engines outside this crate to query.
+        fs::write(format!("{export}/{}.parquet", selector.name), &parquet)?;
         for predicate in predicates(&selector.values)? {
             let expected = truth(
                 &selector.values,
@@ -72,7 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut record = |arm: &str, threads: usize, timing: (f64, f64, f64)| {
                 writeln!(
                     output,
-                    "{},{},{},{},{arm},{threads},{:.1},{:.1},{:.1},{}",
+                    "{},{},{},{},{arm},{threads},{:.1},{:.1},{:.1},{},{},{},{}",
                     quote(&selector.name),
                     predicate.label,
                     selector.values.len(),
@@ -80,7 +84,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     timing.0,
                     timing.1,
                     timing.2,
-                    expected.1
+                    expected.1,
+                    predicate.low,
+                    predicate.high,
+                    expected.0
                 )
             };
             for planning in [

@@ -7,7 +7,8 @@ use witness::experiment::types::Column;
 
 use crate::common::PAGE_ROWS;
 
-/// Rows read per column: 64 pages.
+/// Rows read per column: 64 pages of the default size, whatever page size a
+/// run uses, so every run queries the same corpus.
 pub const MAX_ROWS: usize = 64 * PAGE_ROWS;
 const MIN_PAGES: usize = 4;
 const SELECTORS_PER_TABLE: usize = 8;

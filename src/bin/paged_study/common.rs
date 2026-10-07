@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use witness::access_compiler::Recipe;
 
-/// Rows per page, for Witness pages and Parquet data pages alike.
+/// Rows per page, for Witness pages and Parquet data pages alike, unless
+/// `WITNESS_PAGE_ROWS` sets another size for a sensitivity run.
 pub const PAGE_ROWS: usize = 16_384;
 const REPEATS: usize = 5;
 const TARGET_NS: u128 = 2_000_000;
@@ -72,6 +73,19 @@ where
     }
     samples.sort_by(f64::total_cmp);
     Ok((samples[1], samples[2], samples[3]))
+}
+
+/// The page size of this run: `WITNESS_PAGE_ROWS`, or `PAGE_ROWS`.
+pub fn page_rows() -> Result<usize, String> {
+    match std::env::var("WITNESS_PAGE_ROWS") {
+        Ok(rows) => match rows.parse::<usize>() {
+            Ok(rows) if rows > 0 => Ok(rows),
+            _ => Err(format!(
+                "WITNESS_PAGE_ROWS must be a positive integer, not {rows:?}"
+            )),
+        },
+        Err(_) => Ok(PAGE_ROWS),
+    }
 }
 
 pub fn csv(path: String) -> std::io::Result<BufWriter<File>> {

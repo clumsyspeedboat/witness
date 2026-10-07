@@ -19,6 +19,8 @@
 /experiments/results/real_access/*.acp
 /experiments/results/real_access/storage_*/
 /experiments/results/access_crossover/*.acp
+/experiments/results/paged_study/parquet/
+/experiments/results/paged_scale/parquet/
 
 # Local tools and editor state.
 **/__pycache__/

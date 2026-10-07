@@ -17,7 +17,10 @@ use witness::access_compiler::{
 use witness::experiment::time_window::{parquet_full_sum, parquet_indexed_sum, parquet_table_file};
 use witness::experiment::types::Column;
 
-use crate::common::{PAGE_ROWS, benchmark, compact_menu, csv, direct_menu, quote, truth};
+use crate::checker;
+use crate::common::{
+    PAGE_ROWS, benchmark, compact_menu, csv, direct_menu, page_rows, quote, truth,
+};
 use crate::corpus::{self, Pair};
 use crate::workload::predicates;
 
@@ -27,9 +30,9 @@ const SCALING_THREADS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 /// Page encodings for one column: `direct` keeps every field addressable,
 /// `compact` may also compress a page in one Zstd frame.
-struct Layouts {
-    direct: PagedColumn,
-    compact: PagedColumn,
+pub struct Layouts {
+    pub direct: PagedColumn,
+    pub compact: PagedColumn,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,23 +109,42 @@ struct Outcome {
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
-    let result_dir =
-        std::env::var("WITNESS_PAGED_RESULT_DIR").unwrap_or_else(|_| DEFAULT_RESULT_DIR.into());
+    let page_rows = page_rows()?;
+    // A sensitivity run at another page size writes beside the main study
+    // and measures queries and costs only.
+    let main_run = page_rows == PAGE_ROWS;
+    let result_dir = std::env::var("WITNESS_PAGED_RESULT_DIR").unwrap_or_else(|_| {
+        if main_run {
+            DEFAULT_RESULT_DIR.into()
+        } else {
+            format!("{DEFAULT_RESULT_DIR}_rows{page_rows}")
+        }
+    });
     fs::create_dir_all(&result_dir)?;
     let started = Instant::now();
     let (columns, pairs) = corpus::pairs()?;
     if pairs.len() < 100 {
         return Err(format!("paged corpus is unexpectedly small: {} pairs", pairs.len()).into());
     }
-    let layouts = parallel(columns.len(), |index| encode_layouts(&columns[index]))?;
+    let layouts = parallel(columns.len(), |index| {
+        encode_layouts(&columns[index], page_rows)
+    })?;
     let parquet = parallel(pairs.len(), |index| {
         let pair = &pairs[index];
         let (selector, value) = (&columns[pair.selector].values, &columns[pair.value].values);
         Ok((
-            Bytes::from(parquet_table_file(selector, value, PAGE_ROWS, false)?),
-            Bytes::from(parquet_table_file(selector, value, PAGE_ROWS, true)?),
+            Bytes::from(parquet_table_file(selector, value, page_rows, false)?),
+            Bytes::from(parquet_table_file(selector, value, page_rows, true)?),
         ))
     })?;
+    if main_run {
+        // The plain files, for engines outside this crate to query.
+        let export = format!("{result_dir}/parquet");
+        fs::create_dir_all(&export)?;
+        for (pair_id, (plain, _)) in parquet.iter().enumerate() {
+            fs::write(format!("{export}/pair_{pair_id}.parquet"), plain)?;
+        }
+    }
     eprintln!(
         "encoded {} columns and {} Parquet pairs in {:.0?}",
         columns.len(),
@@ -134,7 +156,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut queries = csv(format!("{result_dir}/queries.csv"))?;
     writeln!(
         queries,
-        "pair,predicate,requested,low,high,matched_rows,pages,arm,p25_ns,median_ns,p75_ns,skipped,accepted,searched,translated,scanned,constant_sums,candidate_pages,oracle_skipped,oracle_accepted"
+        "pair,predicate,requested,low,high,matched_rows,expected_sum,pages,arm,p25_ns,median_ns,p75_ns,skipped,accepted,searched,translated,scanned,constant_sums,candidate_pages,oracle_skipped,oracle_accepted"
     )?;
     for (pair_id, pair) in pairs.iter().enumerate() {
         let selector = &columns[pair.selector].values;
@@ -142,7 +164,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         for predicate in predicates(selector)? {
             let expected = truth(selector, value, predicate.low, predicate.high);
             let (oracle_skipped, oracle_accepted) =
-                exact_zone_map(selector, predicate.low, predicate.high);
+                exact_zone_map(selector, predicate.low, predicate.high, page_rows);
             let pages = layouts[pair.selector].direct.pages().len();
             for arm in ARMS {
                 let run = || {
@@ -170,12 +192,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let counts = outcome.counts;
                 writeln!(
                     queries,
-                    "{pair_id},{},{},{},{},{},{pages},{},{p25:.1},{median:.1},{p75:.1},{},{},{},{},{},{},{},{oracle_skipped},{oracle_accepted}",
+                    "{pair_id},{},{},{},{},{},{},{pages},{},{p25:.1},{median:.1},{p75:.1},{},{},{},{},{},{},{},{oracle_skipped},{oracle_accepted}",
                     predicate.label,
                     predicate.requested,
                     predicate.low,
                     predicate.high,
                     expected.1,
+                    expected.0,
                     arm.name(),
                     counts.skipped,
                     counts.accepted,
@@ -195,12 +218,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     queries.flush()?;
+    bounds(&result_dir, &pairs, &layouts)?;
     costs(&result_dir, &columns, &pairs, &layouts)?;
-    scaling(&result_dir, &columns, &pairs, &layouts)?;
+    if main_run {
+        scaling(&result_dir, &columns, &pairs, &layouts)?;
+        checker::run(&result_dir, &columns, &pairs, &layouts)?;
+    }
     fs::write(
         format!("{result_dir}/freeze.csv"),
         format!(
-            "rule_fingerprint,page_rows,max_rows,columns,pairs\n{:#018x},{PAGE_ROWS},{},{},{}\n",
+            "rule_fingerprint,page_rows,max_rows,columns,pairs\n{:#018x},{page_rows},{},{},{}\n",
             primitive_rule_fingerprint(),
             corpus::MAX_ROWS,
             columns.len(),
@@ -211,14 +238,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn encode_layouts(column: &Column) -> Result<Layouts, String> {
+fn encode_layouts(column: &Column, page_rows: usize) -> Result<Layouts, String> {
     let direct = direct_menu();
     let compact = compact_menu();
     Ok(Layouts {
-        direct: PagedColumn::from_values(&column.values, PAGE_ROWS, &PagePolicy::smallest(direct))?,
+        direct: PagedColumn::from_values(&column.values, page_rows, &PagePolicy::smallest(direct))?,
         compact: PagedColumn::from_values(
             &column.values,
-            PAGE_ROWS,
+            page_rows,
             &PagePolicy::smallest(compact),
         )?,
     })
@@ -284,10 +311,15 @@ fn run_arm(
 
 /// Pages an exact per-page minimum and maximum would skip and accept: the
 /// most any zone map can decide, and so the yardstick for structural bounds.
-fn exact_zone_map(selector: &[Option<i64>], low: i64, high: i64) -> (usize, usize) {
+fn exact_zone_map(
+    selector: &[Option<i64>],
+    low: i64,
+    high: i64,
+    page_rows: usize,
+) -> (usize, usize) {
     let mut skipped = 0;
     let mut accepted = 0;
-    for page in selector.chunks(PAGE_ROWS) {
+    for page in selector.chunks(page_rows) {
         let mut present = page.iter().flatten();
         let Some(&first) = present.next() else {
             skipped += 1;
@@ -303,6 +335,36 @@ fn exact_zone_map(selector: &[Option<i64>], low: i64, high: i64) -> (usize, usiz
         }
     }
     (skipped, accepted)
+}
+
+/// Every selector page's exact value range next to the tightest range its
+/// bound facts give: the slack a structural bound carries.
+fn bounds(result_dir: &str, pairs: &[Pair], layouts: &[Layouts]) -> Result<(), Box<dyn Error>> {
+    let mut output = csv(format!("{result_dir}/bounds.csv"))?;
+    writeln!(
+        output,
+        "pair,page,recipe,rows,non_null,stat_low,stat_high,bound_low,bound_high"
+    )?;
+    for (pair_id, pair) in pairs.iter().enumerate() {
+        for (index, page) in layouts[pair.selector].direct.pages().iter().enumerate() {
+            let field =
+                |value: Option<i128>| value.map(|value| value.to_string()).unwrap_or_default();
+            let bound = paged::derived_bounds(page)?;
+            writeln!(
+                output,
+                "{pair_id},{index},{},{},{},{},{},{},{}",
+                quote(&page.column.recipe.name()),
+                page.rows(),
+                page.non_null,
+                field(page.stats.map(|stats| stats.0)),
+                field(page.stats.map(|stats| stats.1)),
+                field(bound.map(|bound| bound.0)),
+                field(bound.map(|bound| bound.1)),
+            )?;
+        }
+    }
+    output.flush()?;
+    Ok(())
 }
 
 /// What consulting facts costs, next to decoding: deriving every page's facts,
@@ -475,7 +537,7 @@ fn write_layouts(
 }
 
 /// Runs `work` for every index on all cores, returning results in index order.
-fn parallel<T, F>(count: usize, work: F) -> Result<Vec<T>, String>
+pub fn parallel<T, F>(count: usize, work: F) -> Result<Vec<T>, String>
 where
     T: Send,
     F: Fn(usize) -> Result<T, String> + Sync,
