@@ -502,23 +502,25 @@ fn write_layouts(
     let mut output = csv(format!("{result_dir}/pairs.csv"))?;
     writeln!(
         output,
-        "pair,group,source,selector,value,rows,pages,witness_direct_bytes,witness_compact_bytes,parquet_plain_bytes,parquet_zstd_bytes,selector_direct_recipes"
+        "pair,group,source,selector,value,rows,pages,witness_direct_bytes,witness_compact_bytes,parquet_plain_bytes,parquet_zstd_bytes,selector_direct_recipes,value_direct_recipes"
     )?;
     for (pair_id, pair) in pairs.iter().enumerate() {
         let selector = &layouts[pair.selector];
         let value = &layouts[pair.value];
-        let mut recipes = std::collections::BTreeMap::<String, usize>::new();
-        for page in selector.direct.pages() {
-            *recipes.entry(page.column.recipe.name()).or_default() += 1;
-        }
-        let recipes = recipes
-            .into_iter()
-            .map(|(name, count)| format!("{name}:{count}"))
-            .collect::<Vec<_>>()
-            .join(";");
+        let recipes = |column: &PagedColumn| {
+            let mut recipes = std::collections::BTreeMap::<String, usize>::new();
+            for page in column.pages() {
+                *recipes.entry(page.column.recipe.name()).or_default() += 1;
+            }
+            recipes
+                .into_iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
         writeln!(
             output,
-            "{pair_id},{},{},{},{},{},{},{},{},{},{},{}",
+            "{pair_id},{},{},{},{},{},{},{},{},{},{},{},{}",
             quote(&pair.group),
             quote(&pair.source),
             quote(&columns[pair.selector].name),
@@ -529,7 +531,8 @@ fn write_layouts(
             selector.compact.bytes() + value.compact.bytes(),
             parquet[pair_id].0.len(),
             parquet[pair_id].1.len(),
-            quote(&recipes),
+            quote(&recipes(&selector.direct)),
+            quote(&recipes(&value.direct)),
         )?;
     }
     output.flush()?;
