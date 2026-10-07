@@ -36,6 +36,13 @@ WitCensusPiecewiseAccessReady,9.5
 WitCensusMonotoneSourceWeighted,27.7
 WitCensusMonotonePages,28.7
 WitCensusSmallDomain,81.7
+WitCensusConstantColumns,6.8
+WitCensusNonconstantMonotone,3.6
+WitCensusNonconstantMonotoneSourceWeighted,18.7
+WitCensusConstantPages,16.8
+WitCensusNonconstantMonotonePages,3.3
+WitCensusChunkedPremium,1.02
+WitCensusAccessReadyPremium,1.81
 WitCensusOrderMapping,100.0
 WitCensusOrderMappingPremium,0.000
 WitCensusStructuralPremiumMedian,0.053

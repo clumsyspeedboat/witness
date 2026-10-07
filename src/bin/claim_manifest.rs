@@ -257,6 +257,40 @@ fn main() -> Result<(), Box<dyn Error>> {
         &census,
         "small_domain_column_fraction",
     )?;
+    // Constant columns and pages are trivially non-decreasing, so order that
+    // can matter to a query is reported over non-constant data.
+    for (name, key) in [
+        ("WitCensusConstantColumns", "constant_column_fraction"),
+        (
+            "WitCensusNonconstantMonotone",
+            "nonconstant_monotone_column_fraction",
+        ),
+        (
+            "WitCensusNonconstantMonotoneSourceWeighted",
+            "nonconstant_monotone_source_weighted_fraction",
+        ),
+        ("WitCensusConstantPages", "page_1024_constant_fraction"),
+        (
+            "WitCensusNonconstantMonotonePages",
+            "page_1024_nonconstant_monotone_fraction",
+        ),
+    ] {
+        define_percent(&mut out, name, &census, key)?;
+    }
+    define_metric(
+        &mut out,
+        "WitCensusChunkedPremium",
+        &census,
+        "chunked_premium_median",
+        2,
+    )?;
+    define_metric(
+        &mut out,
+        "WitCensusAccessReadyPremium",
+        &census,
+        "access_ready_premium_median",
+        2,
+    )?;
     define_percent(
         &mut out,
         "WitCensusOrderMapping",
