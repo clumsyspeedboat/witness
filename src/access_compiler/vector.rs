@@ -73,6 +73,206 @@ pub fn sum(decoder: &DecoderIr, session: &mut ReadSession<'_>, rows: Span) -> Re
     sum_ranges(decoder, session, &[rows])
 }
 
+/// A set of rows within `rows`, one bit per row: bit `r` stands for row
+/// `rows.start + r`. A bitmap costs the same however scattered the rows are,
+/// where a list of spans costs one entry per run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Selection {
+    pub rows: Span,
+    pub words: Vec<u64>,
+}
+
+impl Selection {
+    pub fn empty(rows: Span) -> Self {
+        Self {
+            rows,
+            words: vec![0; rows.len().div_ceil(64)],
+        }
+    }
+
+    /// Selects every row in `start..end`, which must lie within `rows`.
+    pub fn set_range(&mut self, start: usize, end: usize) {
+        for row in start..end {
+            let bit = row - self.rows.start;
+            self.words[bit / 64] |= 1 << (bit % 64);
+        }
+    }
+
+    pub fn contains(&self, row: usize) -> bool {
+        let bit = row - self.rows.start;
+        self.words[bit / 64] >> (bit % 64) & 1 == 1
+    }
+
+    pub fn count(&self) -> usize {
+        self.words
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    /// Selected rows in `start..end`.
+    pub fn count_range(&self, start: usize, end: usize) -> usize {
+        (start..end).filter(|&row| self.contains(row)).count()
+    }
+
+    /// The selected rows as ordered, disjoint spans.
+    pub fn ranges(&self) -> Vec<Span> {
+        let mut ranges = Vec::new();
+        for row in self.rows.start..self.rows.end {
+            if self.contains(row) {
+                push_range(&mut ranges, row, row + 1);
+            }
+        }
+        ranges
+    }
+
+    /// The span from the first selected row through the last, if any.
+    fn hull(&self) -> Option<Span> {
+        let first = self.words.iter().position(|word| *word != 0)?;
+        let last = self.words.iter().rposition(|word| *word != 0)?;
+        let start = first * 64 + self.words[first].trailing_zeros() as usize;
+        let end = last * 64 + 64 - self.words[last].leading_zeros() as usize;
+        Some(Span {
+            start: self.rows.start + start,
+            end: self.rows.start + end,
+        })
+    }
+}
+
+/// Rows of `rows` whose value lies in `[low, high]`, as a selection.
+pub fn between_selection(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    rows: Span,
+    low: i64,
+    high: i64,
+) -> Result<Selection, String> {
+    if low > high {
+        return Err("vector BETWEEN bounds are invalid".into());
+    }
+    let (low, high) = (i128::from(low), i128::from(high));
+    let mut selection = Selection::empty(rows);
+    scan(decoder, session, rows, &mut |_, row, chunk| {
+        select_chunk(&mut selection, row, chunk, low, high);
+        Ok(())
+    })?;
+    Ok(selection)
+}
+
+/// `dictionary_range` as a selection: codes are compared, never values.
+pub fn dictionary_selection(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    rows: Span,
+    low: i64,
+    high: i64,
+) -> Result<Selection, String> {
+    let &DecoderNode::Dictionary {
+        ids,
+        dictionary,
+        entries,
+        sorted_unique: true,
+    } = decoder.node(decoder.root())?
+    else {
+        return Err("dictionary selection needs a sorted dictionary root".into());
+    };
+    if low > high {
+        return Err("vector dictionary range bounds are invalid".into());
+    }
+    if rows.end > decoder.len()? {
+        return Err("vector scan exceeds the column".into());
+    }
+    let mut selection = Selection::empty(rows);
+    let low_id = table_bound(session, dictionary, entries, low, false)?;
+    let high_id = table_bound(session, dictionary, entries, high, true)?;
+    if low_id < high_id {
+        let (low_id, last_id) = (low_id as i128, high_id as i128 - 1);
+        scan_node(
+            decoder,
+            ids,
+            session,
+            rows.start,
+            rows.end,
+            &mut |_, row, chunk| {
+                let out_of_table = match &chunk {
+                    Chunk::Values(codes) => {
+                        codes.iter().any(|&id| !(0..entries as i128).contains(&id))
+                    }
+                    Chunk::Run { value, .. } => !(0..entries as i128).contains(value),
+                    Chunk::Nulls { .. } => false,
+                };
+                if out_of_table {
+                    return Err("dictionary id is outside table".into());
+                }
+                select_chunk(&mut selection, row, chunk, low_id, last_id);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(selection)
+}
+
+/// Exact SUM of the non-null values at selected rows, in one pass over the
+/// span the selection covers. Each value is added under a mask rather than a
+/// branch, so a scattered selection costs the same as a dense one.
+pub fn sum_selection(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    selection: &Selection,
+) -> Result<i128, String> {
+    if selection.rows.end > decoder.len()? {
+        return Err("vector selection exceeds the column".into());
+    }
+    let Some(hull) = selection.hull() else {
+        return Ok(0);
+    };
+    let mut total = 0_i128;
+    scan(decoder, session, hull, &mut |_, row, chunk| {
+        match chunk {
+            Chunk::Values(values) => {
+                let mut overflow = false;
+                for (index, &value) in values.iter().enumerate() {
+                    let bit = row + index - selection.rows.start;
+                    let take = (selection.words[bit / 64] >> (bit % 64) & 1) as i128;
+                    let (next, carried) = total.overflowing_add(value & take.wrapping_neg());
+                    total = next;
+                    overflow |= carried;
+                }
+                if overflow {
+                    return Err("vector selected SUM overflow".into());
+                }
+            }
+            Chunk::Run { value, len } => {
+                let count = selection.count_range(row, row + len) as i128;
+                total = value
+                    .checked_mul(count)
+                    .and_then(|run| total.checked_add(run))
+                    .ok_or("vector selected SUM overflow")?;
+            }
+            Chunk::Nulls { .. } => {}
+        }
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+fn select_chunk(selection: &mut Selection, row: usize, chunk: Chunk<'_>, low: i128, high: i128) {
+    match chunk {
+        Chunk::Values(values) => {
+            let offset = row - selection.rows.start;
+            for (index, &value) in values.iter().enumerate() {
+                let hit = u64::from(low <= value && value <= high);
+                let bit = offset + index;
+                selection.words[bit / 64] |= hit << (bit % 64);
+            }
+        }
+        Chunk::Run { value, len } if low <= value && value <= high => {
+            selection.set_range(row, row + len);
+        }
+        Chunk::Run { .. } | Chunk::Nulls { .. } => {}
+    }
+}
+
 /// Exact SUM of the non-null values in ordered, disjoint `ranges`.
 pub fn sum_ranges(
     decoder: &DecoderIr,

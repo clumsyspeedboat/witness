@@ -99,6 +99,38 @@ fn vector_execution_reads_chunked_frames() {
 }
 
 #[test]
+fn selections_agree_with_spans() {
+    for case in heldout_cases() {
+        let column = encode(&case.recipe, input_for(&case, ROWS)).unwrap();
+        let mut present = column.truth.iter().flatten().copied().collect::<Vec<_>>();
+        present.sort_unstable();
+        let mut state = case.id as u64 + 7;
+        for _ in 0..6 {
+            let (a, b) = (next(&mut state) % ROWS, next(&mut state) % ROWS);
+            let rows = Span::new(a.min(b), a.max(b) + 1).unwrap();
+            let (x, y) = (
+                present[next(&mut state) % present.len()],
+                present[next(&mut state) % present.len()],
+            );
+            let (low, high) = (x.min(y), x.max(y));
+            let ranges =
+                vector::between(&column.decoder, &mut session(&column), rows, low, high).unwrap();
+            let selection =
+                vector::between_selection(&column.decoder, &mut session(&column), rows, low, high)
+                    .unwrap();
+            assert_eq!(selection.ranges(), ranges, "{}", case.name());
+            assert_eq!(
+                selection.count(),
+                ranges.iter().map(|range| range.len()).sum::<usize>()
+            );
+            let summed =
+                vector::sum_selection(&column.decoder, &mut session(&column), &selection).unwrap();
+            assert_eq!(summed, truth_sum(&column, &ranges), "{}", case.name());
+        }
+    }
+}
+
+#[test]
 fn licensed_searches_agree_with_a_scan() {
     let sorted = (0..ROWS as i64)
         .map(|row| Some(1_000 + row / 3))

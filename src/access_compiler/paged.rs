@@ -474,6 +474,49 @@ pub fn execute_sum(
     }
 }
 
+/// Matching rows of one page as a selection, for actions that decode every
+/// row anyway: one bit per row however scattered the matches, where search
+/// and acceptance yield a few contiguous spans.
+pub fn execute_between_selection(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    action: &PageAction,
+    low: i64,
+    high: i64,
+) -> Result<vector::Selection, String> {
+    let decoder = &page.column.decoder;
+    let all = Span::new(0, page.rows())?;
+    match action {
+        PageAction::Translate(_) => vector::dictionary_selection(decoder, session, all, low, high),
+        PageAction::Scan => vector::between_selection(decoder, session, all, low, high),
+        _ => {
+            let mut selection = vector::Selection::empty(all);
+            for range in execute_between(page, session, action, low, high)? {
+                selection.set_range(range.start, range.end);
+            }
+            Ok(selection)
+        }
+    }
+}
+
+/// SUM over the selected rows of a value page, in one pass.
+pub fn execute_sum_selection(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    action: &SumAction,
+    selection: &vector::Selection,
+) -> Result<i128, String> {
+    match action {
+        SumAction::Decode => vector::sum_selection(&page.column.decoder, session, selection),
+        SumAction::Constant(licence) => {
+            let (value, _) = licence.evidence.ok_or("constant SUM lost its evidence")?;
+            value
+                .checked_mul(selection.count() as i128)
+                .ok_or_else(|| "constant SUM overflow".into())
+        }
+    }
+}
+
 /// How the pages of one query were answered.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PageCounts {
@@ -534,8 +577,27 @@ pub fn sum_where(
             ReadSession::new_untracked(&selector_page.column.page, ClosureMode::Selective);
         let action = plan_between(selector_page, &mut session, low, high, planning)?;
         counts.record(&action);
-        let ranges = execute_between(selector_page, &mut session, &action, low, high)?;
-        if ranges.is_empty() {
+        // Search and acceptance select a few contiguous spans; a scan or a
+        // code translation may select rows anywhere, which a bitmap carries
+        // at one bit per row and the value page consumes in one pass.
+        let selected = match action {
+            PageAction::Skip(_) => return Ok((0, 0, counts)),
+            PageAction::Translate(_) | PageAction::Scan => Selected::Bitmap(
+                execute_between_selection(selector_page, &mut session, &action, low, high)?,
+            ),
+            _ => Selected::Spans(execute_between(
+                selector_page,
+                &mut session,
+                &action,
+                low,
+                high,
+            )?),
+        };
+        let matched = match &selected {
+            Selected::Spans(ranges) => ranges.iter().map(|range| range.len()).sum::<usize>(),
+            Selected::Bitmap(selection) => selection.count(),
+        };
+        if matched == 0 {
             return Ok((0, 0, counts));
         }
         let mut session =
@@ -544,8 +606,12 @@ pub fn sum_where(
         if matches!(sum_action, SumAction::Constant(_)) {
             counts.constant_sums += 1;
         }
-        let sum = execute_sum(value_page, &mut session, &sum_action, &ranges)?;
-        let matched = ranges.iter().map(|range| range.len()).sum::<usize>();
+        let sum = match &selected {
+            Selected::Spans(ranges) => execute_sum(value_page, &mut session, &sum_action, ranges)?,
+            Selected::Bitmap(selection) => {
+                execute_sum_selection(value_page, &mut session, &sum_action, selection)?
+            }
+        };
         Ok((sum, matched, counts))
     })?;
     let mut total = 0_i128;
@@ -557,6 +623,12 @@ pub fn sum_where(
         counts.add(&page_counts);
     }
     Ok((total, matched, counts))
+}
+
+/// The rows one selector page selects, in the form its action produced.
+enum Selected {
+    Spans(Vec<Span>),
+    Bitmap(vector::Selection),
 }
 
 /// Matching rows of a paged column, as column-row spans.
