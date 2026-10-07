@@ -634,6 +634,9 @@ pub fn sum_where(
     Ok((total, matched, counts))
 }
 
+/// Fewest pages a thread is started for.
+const MIN_PAGES_PER_THREAD: usize = 16;
+
 /// Rows a fused pass may decode per span it saves: a span costs one scan
 /// dispatch, about as much as decoding this many rows in a batch.
 const SPAN_COST_ROWS: usize = 64;
@@ -681,7 +684,10 @@ where
     T: Send,
     F: Fn(usize) -> Result<T, String> + Sync,
 {
-    if threads <= 1 || pages <= 1 {
+    // A thread costs about as much to start as a few pages cost to plan and
+    // scan, so small columns use fewer threads than asked.
+    let threads = threads.min(pages / MIN_PAGES_PER_THREAD).max(1);
+    if threads <= 1 {
         return (0..pages).map(&work).collect();
     }
     let next = AtomicUsize::new(0);

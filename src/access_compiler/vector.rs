@@ -161,6 +161,29 @@ pub fn between_selection(
     }
     let (low, high) = (i128::from(low), i128::from(high));
     let mut selection = Selection::empty(rows);
+    // A frame-of-reference root over bit-packed codes compares the codes
+    // against the predicate shifted by the base, which is exact and skips
+    // adding the base to every value.
+    if let DecoderNode::For { base, values } = *decoder.node(decoder.root())?
+        && matches!(decoder.node(values)?, DecoderNode::BitUnpack { .. })
+    {
+        if rows.end > decoder.len()? {
+            return Err("vector scan exceeds the column".into());
+        }
+        let base = i128::from(session.read_i64(base, 0)?);
+        scan_node(
+            decoder,
+            values,
+            session,
+            rows.start,
+            rows.end,
+            &mut |_, row, chunk| {
+                select_chunk(&mut selection, row, chunk, low - base, high - base);
+                Ok(())
+            },
+        )?;
+        return Ok(selection);
+    }
     scan(decoder, session, rows, &mut |_, row, chunk| {
         select_chunk(&mut selection, row, chunk, low, high);
         Ok(())
