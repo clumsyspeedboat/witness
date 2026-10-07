@@ -25,6 +25,9 @@ pub struct Page {
     pub start: usize,
     pub column: EncodedColumn,
     pub facts: InvariantSet,
+    /// First and last value of a dense page that proves itself
+    /// non-decreasing, read when the page was sealed.
+    pub ends: Option<(i128, i128)>,
 }
 
 impl Page {
@@ -95,6 +98,9 @@ pub struct PagedColumn {
     pages: Vec<Page>,
     page_rows: usize,
     rows: usize,
+    /// Leading pages that are each non-decreasing and whose seams never
+    /// decrease: the column's checked order certificate, kept by `append`.
+    ordered_pages: usize,
 }
 
 impl PagedColumn {
@@ -106,6 +112,7 @@ impl PagedColumn {
             pages: Vec::new(),
             page_rows,
             rows: 0,
+            ordered_pages: 0,
         })
     }
 
@@ -121,7 +128,9 @@ impl PagedColumn {
 
     /// Appends `values` as new sealed pages. Existing pages, and the facts
     /// they prove, are untouched, so appending never invalidates a plan made
-    /// for an earlier page.
+    /// for an earlier page. Order across pages is maintained in O(1) per
+    /// page: a new page extends the ordered prefix when it proves itself
+    /// non-decreasing and starts no lower than the previous page ends.
     pub fn append(&mut self, values: &[Option<i64>], policy: &PagePolicy) -> Result<(), String> {
         for chunk in values.chunks(self.page_rows) {
             let column = policy.encode(chunk)?;
@@ -130,14 +139,73 @@ impl PagedColumn {
                 column.page.layout(),
                 column.page.invariants(),
             )?;
+            let ends = if facts.contains(
+                column.decoder.root(),
+                FactScope::AllRows,
+                Property::Value(ValueInvariant::NonDecreasing),
+            ) {
+                let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+                let first = vector::get(&column.decoder, &mut session, 0)?;
+                let last = vector::get(&column.decoder, &mut session, chunk.len() - 1)?;
+                first.zip(last)
+            } else {
+                None
+            };
+            let extends = self.ordered_pages == self.pages.len()
+                && ends.is_some_and(|(first, _)| {
+                    self.pages
+                        .last()
+                        .is_none_or(|previous| previous.ends.is_some_and(|(_, last)| last <= first))
+                });
+            if extends {
+                self.ordered_pages += 1;
+            }
             self.pages.push(Page {
                 start: self.rows,
                 column,
                 facts,
+                ends,
             });
             self.rows += chunk.len();
         }
         Ok(())
+    }
+
+    /// Whether every page is non-decreasing and no seam decreases, so the
+    /// whole column is non-decreasing.
+    pub fn ordered(&self) -> bool {
+        !self.pages.is_empty() && self.ordered_pages == self.pages.len()
+    }
+
+    /// Pages that can hold a value in `[low, high]` when the column is
+    /// ordered: everything before the first page ending at or above `low`
+    /// and after the last page starting at or below `high` holds none. The
+    /// pages just outside the range are re-read to confirm the boundary.
+    fn candidate_pages(&self, low: i128, high: i128) -> Result<Option<(usize, usize)>, String> {
+        if !self.ordered() {
+            return Ok(None);
+        }
+        // `append` extends the ordered prefix only with pages that have ends,
+        // and seams never decrease, so both page ends are sorted.
+        let first = self
+            .pages
+            .partition_point(|page| page.ends.is_some_and(|(_, last)| last < low));
+        let end = self
+            .pages
+            .partition_point(|page| page.ends.is_some_and(|(start, _)| start <= high));
+        let confirm = |index: usize, row_of: fn(&Page) -> usize| -> Result<i128, String> {
+            let page = &self.pages[index];
+            let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+            vector::get(&page.column.decoder, &mut session, row_of(page))?
+                .ok_or_else(|| "ordered page holds a null".into())
+        };
+        if first > 0 && confirm(first - 1, |page| page.rows() - 1)? >= low {
+            return Err("column order certificate disagrees with its pages".into());
+        }
+        if end < self.pages.len() && confirm(end, |_| 0)? <= high {
+            return Err("column order certificate disagrees with its pages".into());
+        }
+        Ok(Some((first, end.max(first))))
     }
 
     pub fn pages(&self) -> &[Page] {
@@ -571,11 +639,31 @@ pub fn sum_where(
     // a query whose pages are nearly all skipped never pays to start any.
     let mut counts = PageCounts::default();
     let mut work = Vec::new();
-    for (index, (selector_page, value_page)) in selector.pages.iter().zip(&value.pages).enumerate()
+    // On a column ordered across pages, only a contiguous run of pages can
+    // match; every page outside it is skipped without being planned.
+    let (first, end) = match planning {
+        Planning::Facts => selector
+            .candidate_pages(i128::from(low), i128::from(high))?
+            .unwrap_or((0, selector.pages.len())),
+        Planning::ScanOnly => (0, selector.pages.len()),
+    };
+    counts.skipped += selector.pages.len() - (end - first);
+    if selector
+        .pages
+        .iter()
+        .zip(&value.pages)
+        .any(|(left, right)| left.start != right.start || left.rows() != right.rows())
     {
-        if selector_page.start != value_page.start || selector_page.rows() != value_page.rows() {
-            return Err("SUM WHERE pages cover different rows".into());
-        }
+        return Err("SUM WHERE pages cover different rows".into());
+    }
+    for (index, (selector_page, _)) in selector
+        .pages
+        .iter()
+        .zip(&value.pages)
+        .enumerate()
+        .take(end)
+        .skip(first)
+    {
         let mut session =
             ReadSession::new_untracked(&selector_page.column.page, ClosureMode::Selective);
         let action = plan_between(selector_page, &mut session, low, high, planning)?;

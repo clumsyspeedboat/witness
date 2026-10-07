@@ -254,6 +254,62 @@ fn appending_seals_new_pages_and_keeps_old_ones() {
 }
 
 #[test]
+fn an_ordered_column_plans_only_the_pages_that_can_match() {
+    let selector_values = (0..40 * PAGE as i64)
+        .map(|row| Some(row / 3))
+        .collect::<Vec<_>>();
+    let value_values = (0..40 * PAGE as i64)
+        .map(|row| Some(row % 11))
+        .collect::<Vec<_>>();
+    let mut selector = PagedColumn::from_values(&selector_values, PAGE, &policy()).unwrap();
+    let mut value = PagedColumn::from_values(&value_values, PAGE, &policy()).unwrap();
+    assert!(selector.ordered());
+    let check = |selector: &PagedColumn,
+                 value: &PagedColumn,
+                 selected: &[Option<i64>],
+                 values: &[Option<i64>]| {
+        for (low, high) in [
+            (5_000, 5_100),
+            (0, 10),
+            (13_000, 20_000),
+            (-10, -1),
+            (100, 100),
+        ] {
+            let expected = truth_ranges(selected, low, high);
+            let sum: i128 = expected
+                .iter()
+                .flat_map(|range| &values[range.start..range.end])
+                .flatten()
+                .map(|&value| i128::from(value))
+                .sum();
+            let rows: usize = expected.iter().map(|range| range.len()).sum();
+            for threads in [1, 4] {
+                let (got, matched, _) =
+                    paged::sum_where(selector, value, low, high, Planning::Facts, threads).unwrap();
+                assert_eq!((got, matched), (sum, rows), "{low}..={high} x{threads}");
+            }
+        }
+    };
+    check(&selector, &value, &selector_values, &value_values);
+    let (_, _, counts) =
+        paged::sum_where(&selector, &value, 5_000, 5_010, Planning::Facts, 1).unwrap();
+    assert!(
+        counts.skipped >= 38,
+        "a narrow predicate plans at most two pages: {counts:?}"
+    );
+
+    // A page that starts below the previous page's end breaks the column
+    // certificate; answers stay exact through per-page planning.
+    let tail = vec![Some(0_i64); PAGE];
+    selector.append(&tail, &policy()).unwrap();
+    value.append(&tail, &policy()).unwrap();
+    assert!(!selector.ordered());
+    let selected = [selector_values, tail.clone()].concat();
+    let values = [value_values, tail].concat();
+    check(&selector, &value, &selected, &values);
+}
+
+#[test]
 fn a_constant_value_page_sums_without_decoding() {
     let selector_values = (0..4 * PAGE as i64).map(Some).collect::<Vec<_>>();
     let value_values = vec![Some(7_i64); 4 * PAGE];
