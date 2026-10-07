@@ -1179,6 +1179,23 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             );
         }
     }
+    let compact = ratios("witness_compact_facts", "parquet_zstd_indexed", None);
+    define(
+        out,
+        "WitPagedCompactZstdMedian",
+        &format!("{:.2}", median(&compact)),
+    );
+    define(
+        out,
+        "WitPagedCompactZstdWins",
+        &group_digits(
+            &compact
+                .iter()
+                .filter(|ratio| **ratio < 1.0)
+                .count()
+                .to_string(),
+        ),
+    );
     let ablation = ratios("witness_direct_facts", "witness_direct_scan", None);
     let geometric =
         (ablation.iter().map(|ratio| ratio.ln()).sum::<f64>() / ablation.len() as f64).exp();

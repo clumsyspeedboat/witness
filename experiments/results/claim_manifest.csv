@@ -177,6 +177,8 @@ WitPagedZstdTenth,0.37
 WitPagedZstdOnePct,0.41
 WitPagedZstdTenPct,0.43
 WitPagedZstdFiftyPct,0.37
+WitPagedCompactZstdMedian,0.82
+WitPagedCompactZstdWins,798
 WitPagedFactsOverScanGeo,0.81
 WitPagedSkippedPages,9.1
 WitPagedBoundSkipRecovery,96.8
