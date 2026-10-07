@@ -1196,6 +1196,12 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
                 .to_string(),
         ),
     );
+    let scan_only = ratios("witness_direct_scan", "parquet_plain_indexed", None);
+    define(
+        out,
+        "WitPagedScanOverPlainMedian",
+        &format!("{:.2}", median(&scan_only)),
+    );
     let ablation = ratios("witness_direct_facts", "witness_direct_scan", None);
     let geometric =
         (ablation.iter().map(|ratio| ratio.ln()).sum::<f64>() / ablation.len() as f64).exp();
