@@ -143,6 +143,16 @@ path = "src/bin/witness_explore.rs"
 required-features = ["experiment"]
 
 [[bin]]
+name = "paged_study"
+path = "src/bin/paged_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "paged_scale_study"
+path = "src/bin/paged_scale_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
 name = "claim_manifest"
 path = "src/bin/claim_manifest.rs"
 required-features = ["experiment"]
