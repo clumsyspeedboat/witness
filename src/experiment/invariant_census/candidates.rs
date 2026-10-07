@@ -1,6 +1,7 @@
 use crate::access_compiler::{
     AccessInvariant, ClosureMode, DecoderNode, EncodedColumn, Evidence, FactScope, InputColumn,
-    MappingInvariant, Property, ReadSession, Recipe, ValueInvariant, derive_invariants, encode,
+    MappingInvariant, Property, ReadSession, Recipe, ValueInvariant, bound_interval,
+    derive_invariants, encode,
 };
 
 use super::model::CandidateRow;
@@ -20,7 +21,7 @@ pub fn analyze_candidates(
             encoded.page.layout(),
             encoded.page.invariants(),
         )?;
-        validate_semantic_facts(&encoded.truth, encoded.decoder.root(), &facts)?;
+        validate_semantic_facts(&encoded, &facts)?;
         validate_mapping_payloads(&encoded)?;
         let root = encoded.decoder.root();
         let structural_monotone = facts.iter().any(|fact| {
@@ -195,10 +196,11 @@ fn recipes(nullable: bool, rows: usize) -> Vec<(String, Recipe)> {
 }
 
 fn validate_semantic_facts(
-    truth: &[Option<i64>],
-    root: crate::access_compiler::NodeId,
+    encoded: &EncodedColumn,
     facts: &crate::access_compiler::InvariantSet,
 ) -> Result<(), String> {
+    let truth = &encoded.truth;
+    let root = encoded.decoder.root();
     for fact in facts.iter().filter(|fact| fact.node == root) {
         let sound = match fact.property {
             Property::Value(ValueInvariant::NonDecreasing) => match fact.scope {
@@ -221,6 +223,15 @@ fn validate_semantic_facts(
                         .chunks(max_rows)
                         .all(|chunk| chunk.windows(2).all(|pair| pair[0] <= pair[1]))
             }
+            Property::Value(ValueInvariant::Bounded(source)) => {
+                let mut session = ReadSession::new_untracked(&encoded.page, ClosureMode::Selective);
+                let (low, high) = bound_interval(&mut session, source)?;
+                truth
+                    .iter()
+                    .flatten()
+                    .all(|&value| low <= i128::from(value) && i128::from(value) <= high)
+            }
+            Property::Value(ValueInvariant::AllNull) => truth.iter().all(Option::is_none),
             _ => true,
         };
         if !sound {
