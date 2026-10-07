@@ -8,7 +8,10 @@ use super::{
 };
 
 const MAGIC: &[u8; 8] = b"ACPAGE01";
-const VERSION: u32 = 3;
+/// Version 4 adds chunked frames: a frame descriptor may mark the frame as a
+/// continuation of the previous frame's decoded stream.
+const VERSION: u32 = 4;
+const UNCHUNKED_VERSION: u32 = 3;
 const LEGACY_VERSION: u32 = 2;
 const LEGACY_HEADER_BASE: usize = 32;
 const HEADER_BASE: usize = 48;
@@ -63,7 +66,7 @@ impl SerializedPage {
         let version = read_u32(&bytes, 8)?;
         let header_base = match version {
             LEGACY_VERSION => LEGACY_HEADER_BASE,
-            VERSION => HEADER_BASE,
+            UNCHUNKED_VERSION | VERSION => HEADER_BASE,
             _ => return Err("unsupported access-page version".into()),
         };
         if bytes.len() < header_base {
@@ -80,7 +83,7 @@ impl SerializedPage {
         if header_length > bytes.len() {
             return Err("access-page directory is truncated".into());
         }
-        let invariants = if version == VERSION {
+        let invariants = if version != LEGACY_VERSION {
             let flags = read_u32(&bytes, FLAGS_AT)?;
             if flags & !KNOWN_FLAGS != 0 {
                 return Err("access-page descriptor has unknown invariant flags".into());
@@ -145,6 +148,14 @@ impl SerializedPage {
             if read_u32(&bytes, at)? as usize != index || bytes[at + 4] != 1 {
                 return Err("invalid frame id or codec".into());
             }
+            let continues = match (version, bytes[at + 5]) {
+                (VERSION, 1) => true,
+                (_, 0) => false,
+                _ => return Err("invalid frame continuation flag".into()),
+            };
+            if continues && index == 0 {
+                return Err("first frame cannot continue another".into());
+            }
             frames.push(FrameLayout {
                 id: FrameId(index),
                 codec: FrameCodec::Zstd,
@@ -152,6 +163,7 @@ impl SerializedPage {
                 compressed_length: to_usize(read_u64(&bytes, at + 16)?)?,
                 decoded_length: to_usize(read_u64(&bytes, at + 24)?)?,
                 alignment: PAGE_ALIGNMENT,
+                continues,
             });
         }
         let dependencies_at = frames_at + frame_count * FRAME_DESC;
@@ -233,6 +245,7 @@ pub(crate) struct PageBuilder {
     fields: Vec<FieldSpec>,
     dependencies: Vec<DependencyRule>,
     next_frame_group: usize,
+    chunk_bytes: BTreeMap<usize, usize>,
     invariants: CheckedInvariants,
 }
 
@@ -248,6 +261,7 @@ impl PageBuilder {
             }],
             dependencies: Vec::new(),
             next_frame_group: 0,
+            chunk_bytes: BTreeMap::new(),
             invariants,
         }
     }
@@ -281,6 +295,23 @@ impl PageBuilder {
         Ok(id)
     }
 
+    /// Frames fields `start..end` as one decoded stream compressed in
+    /// independent chunks of `chunk_bytes` decoded bytes.
+    pub(crate) fn frame_fields_chunked(
+        &mut self,
+        start: usize,
+        end: usize,
+        chunk_bytes: usize,
+    ) -> Result<(), String> {
+        if chunk_bytes == 0 {
+            return Err("frame chunks must be positive".into());
+        }
+        let group = self.next_frame_group;
+        self.frame_fields(start, end)?;
+        self.chunk_bytes.insert(group, chunk_bytes);
+        Ok(())
+    }
+
     pub(crate) fn frame_fields(&mut self, start: usize, end: usize) -> Result<(), String> {
         if start == 0 || start >= end || end > self.fields.len() {
             return Err("invalid frame field range".into());
@@ -306,8 +337,33 @@ impl PageBuilder {
                 groups.entry(group).or_default().push(FieldId(index));
             }
         }
+        // Each group's decoded stream is assembled first: chunking decides the
+        // frame count, and the frame count sizes the header.
+        let mut streams = Vec::with_capacity(groups.len());
+        for (group, field_ids) in &groups {
+            let mut decoded = Vec::new();
+            let mut offsets = Vec::with_capacity(field_ids.len());
+            for field_id in field_ids {
+                let field = &self.fields[field_id.0];
+                let decoded_offset = align_up(decoded.len(), field.alignment)?;
+                decoded.resize(decoded_offset, 0);
+                offsets.push((*field_id, decoded_offset));
+                decoded.extend_from_slice(&field.bytes);
+            }
+            let chunk = self
+                .chunk_bytes
+                .get(group)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .min(decoded.len())
+                .max(1);
+            streams.push((offsets, decoded, chunk));
+        }
         let field_count = self.fields.len();
-        let frame_count = groups.len();
+        let frame_count = streams
+            .iter()
+            .map(|(_, decoded, chunk)| decoded.len().div_ceil(*chunk).max(1))
+            .sum();
         let header_length = header_length(
             HEADER_BASE,
             field_count,
@@ -331,33 +387,37 @@ impl PageBuilder {
 
         let mut compressed_frames = Vec::new();
         let mut frames = Vec::new();
-        for (frame_index, field_ids) in groups.values().enumerate() {
-            let mut decoded = Vec::new();
-            for field_id in field_ids {
-                let field = &self.fields[field_id.0];
-                let decoded_offset = align_up(decoded.len(), field.alignment)?;
-                decoded.resize(decoded_offset, 0);
+        for (offsets, decoded, chunk) in &streams {
+            let head = FrameId(frames.len());
+            for (field_id, decoded_offset) in offsets {
                 field_locations[field_id.0] = Some(FieldLocation::Framed {
-                    frame: FrameId(frame_index),
-                    decoded_offset,
+                    frame: head,
+                    decoded_offset: *decoded_offset,
                 });
-                decoded.extend_from_slice(&field.bytes);
             }
-            let compressed = zstd::bulk::compress(&decoded, 3)
-                .map_err(|error| format!("Zstd frame compression failed: {error}"))?;
-            cursor = align_up(cursor, PAGE_ALIGNMENT)?;
-            frames.push(FrameLayout {
-                id: FrameId(frame_index),
-                codec: FrameCodec::Zstd,
-                offset: cursor,
-                compressed_length: compressed.len(),
-                decoded_length: decoded.len(),
-                alignment: PAGE_ALIGNMENT,
-            });
-            cursor = cursor
-                .checked_add(compressed.len())
-                .ok_or("frame offset overflow")?;
-            compressed_frames.push(compressed);
+            let pieces = if decoded.is_empty() {
+                vec![&decoded[..]]
+            } else {
+                decoded.chunks(*chunk).collect()
+            };
+            for (index, piece) in pieces.into_iter().enumerate() {
+                let compressed = zstd::bulk::compress(piece, 3)
+                    .map_err(|error| format!("Zstd frame compression failed: {error}"))?;
+                cursor = align_up(cursor, PAGE_ALIGNMENT)?;
+                frames.push(FrameLayout {
+                    id: FrameId(frames.len()),
+                    codec: FrameCodec::Zstd,
+                    offset: cursor,
+                    compressed_length: compressed.len(),
+                    decoded_length: piece.len(),
+                    alignment: PAGE_ALIGNMENT,
+                    continues: index > 0,
+                });
+                cursor = cursor
+                    .checked_add(compressed.len())
+                    .ok_or("frame offset overflow")?;
+                compressed_frames.push(compressed);
+            }
         }
 
         let mut bytes = vec![0_u8; cursor];
@@ -446,6 +506,7 @@ fn write_header(
         let at = frames_at + frame.id.0 * FRAME_DESC;
         put_u32(bytes, at, frame.id.0 as u32)?;
         bytes[at + 4] = 1;
+        bytes[at + 5] = u8::from(frame.continues);
         put_u64(bytes, at + 8, frame.offset as u64)?;
         put_u64(bytes, at + 16, frame.compressed_length as u64)?;
         put_u64(bytes, at + 24, frame.decoded_length as u64)?;

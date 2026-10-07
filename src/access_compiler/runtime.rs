@@ -4,6 +4,14 @@ use std::os::unix::fs::FileExt;
 
 use super::{AccessSet, FieldId, FieldLocation, FrameCodec, FrameId, SerializedPage, Span};
 
+/// Decoded bytes of one frame group. Chunks decode on first touch, in place.
+struct FrameBuffer {
+    bytes: Vec<u8>,
+    chunk: usize,
+    decoded: Vec<bool>,
+    pending: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClosureMode {
     Selective,
@@ -32,7 +40,7 @@ pub struct ReadSession<'a> {
     delivered: Vec<Span>,
     transferred: Vec<Span>,
     storage_cache: Vec<u8>,
-    frames: BTreeMap<FrameId, Vec<u8>>,
+    frames: BTreeMap<FrameId, FrameBuffer>,
     source: ReadSource<'a>,
     transfer_operations: usize,
     frames_decoded: usize,
@@ -480,44 +488,67 @@ impl<'a> ReadSession<'a> {
                 frame,
                 decoded_offset,
             } => {
-                self.ensure_frame(frame)?;
-                let decoded = &self.frames[&frame];
-                Ok(&decoded[decoded_offset + span.start..decoded_offset + span.end])
+                let decoded = Span::new(decoded_offset + span.start, decoded_offset + span.end)?;
+                self.ensure_frame(frame, decoded)?;
+                Ok(&self.frames[&frame].bytes[decoded.start..decoded.end])
             }
         }
     }
 
-    fn ensure_frame(&mut self, frame_id: FrameId) -> Result<(), String> {
-        if self.frames.contains_key(&frame_id) {
-            return Ok(());
-        }
-        let frame = self
-            .page
-            .layout()
-            .frames
-            .get(frame_id.0)
-            .ok_or("framed read references absent frame")?
-            .clone();
-        let delivered = match self.mode {
-            ClosureMode::Selective => {
-                Span::new(frame.offset, frame.offset + frame.compressed_length)?
+    /// Decodes the chunks of frame group `head` that `decoded` spans. An
+    /// unchunked frame is one chunk, decoded whole on its first read.
+    fn ensure_frame(&mut self, head: FrameId, decoded: Span) -> Result<(), String> {
+        if let Some(buffer) = self.frames.get(&head) {
+            if buffer.pending == 0 {
+                return Ok(());
             }
-            ClosureMode::FullPage => Span::new(0, self.page.bytes().len())?,
-        };
-        if self.track_access || !matches!(&self.source, ReadSource::Memory) {
-            self.deliver(delivered)?;
+            let (first, last) = chunk_range(buffer.chunk, buffer.decoded.len(), decoded);
+            if buffer.decoded[first..=last].iter().all(|done| *done) {
+                return Ok(());
+            }
         }
-        let compressed_range = frame.offset..frame.offset + frame.compressed_length;
-        let compressed = match &self.source {
-            ReadSource::Memory => &self.page.bytes()[compressed_range],
-            _ => &self.storage_cache[compressed_range],
-        };
-        let decoded = match frame.codec {
-            FrameCodec::Zstd => zstd::bulk::decompress(compressed, frame.decoded_length)
-                .map_err(|error| format!("Zstd frame decompression failed: {error}"))?,
-        };
-        self.frames.insert(frame_id, decoded);
-        self.frames_decoded += 1;
+        let group = self.page.layout().frame_group(head)?.to_vec();
+        let chunk = group[0].decoded_length.max(1);
+        let buffer = self.frames.entry(head).or_insert_with(|| FrameBuffer {
+            bytes: vec![0; group.iter().map(|frame| frame.decoded_length).sum()],
+            chunk,
+            decoded: vec![false; group.len()],
+            pending: group.len(),
+        });
+        let (first, last) = chunk_range(chunk, group.len(), decoded);
+        let missing = (first..=last)
+            .filter(|&index| !buffer.decoded[index])
+            .collect::<Vec<_>>();
+        for index in missing {
+            let frame = &group[index];
+            let delivered = match self.mode {
+                ClosureMode::Selective => {
+                    Span::new(frame.offset, frame.offset + frame.compressed_length)?
+                }
+                ClosureMode::FullPage => Span::new(0, self.page.bytes().len())?,
+            };
+            if self.track_access || !matches!(&self.source, ReadSource::Memory) {
+                self.deliver(delivered)?;
+            }
+            let compressed_range = frame.offset..frame.offset + frame.compressed_length;
+            let compressed = match &self.source {
+                ReadSource::Memory => &self.page.bytes()[compressed_range],
+                _ => &self.storage_cache[compressed_range],
+            };
+            let decoded = match frame.codec {
+                FrameCodec::Zstd => zstd::bulk::decompress(compressed, frame.decoded_length)
+                    .map_err(|error| format!("Zstd frame decompression failed: {error}"))?,
+            };
+            if decoded.len() != frame.decoded_length {
+                return Err("Zstd frame decoded to the wrong length".into());
+            }
+            let buffer = self.frames.get_mut(&head).ok_or("frame buffer vanished")?;
+            let start = index * buffer.chunk;
+            buffer.bytes[start..start + decoded.len()].copy_from_slice(&decoded);
+            buffer.decoded[index] = true;
+            buffer.pending -= 1;
+            self.frames_decoded += 1;
+        }
         Ok(())
     }
 
@@ -562,6 +593,19 @@ impl<'a> ReadSession<'a> {
 /// field at any bit alignment, and a size the compiler can turn into a fixed
 /// unaligned load.
 const WIDE_LOAD: usize = 16;
+
+/// Chunks `first..=last` of a group of `chunks` uniform chunks of `chunk`
+/// decoded bytes that intersect `decoded`; an empty span touches the chunk
+/// holding its position, clamped to the last chunk.
+fn chunk_range(chunk: usize, chunks: usize, decoded: Span) -> (usize, usize) {
+    let first = (decoded.start / chunk).min(chunks - 1);
+    let last = if decoded.is_empty() {
+        first
+    } else {
+        ((decoded.end - 1) / chunk).min(chunks - 1)
+    };
+    (first, last)
+}
 
 /// Unpacks `rows` from `bytes`, the delivered slice starting at stream byte
 /// `first_byte`. Callers have validated that the slice covers every row.

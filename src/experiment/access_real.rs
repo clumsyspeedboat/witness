@@ -410,6 +410,7 @@ mod tests {
             Recipe::For(values)
             | Recipe::Dictionary(values)
             | Recipe::Frame(values)
+            | Recipe::ChunkedFrame { values, .. }
             | Recipe::Patch { values, .. }
             | Recipe::Nullable { values, .. }
             | Recipe::Rle { values, .. } => bounded_access_dependency(values),

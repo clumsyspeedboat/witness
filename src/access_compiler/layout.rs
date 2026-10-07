@@ -95,6 +95,10 @@ pub struct FrameLayout {
     pub compressed_length: usize,
     pub decoded_length: usize,
     pub alignment: usize,
+    /// The frame continues the decoded stream of the frame before it. A
+    /// chunked frame is a head frame followed by continuation frames, each
+    /// compressed on its own, so a read decompresses only the chunks it spans.
+    pub continues: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,6 +139,23 @@ pub struct ByteClosure {
 }
 
 impl LayoutIr {
+    /// The frames holding one decoded stream: `head` and every continuation
+    /// frame after it. An unchunked frame is a group of one.
+    pub fn frame_group(&self, head: FrameId) -> Result<&[FrameLayout], String> {
+        let first = self
+            .frames
+            .get(head.0)
+            .ok_or("layout references an absent frame")?;
+        if first.continues {
+            return Err("layout references a continuation frame directly".into());
+        }
+        let end = self.frames[head.0 + 1..]
+            .iter()
+            .position(|frame| !frame.continues)
+            .map_or(self.frames.len(), |offset| head.0 + 1 + offset);
+        Ok(&self.frames[head.0..end])
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.fields.get(self.metadata.0).is_none() {
             return Err("layout metadata field is absent".into());
@@ -153,11 +174,13 @@ impl LayoutIr {
                     frame,
                     decoded_offset,
                 } => {
-                    let frame = self
-                        .frames
-                        .get(frame.0)
-                        .ok_or_else(|| format!("field {index} references an absent frame"))?;
-                    if decoded_offset + field.length > frame.decoded_length {
+                    let decoded_length = self
+                        .frame_group(frame)
+                        .map_err(|error| format!("field {index}: {error}"))?
+                        .iter()
+                        .map(|frame| frame.decoded_length)
+                        .sum::<usize>();
+                    if decoded_offset + field.length > decoded_length {
                         return Err(format!("field {index} exceeds decoded frame"));
                     }
                 }
@@ -168,8 +191,28 @@ impl LayoutIr {
                 || frame.alignment == 0
                 || frame.offset % frame.alignment != 0
                 || frame.offset + frame.compressed_length > self.file_length
+                || (index == 0 && frame.continues)
             {
                 return Err(format!("invalid frame {index}"));
+            }
+            // Chunk lookup divides by the head's decoded length, so every
+            // chunk but the last must match it and the last may not exceed it.
+            if frame.continues {
+                let head = self.frames[..index]
+                    .iter()
+                    .rposition(|frame| !frame.continues)
+                    .ok_or("continuation frame has no head")?;
+                let chunk = self.frames[head].decoded_length;
+                let last = self
+                    .frames
+                    .get(index + 1)
+                    .is_none_or(|next| !next.continues);
+                if self.frames[index - 1].decoded_length != chunk
+                    || frame.decoded_length > chunk
+                    || (!last && frame.decoded_length != chunk)
+                {
+                    return Err(format!("frame {index} breaks its group's chunk size"));
+                }
             }
         }
         for rule in &self.dependencies {
@@ -237,12 +280,18 @@ impl LayoutIr {
                             .min(field.length);
                         delivered.push(Span::new(offset + start, offset + end)?);
                     }
-                    FieldLocation::Framed { frame, .. } => {
-                        let frame = &self.frames[frame.0];
-                        delivered.push(Span::new(
-                            frame.offset,
-                            frame.offset + frame.compressed_length,
-                        )?);
+                    FieldLocation::Framed {
+                        frame,
+                        decoded_offset,
+                    } => {
+                        let decoded =
+                            Span::new(decoded_offset + span.start, decoded_offset + span.end)?;
+                        for chunk in frame_chunks(self.frame_group(frame)?, decoded) {
+                            delivered.push(Span::new(
+                                chunk.offset,
+                                chunk.offset + chunk.compressed_length,
+                            )?);
+                        }
                     }
                 }
             }
@@ -257,6 +306,24 @@ impl LayoutIr {
             delivered_bytes,
         })
     }
+}
+
+/// The frames of `group` whose decoded bytes intersect `decoded`, in order. A
+/// group of one is returned whole, so an unchunked frame behaves as before.
+pub fn frame_chunks(group: &[FrameLayout], decoded: Span) -> impl Iterator<Item = &FrameLayout> {
+    let whole = group.len() == 1;
+    let mut start = 0;
+    group.iter().filter(move |frame| {
+        let end = start + frame.decoded_length;
+        let hit = whole
+            || if decoded.is_empty() {
+                start <= decoded.start && decoded.start < end
+            } else {
+                start < decoded.end && decoded.start < end
+            };
+        start = end;
+        hit
+    })
 }
 
 fn apply_dependency(

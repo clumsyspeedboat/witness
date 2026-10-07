@@ -157,6 +157,14 @@ fn parse_recipe(spec: &str) -> Result<Recipe, String> {
         "Frame" => Ok(Recipe::Frame(Box::new(parse_recipe(
             argument.ok_or("Frame needs a child recipe")?,
         )?))),
+        "ChunkedFrame" => {
+            let (chunk_bytes, child) =
+                split_leading_number(argument.ok_or("ChunkedFrame needs (bytes, child)")?)?;
+            Ok(Recipe::ChunkedFrame {
+                chunk_bytes,
+                values: Box::new(parse_recipe(&child)?),
+            })
+        }
         "Nullable" => {
             let (rank_interval, child) =
                 split_leading_number(argument.ok_or("Nullable needs (interval, child)")?)?;

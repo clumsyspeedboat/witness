@@ -33,6 +33,12 @@ pub enum Recipe {
         values: Box<Recipe>,
     },
     Frame(Box<Recipe>),
+    /// A frame whose decoded stream is compressed in independent chunks of
+    /// `chunk_bytes`, so a read decompresses only the chunks it spans.
+    ChunkedFrame {
+        chunk_bytes: usize,
+        values: Box<Recipe>,
+    },
 }
 
 impl Recipe {
@@ -49,6 +55,10 @@ impl Recipe {
             Self::Patch { values, .. } => format!("Patch({})", values.name()),
             Self::Nullable { values, .. } => format!("Nullable({})", values.name()),
             Self::Frame(values) => format!("Frame({})", values.name()),
+            Self::ChunkedFrame {
+                chunk_bytes,
+                values,
+            } => format!("ChunkedFrame{}K({})", chunk_bytes / 1024, values.name()),
         }
     }
 }
@@ -174,6 +184,15 @@ fn encode_node(
             builder.frame_fields(start, builder.field_count())?;
             Ok(node)
         }
+        Recipe::ChunkedFrame {
+            chunk_bytes,
+            values,
+        } => {
+            let start = builder.field_count();
+            let node = encode_node(values, batch, builder, nodes)?;
+            builder.frame_fields_chunked(start, builder.field_count(), *chunk_bytes)?;
+            Ok(node)
+        }
         Recipe::Nullable {
             rank_interval,
             values,
@@ -227,6 +246,15 @@ fn encode_dense_node(
             let start = builder.field_count();
             let node = encode_dense_node(child, batch, builder, nodes)?;
             builder.frame_fields(start, builder.field_count())?;
+            Ok(node)
+        }
+        Recipe::ChunkedFrame {
+            chunk_bytes,
+            values,
+        } => {
+            let start = builder.field_count();
+            let node = encode_dense_node(values, batch, builder, nodes)?;
+            builder.frame_fields_chunked(start, builder.field_count(), *chunk_bytes)?;
             Ok(node)
         }
     }

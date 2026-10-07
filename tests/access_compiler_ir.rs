@@ -191,6 +191,7 @@ fn any_access_inside_a_frame_delivers_the_complete_compressed_frame() {
             compressed_length: 30,
             decoded_length: 100,
             alignment: 64,
+            continues: false,
         }],
         dependencies: Vec::new(),
         file_length: 94,

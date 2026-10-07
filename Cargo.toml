@@ -79,6 +79,11 @@ name = "documentation_example"
 path = "tests/documentation_example.rs"
 required-features = ["experiment"]
 
+[[test]]
+name = "chunked_frames"
+path = "tests/chunked_frames.rs"
+required-features = ["experiment"]
+
 [[bin]]
 name = "generate_access_compiler"
 path = "src/bin/generate_access_compiler.rs"

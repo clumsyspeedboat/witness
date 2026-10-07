@@ -51,12 +51,29 @@ pub enum MappingInvariant {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AccessInvariant {
-    Miniblock { rows: usize },
-    RestartBound { rows: usize },
-    RunIndex { max_runs: usize },
-    PatchIndex { max_exceptions: usize },
-    ValidityRank { max_rows: usize },
-    EnclosingFrame { compressed_bytes: usize },
+    Miniblock {
+        rows: usize,
+    },
+    RestartBound {
+        rows: usize,
+    },
+    RunIndex {
+        max_runs: usize,
+    },
+    PatchIndex {
+        max_exceptions: usize,
+    },
+    ValidityRank {
+        max_rows: usize,
+    },
+    EnclosingFrame {
+        compressed_bytes: usize,
+    },
+    /// The enclosing frame is compressed in independent chunks of
+    /// `decoded_bytes`, so a read delivers only the chunks it spans.
+    FrameChunks {
+        decoded_bytes: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -186,15 +203,31 @@ pub fn derive_invariants(
         );
     }
     if let Some(frame) = layout.frames.first() {
+        let group = layout.frame_group(frame.id)?;
         output.insert(
             root,
             FactScope::Physical,
             Property::Access(AccessInvariant::EnclosingFrame {
-                compressed_bytes: frame.compressed_length,
+                compressed_bytes: group
+                    .iter()
+                    .map(|chunk| chunk.compressed_length)
+                    .max()
+                    .unwrap_or(0),
             }),
             Evidence::Layout("enclosing_frame"),
             [],
         );
+        if group.len() > 1 {
+            output.insert(
+                root,
+                FactScope::Physical,
+                Property::Access(AccessInvariant::FrameChunks {
+                    decoded_bytes: frame.decoded_length,
+                }),
+                Evidence::Layout("frame_chunks"),
+                [],
+            );
+        }
     }
     Ok(output)
 }
