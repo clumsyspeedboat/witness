@@ -109,6 +109,55 @@ pub fn parquet_pair_file(
     Ok(out)
 }
 
+/// A two-column Parquet file with the writer's default encodings (dictionary
+/// pages, plain fallback), optionally Zstd-compressed, in one row group.
+/// Statistics and the page index cover every page of `page_rows` rows, so a
+/// reader can prune pages by their stored minimum and maximum.
+pub fn parquet_table_file(
+    selector: &[Option<i64>],
+    values: &[Option<i64>],
+    page_rows: usize,
+    compressed: bool,
+) -> Result<Vec<u8>, String> {
+    if selector.len() != values.len() || page_rows == 0 {
+        return Err("invalid selector/value pair".to_string());
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Int64,
+            selector.iter().any(Option::is_none),
+        ),
+        Field::new("value", DataType::Int64, values.iter().any(Option::is_none)),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(selector.to_vec())),
+            Arc::new(Int64Array::from(values.to_vec())),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let compression = if compressed {
+        Compression::ZSTD(ZstdLevel::try_new(3).map_err(|error| error.to_string())?)
+    } else {
+        Compression::UNCOMPRESSED
+    };
+    let properties = WriterProperties::builder()
+        .set_compression(compression)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_data_page_row_count_limit(page_rows)
+        .set_write_batch_size(page_rows)
+        .set_max_row_group_row_count(Some(selector.len().max(1)))
+        .build();
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(Cursor::new(&mut out), schema, Some(properties))
+        .map_err(|error| error.to_string())?;
+    writer.write(&batch).map_err(|error| error.to_string())?;
+    writer.close().map_err(|error| error.to_string())?;
+    Ok(out)
+}
+
 pub fn parquet_full_sum(bytes: Bytes, lower: i64, upper: i64) -> Result<ParquetAggregate, String> {
     parquet_full_sum_reader(bytes, lower, upper, 0)
 }

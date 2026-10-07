@@ -3,6 +3,7 @@ use arrow_array::{Array, Float64Array, Int32Array, Int64Array, TimestampMicrosec
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -93,6 +94,70 @@ pub fn invariant_census_columns(max_rows: usize) -> Result<Vec<Column>, Box<dyn 
         (&right.group, &right.source, &right.name) == (&left.group, &left.source, &left.name)
     });
     Ok(columns)
+}
+
+/// One table of aligned exact-integer columns: row `i` of every column is
+/// row `i` of the same source record.
+#[derive(Clone, Debug)]
+pub struct StudyTable {
+    pub group: String,
+    pub source: String,
+    pub columns: Vec<Column>,
+}
+
+/// Tables for the paged study: every breadth-corpus table, plus the
+/// household-power and yellow-taxi tables, each column capped at `max_rows`.
+/// Only exact columns are kept, and a table keeps the columns sharing its
+/// most common length so that rows stay aligned.
+pub fn paged_study_tables(max_rows: usize) -> Result<Vec<StudyTable>, Box<dyn Error>> {
+    let mut grouped = BTreeMap::<(String, String), Vec<Column>>::new();
+    let mut add = |column: Column| {
+        if column.exact_i64 {
+            grouped
+                .entry((column.group.clone(), column.source.clone()))
+                .or_default()
+                .push(column);
+        }
+    };
+    for (group, directory) in CENSUS_DIRECTORIES {
+        dir_columns_prefix(group, directory, Some(max_rows))?
+            .into_iter()
+            .for_each(&mut add);
+    }
+    household_power_columns_limited(Some(max_rows))?
+        .into_iter()
+        .for_each(&mut add);
+    yellow_columns(Some(max_rows))?
+        .into_iter()
+        .for_each(&mut add);
+    Ok(grouped
+        .into_iter()
+        .filter_map(|((group, source), mut columns)| {
+            let mut lengths = BTreeMap::<usize, usize>::new();
+            for column in &columns {
+                *lengths.entry(column.values.len()).or_default() += 1;
+            }
+            let (&length, _) = lengths.iter().max_by_key(|(_, count)| **count)?;
+            columns.retain(|column| column.values.len() == length);
+            columns.sort_by(|left, right| left.name.cmp(&right.name));
+            Some(StudyTable {
+                group,
+                source,
+                columns,
+            })
+        })
+        .collect())
+}
+
+/// The scale corpus, exported by `scripts/fetch_scale_corpus.py`: every exact
+/// column of TPC-H SF10 lineitem at full length.
+pub fn scale_columns() -> Result<Vec<Column>, Box<dyn Error>> {
+    Ok(
+        dir_columns_prefix("tpch_sf10", "eval/data/scale/tpch_sf10", None)?
+            .into_iter()
+            .filter(|column| column.exact_i64)
+            .collect(),
+    )
 }
 
 /// Breadth corpora exported by `scripts/fetch_census_corpora.py`: every exact
