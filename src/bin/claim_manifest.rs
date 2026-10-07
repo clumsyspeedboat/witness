@@ -859,6 +859,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     define(&mut out, "WitCertificateHeaderBytes", "16");
 
     paged_claims(&mut out)?;
+    separation_claims(&mut out)?;
 
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
@@ -1380,6 +1381,572 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             &format!("{:.2}", parquet / 1e6),
         );
     }
+    Ok(())
+}
+
+const DUCKDB: &str = "experiments/results/duckdb";
+
+/// Page-size sensitivity runs: their page size, as the study names its
+/// directory, and the suffix of their claims.
+const PAGE_SIZES: [(&str, &str); 2] = [("4096", "FourK"), ("65536", "SixtyFourK")];
+
+/// Target-selectivity buckets of the paged workload and their claim suffixes.
+const BUCKETS: [(&str, &str); 4] = [
+    ("0.1pct", "Tenth"),
+    ("1pct", "OnePct"),
+    ("10pct", "TenPct"),
+    ("50pct", "FiftyPct"),
+];
+
+/// Median latency per (pair, predicate) and arm.
+type Latency = BTreeMap<(String, String), BTreeMap<String, f64>>;
+
+fn paged_latency(dir: &str) -> Result<Latency, Box<dyn Error>> {
+    let queries = read_csv(&format!("{dir}/queries.csv"))?;
+    let mut latency = Latency::new();
+    for row in &queries {
+        latency
+            .entry((
+                queries.field(row, "pair")?,
+                queries.field(row, "predicate")?,
+            ))
+            .or_default()
+            .insert(
+                queries.field(row, "arm")?,
+                queries.field(row, "median_ns")?.parse()?,
+            );
+    }
+    Ok(latency)
+}
+
+/// `numerator / denominator` for every cell that measured both arms,
+/// optionally in one selectivity bucket.
+fn arm_ratios(
+    latency: &Latency,
+    numerator: &str,
+    denominator: &str,
+    bucket: Option<&str>,
+) -> Vec<f64> {
+    latency
+        .iter()
+        .filter(|((_, predicate), _)| {
+            bucket.is_none_or(|bucket| predicate.split('+').next() == Some(bucket))
+        })
+        .filter_map(|(_, arms)| Some(arms.get(numerator)? / arms.get(denominator)?))
+        .collect()
+}
+
+fn geometric_mean(values: &[f64]) -> f64 {
+    (values.iter().map(|value| value.ln()).sum::<f64>() / values.len() as f64).exp()
+}
+
+/// Claims that separate what derived facts buy from what the executor buys
+/// and from what stored statistics buy: the three planners on one executor,
+/// Parquet without its page index, other page sizes, the slack of derived
+/// bounds, fault injection against the checker, and DuckDB on the same
+/// queries.
+fn separation_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let latency = paged_latency(PAGED)?;
+    let facts_over_zonemap = arm_ratios(
+        &latency,
+        "witness_direct_facts",
+        "witness_direct_zonemap",
+        None,
+    );
+    define(
+        out,
+        "WitPagedFactsOverZonemapGeo",
+        &format!("{:.2}", geometric_mean(&facts_over_zonemap)),
+    );
+    define(
+        out,
+        "WitPagedFactsOverZonemapMedian",
+        &format!("{:.2}", median(&facts_over_zonemap)),
+    );
+    for (name, keep) in [
+        (
+            "WitPagedFactsBeatZonemap",
+            (|ratio: f64| ratio < 0.95) as fn(f64) -> bool,
+        ),
+        ("WitPagedFactsTrailZonemap", |ratio: f64| ratio > 1.05),
+    ] {
+        let count = facts_over_zonemap
+            .iter()
+            .filter(|ratio| keep(**ratio))
+            .count();
+        define(out, name, &group_digits(&count.to_string()));
+    }
+    for (bucket, suffix) in BUCKETS {
+        let selected = arm_ratios(
+            &latency,
+            "witness_direct_facts",
+            "witness_direct_zonemap",
+            Some(bucket),
+        );
+        define(
+            out,
+            &format!("WitPagedFactsOverZonemap{suffix}"),
+            &format!("{:.2}", median(&selected)),
+        );
+    }
+    let zonemap_over_scan = arm_ratios(
+        &latency,
+        "witness_direct_zonemap",
+        "witness_direct_scan",
+        None,
+    );
+    define(
+        out,
+        "WitPagedZonemapOverScanGeo",
+        &format!("{:.2}", geometric_mean(&zonemap_over_scan)),
+    );
+    let zonemap_over_plain = arm_ratios(
+        &latency,
+        "witness_direct_zonemap",
+        "parquet_plain_indexed",
+        None,
+    );
+    define(
+        out,
+        "WitPagedZonemapOverPlainMedian",
+        &format!("{:.2}", median(&zonemap_over_plain)),
+    );
+
+    // Against whichever Parquet read is faster for each query: with or
+    // without the page index.
+    let best = latency
+        .values()
+        .filter_map(|arms| {
+            let parquet = arms
+                .get("parquet_plain_indexed")?
+                .min(*arms.get("parquet_plain_full")?);
+            Some(arms.get("witness_direct_facts")? / parquet)
+        })
+        .collect::<Vec<_>>();
+    define(
+        out,
+        "WitPagedFactsOverBestPlainMedian",
+        &format!("{:.2}", median(&best)),
+    );
+    define(
+        out,
+        "WitPagedFactsOverBestPlainWins",
+        &group_digits(
+            &best
+                .iter()
+                .filter(|ratio| **ratio < 1.0)
+                .count()
+                .to_string(),
+        ),
+    );
+
+    for (bucket, suffix) in BUCKETS {
+        let selected = latency
+            .iter()
+            .filter(|((_, predicate), _)| predicate.split('+').next() == Some(bucket))
+            .filter_map(|(_, arms)| {
+                let parquet = arms
+                    .get("parquet_plain_indexed")?
+                    .min(*arms.get("parquet_plain_full")?);
+                Some(arms.get("witness_direct_facts")? / parquet)
+            })
+            .collect::<Vec<_>>();
+        define(
+            out,
+            &format!("WitPagedFactsOverBestPlain{suffix}"),
+            &format!("{:.2}", median(&selected)),
+        );
+    }
+
+    // Parquet without its page index: what a missing zone map costs.
+    let full_over_indexed = arm_ratios(
+        &latency,
+        "parquet_plain_full",
+        "parquet_plain_indexed",
+        None,
+    );
+    define(
+        out,
+        "WitPagedNoIndexOverIndexedMedian",
+        &format!("{:.2}", median(&full_over_indexed)),
+    );
+    let tenth = arm_ratios(
+        &latency,
+        "parquet_plain_full",
+        "parquet_plain_indexed",
+        Some("0.1pct"),
+    );
+    define(
+        out,
+        "WitPagedNoIndexOverIndexedTenth",
+        &format!("{:.2}", median(&tenth)),
+    );
+    let facts_over_full = arm_ratios(&latency, "witness_direct_facts", "parquet_plain_full", None);
+    define(
+        out,
+        "WitPagedFactsOverNoIndexMedian",
+        &format!("{:.2}", median(&facts_over_full)),
+    );
+
+    // Page size: the same corpus and queries at 4 Ki and 64 Ki rows a page,
+    // and a table row per page size including the main run's.
+    let size_row = |dir: &str, latency: &Latency| -> Result<String, Box<dyn Error>> {
+        let plain = arm_ratios(
+            latency,
+            "witness_direct_facts",
+            "parquet_plain_indexed",
+            None,
+        );
+        let zonemap = arm_ratios(
+            latency,
+            "witness_direct_facts",
+            "witness_direct_zonemap",
+            None,
+        );
+        let pairs = read_csv(&format!("{dir}/pairs.csv"))?;
+        let bytes = pairs
+            .iter()
+            .map(|row| {
+                Ok(pairs.field(row, "witness_direct_bytes")?.parse::<f64>()?
+                    / pairs.field(row, "parquet_plain_bytes")?.parse::<f64>()?)
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        let costs = read_csv(&format!("{dir}/costs.csv"))?;
+        let plan_share = costs
+            .iter()
+            .map(|row| {
+                Ok(costs.field(row, "plan_ns")?.parse::<f64>()?
+                    / costs.field(row, "scan_ns")?.parse::<f64>()?)
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        Ok(format!(
+            "{:.2} & {:.2} & {:.2} & {:.2}",
+            median(&plain),
+            geometric_mean(&zonemap),
+            median(&bytes),
+            median(&plan_share) * 100.0
+        ))
+    };
+    let mut size_rows = BTreeMap::<usize, String>::new();
+    let main_freeze = read_csv(&format!("{PAGED}/freeze.csv"))?;
+    size_rows.insert(
+        main_freeze.field(&main_freeze[0], "page_rows")?.parse()?,
+        size_row(PAGED, &latency)?,
+    );
+    for (rows, suffix) in PAGE_SIZES {
+        let dir = format!("{PAGED}_rows{rows}");
+        let freeze = read_csv(&format!("{dir}/freeze.csv"))?;
+        if freeze.field(&freeze[0], "page_rows")? != rows {
+            return Err(format!("{dir} was measured at another page size").into());
+        }
+        let latency = paged_latency(&dir)?;
+        let plain = arm_ratios(
+            &latency,
+            "witness_direct_facts",
+            "parquet_plain_indexed",
+            None,
+        );
+        define(
+            out,
+            &format!("WitPagedRows{suffix}PlainMedian"),
+            &format!("{:.2}", median(&plain)),
+        );
+        let zonemap = arm_ratios(
+            &latency,
+            "witness_direct_facts",
+            "witness_direct_zonemap",
+            None,
+        );
+        define(
+            out,
+            &format!("WitPagedRows{suffix}FactsOverZonemapGeo"),
+            &format!("{:.2}", geometric_mean(&zonemap)),
+        );
+        let pairs = read_csv(&format!("{dir}/pairs.csv"))?;
+        let bytes = pairs
+            .iter()
+            .map(|row| {
+                Ok(pairs.field(row, "witness_direct_bytes")?.parse::<f64>()?
+                    / pairs.field(row, "parquet_plain_bytes")?.parse::<f64>()?)
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        define(
+            out,
+            &format!("WitPagedRows{suffix}DirectOverPlainBytes"),
+            &format!("{:.2}", median(&bytes)),
+        );
+        size_rows.insert(rows.parse()?, size_row(&dir, &latency)?);
+    }
+    let mut table = String::new();
+    for (rows, cells) in &size_rows {
+        writeln!(table, "{} & {cells} \\\\", group_digits(&rows.to_string()))?;
+    }
+    define(out, "WitPagedSizeRows", table.trim_end());
+
+    // Slack of derived bounds against exact statistics, over pages that
+    // hold a value.
+    let bounds = read_csv(&format!("{PAGED}/bounds.csv"))?;
+    let (mut valued, mut bounded, mut exact) = (0_usize, 0_usize, 0_usize);
+    let mut slack = Vec::new();
+    for row in &bounds {
+        let stat_low = bounds.field(row, "stat_low")?;
+        if stat_low.is_empty() {
+            continue;
+        }
+        valued += 1;
+        let bound_low = bounds.field(row, "bound_low")?;
+        if bound_low.is_empty() {
+            continue;
+        }
+        bounded += 1;
+        let (stat_low, stat_high) = (
+            stat_low.parse::<f64>()?,
+            bounds.field(row, "stat_high")?.parse::<f64>()?,
+        );
+        let (bound_low, bound_high) = (
+            bound_low.parse::<f64>()?,
+            bounds.field(row, "bound_high")?.parse::<f64>()?,
+        );
+        if (bound_low, bound_high) == (stat_low, stat_high) {
+            exact += 1;
+        } else {
+            slack.push((bound_high - bound_low + 1.0) / (stat_high - stat_low + 1.0));
+        }
+    }
+    define(out, "WitBoundsPages", &group_digits(&valued.to_string()));
+    define(
+        out,
+        "WitBoundsBoundedPercent",
+        &format!("{:.1}", bounded as f64 * 100.0 / valued as f64),
+    );
+    define(
+        out,
+        "WitBoundsExactPercent",
+        &format!("{:.1}", exact as f64 * 100.0 / bounded as f64),
+    );
+    define(
+        out,
+        "WitBoundsSlackMedian",
+        &format!("{:.2}", median(&slack)),
+    );
+
+    // Fault injection against the checker.
+    let checker = read_csv(&format!("{PAGED}/checker.csv"))?;
+    let mut tally = BTreeMap::<(String, String), usize>::new();
+    for row in &checker {
+        *tally
+            .entry((
+                checker.field(row, "checker")?,
+                checker.field(row, "outcome")?,
+            ))
+            .or_default() += checker.field(row, "mutants")?.parse::<usize>()?;
+    }
+    let total = |verdict: Option<&str>, harmful: Option<bool>| {
+        tally
+            .iter()
+            .filter(|((checked, _), _)| verdict.is_none_or(|verdict| checked == verdict))
+            .filter(|((_, outcome), _)| {
+                harmful.is_none_or(|harmful| (outcome != "correct") == harmful)
+            })
+            .map(|(_, count)| count)
+            .sum::<usize>()
+    };
+    let mut families = BTreeMap::<String, [usize; 4]>::new();
+    for row in &checker {
+        let counts = families.entry(checker.field(row, "family")?).or_default();
+        let mutants = checker.field(row, "mutants")?.parse::<usize>()?;
+        let accepted = checker.field(row, "checker")? == "accepted";
+        let harmful = checker.field(row, "outcome")? != "correct";
+        counts[0] += mutants;
+        counts[1] += if harmful { mutants } else { 0 };
+        counts[2] += if harmful && !accepted { mutants } else { 0 };
+        counts[3] += if accepted { mutants } else { 0 };
+    }
+    let mut table = String::new();
+    for (family, label) in [
+        ("kind", "another action kind"),
+        ("evidence", "a moved bound"),
+        ("foreign_page", "a neighbouring page's action"),
+        ("stale_plan", "another predicate's action"),
+        ("forged_statistics", "forged statistics"),
+    ] {
+        let [mutants, harmful, rejected, accepted] = families
+            .get(family)
+            .copied()
+            .ok_or("checker study lacks a mutation family")?;
+        writeln!(
+            table,
+            "{label} & {} & {} & {} & {} \\\\",
+            group_digits(&mutants.to_string()),
+            group_digits(&harmful.to_string()),
+            group_digits(&rejected.to_string()),
+            group_digits(&accepted.to_string()),
+        )?;
+    }
+    define(out, "WitCheckerFamilyRows", table.trim_end());
+    if total(Some("accepted"), Some(true)) != 0 {
+        return Err("the checker accepted a mutant that answers wrongly".into());
+    }
+    for (name, value) in [
+        ("WitCheckerMutants", total(None, None)),
+        ("WitCheckerAccepted", total(Some("accepted"), None)),
+        ("WitCheckerHarmful", total(None, Some(true))),
+        (
+            "WitCheckerHarmfulRejected",
+            total(Some("rejected"), Some(true)),
+        ),
+        (
+            "WitCheckerHarmlessRejected",
+            total(Some("rejected"), Some(false)),
+        ),
+    ] {
+        define(out, name, &group_digits(&value.to_string()));
+    }
+
+    // DuckDB on the same queries, one thread, against the fact planner.
+    let duck = read_csv(&format!("{DUCKDB}/paged.csv"))?;
+    let mut client = BTreeMap::<&str, Vec<f64>>::new();
+    let mut buckets = BTreeMap::<String, Vec<f64>>::new();
+    let mut scanned = Vec::new();
+    for row in &duck {
+        let pair = duck
+            .field(row, "table")?
+            .strip_prefix("pair_")
+            .ok_or("DuckDB paged table is not a pair")?
+            .to_string();
+        let predicate = duck.field(row, "predicate")?;
+        let witness = latency
+            .get(&(pair, predicate.clone()))
+            .and_then(|arms| arms.get("witness_direct_facts"))
+            .ok_or("DuckDB measured a query the paged study did not")?;
+        let engine = duck.field(row, "engine")?;
+        let ratio = witness / duck.field(row, "median_ns")?.parse::<f64>()?;
+        if engine == "duckdb_native" {
+            scanned.push(
+                duck.field(row, "rows_scanned")?.parse::<f64>()?
+                    / duck.field(row, "rows")?.parse::<f64>()?,
+            );
+            let bucket = predicate.split('+').next().unwrap_or_default().to_string();
+            buckets.entry(bucket).or_default().push(ratio);
+            client.entry("WitDuckNative").or_default().push(ratio);
+        } else {
+            client.entry("WitDuckParquet").or_default().push(ratio);
+        }
+    }
+    for (name, ratios) in &client {
+        define(
+            out,
+            &format!("{name}Median"),
+            &format!("{:.2}", median(ratios)),
+        );
+        define(
+            out,
+            &format!("{name}Wins"),
+            &group_digits(
+                &ratios
+                    .iter()
+                    .filter(|ratio| **ratio < 1.0)
+                    .count()
+                    .to_string(),
+            ),
+        );
+        define(
+            out,
+            &format!("{name}Queries"),
+            &group_digits(&ratios.len().to_string()),
+        );
+    }
+    define(
+        out,
+        "WitDuckScannedPercent",
+        &format!("{:.0}", median(&scanned) * 100.0),
+    );
+    for (bucket, suffix) in BUCKETS {
+        let ratios = buckets
+            .get(bucket)
+            .ok_or("DuckDB measured no query in a selectivity bucket")?;
+        define(
+            out,
+            &format!("WitDuckNative{suffix}"),
+            &format!("{:.2}", median(ratios)),
+        );
+    }
+
+    // DuckDB on the 60 M-row columns, 1 and 64 threads.
+    let scale = read_csv(&format!("{PAGED_SCALE}/scaling.csv"))?;
+    let mut witness = BTreeMap::<(String, String, String), f64>::new();
+    for row in &scale {
+        if scale.field(row, "arm")? == "witness_direct_facts" {
+            witness.insert(
+                (
+                    scale.field(row, "selector")?,
+                    scale.field(row, "predicate")?,
+                    scale.field(row, "threads")?,
+                ),
+                scale.field(row, "median_ns")?.parse()?,
+            );
+        }
+    }
+    let duck = read_csv(&format!("{DUCKDB}/scale.csv"))?;
+    let mut by_threads = BTreeMap::<String, Vec<f64>>::new();
+    for row in &duck {
+        if duck.field(row, "engine")? != "duckdb_native" {
+            continue;
+        }
+        let key = (
+            duck.field(row, "table")?,
+            duck.field(row, "predicate")?,
+            duck.field(row, "threads")?,
+        );
+        let nanos = duck.field(row, "median_ns")?.parse::<f64>()?;
+        let ours = witness
+            .get(&key)
+            .ok_or("DuckDB measured a scale query the scale study did not")?;
+        by_threads
+            .entry(key.2.clone())
+            .or_default()
+            .push(ours / nanos);
+        if key.0 == "c0_l_orderkey_x1" && key.2 == "1" {
+            for (predicate, suffix) in [("0.1pct", "Tenth"), ("50pct", "FiftyPct")] {
+                if key.1 == predicate {
+                    define(
+                        out,
+                        &format!("WitDuckScaleOrderkey{suffix}Ms"),
+                        &format!("{:.2}", nanos / 1e6),
+                    );
+                }
+            }
+        }
+    }
+    for (threads, suffix) in [("1", "One"), ("64", "SixtyFour")] {
+        let ratios = by_threads
+            .get(threads)
+            .ok_or("DuckDB scale run lacks a thread count")?;
+        define(
+            out,
+            &format!("WitDuckScale{suffix}Median"),
+            &format!("{:.2}", median(ratios)),
+        );
+        define(
+            out,
+            &format!("WitDuckScale{suffix}Wins"),
+            &ratios
+                .iter()
+                .filter(|ratio| **ratio < 1.0)
+                .count()
+                .to_string(),
+        );
+    }
+    let version = read_csv(&format!("{DUCKDB}/freeze.csv"))?;
+    define(
+        out,
+        "WitDuckVersion",
+        &version.field(&version[0], "duckdb_version")?,
+    );
+    let floor = version
+        .field(&version[0], "client_floor_ns")?
+        .parse::<f64>()?;
+    define(out, "WitDuckClientFloorUs", &format!("{:.0}", floor / 1e3));
     Ok(())
 }
 
