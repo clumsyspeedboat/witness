@@ -30,7 +30,7 @@ This one command fetches all corpus inputs, verifies `INPUTS.sha256`, applies
 the validation gates, reruns every claim-bearing experiment, regenerates the
 claim manifest and worked example, and writes provenance and checksums.
 
-The seven stages are:
+The eight stages are:
 
 | Stage | Output |
 |---:|---|
@@ -38,9 +38,10 @@ The seven stages are:
 | 2 | paired 16,384/131,072-row predicate studies |
 | 3 | Bloom, min/max, and sparse-fence controls |
 | 4 | logical, delivered, and transferred access measurements |
-| 5 | auxiliary-plan measurements and neutral claim manifest |
-| 6 | generated kernels, physical toy artifacts, and walkthrough |
-| 7 | host provenance and input/output checksums |
+| 5 | paged queries against Parquet page pruning, and 60 M-row thread scaling |
+| 6 | auxiliary-plan measurements and neutral claim manifest |
+| 7 | generated kernels, physical toy artifacts, and walkthrough |
+| 8 | host provenance and input/output checksums |
 
 Structural facts, answers, serialized bytes, and byte accounting are
 deterministic for fixed inputs and dependencies. Runtime measurements vary by
@@ -58,7 +59,7 @@ This separately regenerates `experiments/results/access_compiler/` and
 `experiments/results/access_crossover/`. These runs diagnose generated-plan
 overhead, access closure, selectivity crossover, and storage scheduling. They
 are not read by `claim_manifest.rs`, do not support a displayed manuscript
-number, and are therefore outside the seven-stage checksum manifest.
+number, and are therefore outside the eight-stage checksum manifest.
 
 ## Inputs
 

@@ -2,13 +2,14 @@
 
 ## Claim-bearing path
 
-The public artifact has one seven-stage pipeline:
+The public artifact has one eight-stage pipeline:
 
 ```text
 invariant census
   -> paired predicate study
   -> membership-certificate controls
   -> physical access study
+  -> paged query and scaling studies
   -> neutral claim manifest
   -> generated worked example
   -> provenance and checksums
