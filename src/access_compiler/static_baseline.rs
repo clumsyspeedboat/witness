@@ -1,9 +1,9 @@
 use std::marker::PhantomData;
 
 use super::{
-    Answer, ClosureMode, EncodedColumn, Execution, FieldId, NullPlacement, ReadSession, Span,
-    find_position, load_metadata, locate_indexed, lower_bound_position, nullable_is_valid,
-    nullable_prefix_rank, nullable_rank, push_range, unzigzag,
+    Answer, BATCH_ROWS, ClosureMode, EncodedColumn, Execution, FieldId, NullPlacement, ReadSession,
+    Span, find_position, load_metadata, locate_indexed, lower_bound_position, nullable_is_valid,
+    nullable_prefix_rank, nullable_rank, push_batch_matches, push_range, sum_batch, unzigzag,
 };
 
 pub trait StaticDecoder {
@@ -23,6 +23,24 @@ pub trait StaticDecoder {
             visitor(session, value, row, row + 1)?;
         }
         Ok(())
+    }
+
+    /// True when `batch` decodes this subtree: every node is dense and maps a
+    /// contiguous row span to a contiguous row span.
+    const BATCH: bool = false;
+
+    /// Hands `sink` dense decoded values in row order, at most `BATCH_ROWS`
+    /// at a time. Only callable when `BATCH` holds.
+    fn batch<F>(
+        _session: &mut ReadSession<'_>,
+        _start: usize,
+        _end: usize,
+        _sink: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut ReadSession<'_>, &mut [i128], usize) -> Result<(), String>,
+    {
+        Err("static decoder has no batch form".into())
     }
 }
 
@@ -45,6 +63,45 @@ impl<const FIELD: usize, const WIDTH: u8, const MINIBLOCK_ROWS: usize, const MIN
             MINIBLOCK_ROWS,
             MINIBLOCK_BYTES,
         )?)))
+    }
+
+    const BATCH: bool = true;
+
+    #[inline(always)]
+    fn batch<F>(
+        session: &mut ReadSession<'_>,
+        start: usize,
+        end: usize,
+        sink: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut ReadSession<'_>, &mut [i128], usize) -> Result<(), String>,
+    {
+        let field = FieldId(FIELD);
+        session.touch_bits(
+            field,
+            Span::new(start, end)?,
+            WIDTH,
+            MINIBLOCK_ROWS,
+            MINIBLOCK_BYTES,
+        )?;
+        let mut buffer = session.take_batch_buffer();
+        let mut row = start;
+        while row < end {
+            let chunk_end = (row + BATCH_ROWS).min(end);
+            session.unpack_bits_into(
+                field,
+                Span::new(row, chunk_end)?,
+                WIDTH,
+                MINIBLOCK_ROWS,
+                MINIBLOCK_BYTES,
+                &mut buffer,
+            )?;
+            sink(session, &mut buffer, row)?;
+            row = chunk_end;
+        }
+        session.restore_batch_buffer(buffer);
+        Ok(())
     }
 }
 
@@ -81,6 +138,33 @@ impl<const BASE: usize, Child: StaticDecoder> StaticDecoder for StaticFor<BASE, 
                 visitor(session, value, span_start, span_end)
             },
         )
+    }
+
+    const BATCH: bool = Child::BATCH;
+
+    #[inline(always)]
+    fn batch<F>(
+        session: &mut ReadSession<'_>,
+        start: usize,
+        end: usize,
+        sink: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut ReadSession<'_>, &mut [i128], usize) -> Result<(), String>,
+    {
+        let base = i128::from(session.read_i64(FieldId(BASE), 0)?);
+        Child::batch(session, start, end, &mut |session, values, first| {
+            let mut overflow = false;
+            for value in values.iter_mut() {
+                let (next, carried) = value.overflowing_add(base);
+                *value = next;
+                overflow |= carried;
+            }
+            if overflow {
+                return Err("static FOR span overflow".into());
+            }
+            sink(session, values, first)
+        })
     }
 }
 
@@ -149,6 +233,63 @@ impl<
                 if row >= emit_start {
                     visitor(session, Some(value), row, row + 1)?;
                 }
+            }
+            block_start += RESTART_INTERVAL;
+        }
+        Ok(())
+    }
+
+    const BATCH: bool = Child::BATCH;
+
+    #[inline(always)]
+    fn batch<F>(
+        session: &mut ReadSession<'_>,
+        start: usize,
+        end: usize,
+        sink: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut ReadSession<'_>, &mut [i128], usize) -> Result<(), String>,
+    {
+        let mut block_start = start / RESTART_INTERVAL * RESTART_INTERVAL;
+        while block_start < end {
+            let block_end = (block_start + RESTART_INTERVAL).min(end);
+            let emit_start = start.max(block_start);
+            let mut value =
+                i128::from(session.read_i64(FieldId(RESTARTS), block_start / RESTART_INTERVAL)?);
+            if block_start >= emit_start {
+                sink(session, &mut [value], block_start)?;
+            }
+            if block_start + 1 < block_end {
+                Child::batch(
+                    session,
+                    block_start + 1,
+                    block_end,
+                    &mut |session, codes, first| {
+                        let mut overflow = false;
+                        for slot in codes.iter_mut() {
+                            let code = u64::try_from(*slot)
+                                .map_err(|_| "static delta code does not fit u64")?;
+                            let delta = if UNSIGNED {
+                                i128::from(code)
+                            } else {
+                                i128::from(unzigzag(code))
+                            };
+                            let (next, carried) = value.overflowing_add(delta);
+                            value = next;
+                            overflow |= carried;
+                            *slot = value;
+                        }
+                        if overflow {
+                            return Err("static delta span overflow".into());
+                        }
+                        let skip = emit_start.saturating_sub(first).min(codes.len());
+                        if skip < codes.len() {
+                            sink(session, &mut codes[skip..], first + skip)?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             block_start += RESTART_INTERVAL;
         }
@@ -262,6 +403,24 @@ impl<const FIELD: usize, const ENTRIES: usize, Child: StaticDecoder> StaticDecod
                 visitor(session, value, span_start, span_end)
             },
         )
+    }
+
+    const BATCH: bool = Child::BATCH;
+
+    #[inline(always)]
+    fn batch<F>(
+        session: &mut ReadSession<'_>,
+        start: usize,
+        end: usize,
+        sink: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut ReadSession<'_>, &mut [i128], usize) -> Result<(), String>,
+    {
+        Child::batch(session, start, end, &mut |session, ids, first| {
+            session.gather_i64_into(FieldId(FIELD), ENTRIES, ids)?;
+            sink(session, ids, first)
+        })
     }
 }
 
@@ -467,24 +626,37 @@ pub fn static_sum<D: StaticDecoder>(
     load_metadata(&column.page, &mut session)?;
     let mut sum = 0_i128;
     let mut decoded_rows = 0;
-    D::visit(
-        &mut session,
-        rows.start,
-        rows.end,
-        &mut |_session, value, start, end| {
-            decoded_rows += end - start;
-            if let Some(value) = value {
-                sum = sum
-                    .checked_add(
-                        value
-                            .checked_mul((end - start) as i128)
-                            .ok_or("static SUM product overflow")?,
-                    )
-                    .ok_or("static SUM overflow")?;
-            }
-            Ok(())
-        },
-    )?;
+    if D::BATCH {
+        D::batch(
+            &mut session,
+            rows.start,
+            rows.end,
+            &mut |_session, values, _first| {
+                decoded_rows += values.len();
+                sum = sum_batch(sum, values)?;
+                Ok(())
+            },
+        )?;
+    } else {
+        D::visit(
+            &mut session,
+            rows.start,
+            rows.end,
+            &mut |_session, value, start, end| {
+                decoded_rows += end - start;
+                if let Some(value) = value {
+                    sum = sum
+                        .checked_add(
+                            value
+                                .checked_mul((end - start) as i128)
+                                .ok_or("static SUM product overflow")?,
+                        )
+                        .ok_or("static SUM overflow")?;
+                }
+                Ok(())
+            },
+        )?;
+    }
     Ok(Execution {
         answer: Answer::Sum(sum),
         metrics: session.metrics(),
@@ -507,18 +679,38 @@ pub fn static_between<D: StaticDecoder>(
     load_metadata(&column.page, &mut session)?;
     let mut ranges = Vec::new();
     let mut decoded_rows = 0;
-    D::visit(
-        &mut session,
-        rows.start,
-        rows.end,
-        &mut |_session, value, start, end| {
-            decoded_rows += end - start;
-            if value.is_some_and(|value| i128::from(low) <= value && value <= i128::from(high)) {
-                push_range(&mut ranges, start, end);
-            }
-            Ok(())
-        },
-    )?;
+    if D::BATCH {
+        D::batch(
+            &mut session,
+            rows.start,
+            rows.end,
+            &mut |_session, values, first| {
+                decoded_rows += values.len();
+                push_batch_matches(
+                    &mut ranges,
+                    values,
+                    first,
+                    i128::from(low),
+                    i128::from(high),
+                );
+                Ok(())
+            },
+        )?;
+    } else {
+        D::visit(
+            &mut session,
+            rows.start,
+            rows.end,
+            &mut |_session, value, start, end| {
+                decoded_rows += end - start;
+                if value.is_some_and(|value| i128::from(low) <= value && value <= i128::from(high))
+                {
+                    push_range(&mut ranges, start, end);
+                }
+                Ok(())
+            },
+        )?;
+    }
     Ok(Execution {
         answer: Answer::Ranges(ranges),
         metrics: session.metrics(),
@@ -679,7 +871,27 @@ pub fn static_dictionary_filter<
     let high_id = left;
     let mut ranges = Vec::new();
     let mut decoded_rows = 0;
-    if low_id < high_id {
+    if low_id < high_id && Ids::BATCH {
+        Ids::batch(
+            &mut session,
+            0,
+            column.truth.len(),
+            &mut |_session, codes, first| {
+                decoded_rows += codes.len();
+                if codes.iter().any(|&id| !(0..ENTRIES as i128).contains(&id)) {
+                    return Err("static dictionary id outside table".into());
+                }
+                push_batch_matches(
+                    &mut ranges,
+                    codes,
+                    first,
+                    low_id as i128,
+                    high_id as i128 - 1,
+                );
+                Ok(())
+            },
+        )?;
+    } else if low_id < high_id {
         Ids::visit(
             &mut session,
             0,

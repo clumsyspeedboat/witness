@@ -163,6 +163,53 @@ pub fn push_range(ranges: &mut Vec<Span>, start: usize, end: usize) {
     }
 }
 
+/// Rows per batch in batch kernels: 16 KiB of decoded values, which stays
+/// resident in L1 between the decode and the consuming loop.
+pub const BATCH_ROWS: usize = 1_024;
+
+/// Adds a batch of decoded values to `sum`. Any intermediate overflow fails,
+/// so the outcome equals a chain of per-value `checked_add` calls.
+pub fn sum_batch(sum: i128, values: &[i128]) -> Result<i128, String> {
+    let mut total = sum;
+    let mut overflow = false;
+    for &value in values {
+        let (next, carried) = total.overflowing_add(value);
+        total = next;
+        overflow |= carried;
+    }
+    if overflow {
+        Err("batch SUM overflow".into())
+    } else {
+        Ok(total)
+    }
+}
+
+/// Appends the rows of a batch whose values lie in `[low, high]`, producing
+/// the same ranges as one `push_range` call per matching row.
+pub fn push_batch_matches(
+    ranges: &mut Vec<Span>,
+    values: &[i128],
+    first_row: usize,
+    low: i128,
+    high: i128,
+) {
+    let mut run_start = None;
+    for (offset, &value) in values.iter().enumerate() {
+        let hit = low <= value && value <= high;
+        match (hit, run_start) {
+            (true, None) => run_start = Some(offset),
+            (false, Some(start)) => {
+                push_range(ranges, first_row + start, first_row + offset);
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = run_start {
+        push_range(ranges, first_row + start, first_row + values.len());
+    }
+}
+
 pub fn unzigzag(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }

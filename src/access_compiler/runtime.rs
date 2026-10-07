@@ -38,6 +38,7 @@ pub struct ReadSession<'a> {
     frames_decoded: usize,
     track_access: bool,
     primitive_values_read: usize,
+    batch_buffer: Vec<i128>,
 }
 
 impl<'a> ReadSession<'a> {
@@ -55,6 +56,7 @@ impl<'a> ReadSession<'a> {
             frames_decoded: 0,
             track_access: true,
             primitive_values_read: 0,
+            batch_buffer: Vec::new(),
         }
     }
 
@@ -72,6 +74,7 @@ impl<'a> ReadSession<'a> {
             frames_decoded: 0,
             track_access: false,
             primitive_values_read: 0,
+            batch_buffer: Vec::new(),
         }
     }
 
@@ -100,6 +103,7 @@ impl<'a> ReadSession<'a> {
             frames_decoded: 0,
             track_access: true,
             primitive_values_read: 0,
+            batch_buffer: Vec::new(),
         })
     }
 
@@ -122,6 +126,7 @@ impl<'a> ReadSession<'a> {
             frames_decoded: 0,
             track_access: true,
             primitive_values_read: 0,
+            batch_buffer: Vec::new(),
         }
     }
 
@@ -261,6 +266,131 @@ impl<'a> ReadSession<'a> {
             values.push(((word >> bit) & mask) as u64);
         }
         Ok(values)
+    }
+
+    /// Reads the packed bytes of `rows` once, exactly as `read_bit_values`
+    /// over the same rows would, without decoding them. A batch kernel calls
+    /// this before unpacking the span in chunks; the chunk reads then fall
+    /// inside an already delivered range and add no transfers.
+    pub fn touch_bits(
+        &mut self,
+        field: FieldId,
+        rows: Span,
+        width: u8,
+        miniblock_rows: usize,
+        miniblock_bytes: usize,
+    ) -> Result<(), String> {
+        if width == 0 || rows.start == rows.end {
+            return Ok(());
+        }
+        if width > 64 || miniblock_rows == 0 || miniblock_bytes == 0 {
+            return Err("invalid bit-unpack parameters".into());
+        }
+        let first_byte = packed_byte_offset(rows.start, width, miniblock_rows, miniblock_bytes)?;
+        let last_row = rows.end - 1;
+        let last_byte = packed_byte_offset(last_row, width, miniblock_rows, miniblock_bytes)?;
+        let last_bit = (last_row % miniblock_rows) * width as usize % 8;
+        let byte_end = last_byte + (last_bit + width as usize).div_ceil(8);
+        self.read_range(field, Span::new(first_byte, byte_end)?)?;
+        Ok(())
+    }
+
+    /// Lends the session's reusable batch buffer to a batch kernel, which
+    /// hands it back with `restore_batch_buffer`. Reusing one buffer, rather
+    /// than declaring a full batch per call, keeps a short span from paying
+    /// to initialize rows it never decodes.
+    pub fn take_batch_buffer(&mut self) -> Vec<i128> {
+        std::mem::take(&mut self.batch_buffer)
+    }
+
+    pub fn restore_batch_buffer(&mut self, buffer: Vec<i128>) {
+        self.batch_buffer = buffer;
+    }
+
+    /// Batch form of `read_bit_values`: replaces the contents of `out` with
+    /// `rows`, reusing its allocation. It reads the same byte range and
+    /// records the same access, so batch and per-value kernels are accounted
+    /// identically.
+    pub fn unpack_bits_into(
+        &mut self,
+        field: FieldId,
+        rows: Span,
+        width: u8,
+        miniblock_rows: usize,
+        miniblock_bytes: usize,
+        out: &mut Vec<i128>,
+    ) -> Result<(), String> {
+        out.clear();
+        self.record_primitive_values(rows.len());
+        if width == 0 {
+            out.resize(rows.len(), 0);
+            return Ok(());
+        }
+        if width > 64 || miniblock_rows == 0 || miniblock_bytes == 0 {
+            return Err("invalid bit-unpack parameters".into());
+        }
+        if rows.start == rows.end {
+            return Ok(());
+        }
+        let first_byte = packed_byte_offset(rows.start, width, miniblock_rows, miniblock_bytes)?;
+        let last_row = rows.end - 1;
+        let last_byte = packed_byte_offset(last_row, width, miniblock_rows, miniblock_bytes)?;
+        let last_bit = (last_row % miniblock_rows) * width as usize % 8;
+        let byte_end = last_byte + (last_bit + width as usize).div_ceil(8);
+        miniblock_rows
+            .checked_mul(width as usize)
+            .ok_or("packed bit offset overflow")?;
+        let bytes = self.read_range(field, Span::new(first_byte, byte_end)?)?;
+        unpack_into(
+            bytes,
+            rows,
+            width,
+            miniblock_rows,
+            miniblock_bytes,
+            first_byte,
+            out,
+        );
+        Ok(())
+    }
+
+    /// Batch dictionary lookup: replaces every id in `values` with entry `id`
+    /// of an i64 table field. A tracked or storage-backed session reads entry
+    /// by entry, exactly as per-value `read_i64` would; an untracked in-memory
+    /// session, which records nothing, indexes one borrowed view instead.
+    pub fn gather_i64_into(
+        &mut self,
+        field: FieldId,
+        entries: usize,
+        values: &mut [i128],
+    ) -> Result<(), String> {
+        let mut max_id = 0_usize;
+        for &id in values.iter() {
+            let id = usize::try_from(id).map_err(|_| "dictionary id does not fit usize")?;
+            if id >= entries {
+                return Err("dictionary id is outside table".into());
+            }
+            max_id = max_id.max(id);
+        }
+        if values.is_empty() {
+            return Ok(());
+        }
+        if self.track_access || !matches!(self.source, ReadSource::Memory) {
+            for value in values.iter_mut() {
+                *value = i128::from(self.read_i64(field, *value as usize)?);
+            }
+            return Ok(());
+        }
+        let end = (max_id + 1)
+            .checked_mul(8)
+            .ok_or("dictionary view offset overflow")?;
+        let table = self.read_range(field, Span::new(0, end)?)?;
+        for value in values.iter_mut() {
+            let offset = *value as usize * 8;
+            *value = i128::from(i64::from_le_bytes(
+                table[offset..offset + 8].try_into().unwrap(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn read_bits(
@@ -432,6 +562,59 @@ impl<'a> ReadSession<'a> {
 /// field at any bit alignment, and a size the compiler can turn into a fixed
 /// unaligned load.
 const WIDE_LOAD: usize = 16;
+
+/// Unpacks `rows` from `bytes`, the delivered slice starting at stream byte
+/// `first_byte`. Callers have validated that the slice covers every row.
+fn unpack_into(
+    bytes: &[u8],
+    rows: Span,
+    width: u8,
+    miniblock_rows: usize,
+    miniblock_bytes: usize,
+    first_byte: usize,
+    out: &mut Vec<i128>,
+) {
+    let width_bits = width as usize;
+    let mask = if width == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << width) - 1
+    };
+    let extract = |offset: usize, bit: usize| -> u64 {
+        // A 57-bit value at any bit alignment fits one 8-byte window; wider
+        // values take a 16-byte window. Near the end of the slice assemble
+        // only the bytes the value needs.
+        if width_bits <= 57 && offset + 8 <= bytes.len() {
+            let word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            (word >> bit) & mask
+        } else if offset + WIDE_LOAD <= bytes.len() {
+            let word = u128::from_le_bytes(bytes[offset..offset + WIDE_LOAD].try_into().unwrap());
+            ((word >> bit) as u64) & mask
+        } else {
+            let count = (bit + width_bits).div_ceil(8);
+            let mut word = 0_u128;
+            for (index, byte) in bytes[offset..offset + count].iter().copied().enumerate() {
+                word |= u128::from(byte) << (index * 8);
+            }
+            ((word >> bit) as u64) & mask
+        }
+    };
+    if miniblock_bytes * 8 == miniblock_rows * width_bits {
+        // Miniblocks abut without padding, so row r starts at bit r * width
+        // and the cursor advances without per-row division.
+        let first_bit = rows.start * width_bits - first_byte * 8;
+        out.extend((0..rows.len()).map(|index| {
+            let bit = first_bit + index * width_bits;
+            i128::from(extract(bit >> 3, bit & 7))
+        }));
+    } else {
+        out.extend((rows.start..rows.end).map(|row| {
+            let bit_offset = (row % miniblock_rows) * width_bits;
+            let offset = (row / miniblock_rows) * miniblock_bytes + bit_offset / 8 - first_byte;
+            i128::from(extract(offset, bit_offset % 8))
+        }));
+    }
+}
 
 fn packed_byte_offset(
     row: usize,

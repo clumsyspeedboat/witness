@@ -53,6 +53,7 @@ pub use static_baseline::{
     static_monotone_filter, static_piecewise_monotone_filter, static_sum,
 };
 pub use support::{
-    find_position, load_metadata, locate_indexed, lower_bound_position, nullable_is_valid,
-    nullable_prefix_rank, nullable_rank, push_range, unzigzag,
+    BATCH_ROWS, find_position, load_metadata, locate_indexed, lower_bound_position,
+    nullable_is_valid, nullable_prefix_rank, nullable_rank, push_batch_matches, push_range,
+    sum_batch, unzigzag,
 };
