@@ -1353,6 +1353,7 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         curve.push_str(&format!("({threads},{:.2})", median(&speedups)));
     }
     define(out, "WitScaleSpeedupPlot", &curve);
+    paged_tables(out)?;
     for (predicate, suffix) in [("0.1pct", "Tenth"), ("50pct", "FiftyPct")] {
         let key = |arm: &str| {
             (
@@ -1379,6 +1380,167 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             &format!("{:.2}", parquet / 1e6),
         );
     }
+    Ok(())
+}
+
+/// Display names for corpus groups, in table order.
+const GROUPS: [(&str, &str); 7] = [
+    ("publicbi", "Public BI"),
+    ("tpcds", "TPC-DS"),
+    ("tpch", "TPC-H"),
+    ("clickbench", "ClickBench"),
+    ("nab", "NAB"),
+    ("household", "Household"),
+    ("large", "NYC taxi"),
+];
+
+/// Table rows for the paper: page decisions by target selectivity, paged
+/// results by corpus group, and census incidence by corpus group.
+fn paged_tables(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let pairs = read_csv(&format!("{PAGED}/pairs.csv"))?;
+    let queries = read_csv(&format!("{PAGED}/queries.csv"))?;
+    let group_of = pairs
+        .iter()
+        .map(|row| Ok((pairs.field(row, "pair")?, pairs.field(row, "group")?)))
+        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+
+    let mut decisions = BTreeMap::<String, [usize; 6]>::new();
+    let mut latency = BTreeMap::<(String, String), BTreeMap<String, f64>>::new();
+    let mut group_pages = BTreeMap::<String, [usize; 2]>::new();
+    for row in &queries {
+        let predicate = queries.field(row, "predicate")?;
+        let pair = queries.field(row, "pair")?;
+        let arm = queries.field(row, "arm")?;
+        latency
+            .entry((pair.clone(), predicate.clone()))
+            .or_default()
+            .insert(arm.clone(), queries.field(row, "median_ns")?.parse()?);
+        if arm != "witness_direct_facts" {
+            continue;
+        }
+        let bucket = predicate.split('+').next().unwrap_or_default().to_string();
+        let entry = decisions.entry(bucket).or_default();
+        for (slot, name) in [
+            "pages",
+            "skipped",
+            "accepted",
+            "searched",
+            "translated",
+            "scanned",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            entry[slot] += queries.field(row, name)?.parse::<usize>()?;
+        }
+        let group = group_of.get(&pair).ok_or("query names an unknown pair")?;
+        let pages = group_pages.entry(group.clone()).or_default();
+        pages[0] += queries.field(row, "pages")?.parse::<usize>()?;
+        pages[1] += queries.field(row, "skipped")?.parse::<usize>()?;
+    }
+    let share = |part: usize, whole: usize| format!("{:.1}", part as f64 * 100.0 / whole as f64);
+    let mut table = String::new();
+    for (bucket, label) in [
+        ("0.1pct", "0.1"),
+        ("1pct", "1"),
+        ("10pct", "10"),
+        ("50pct", "50"),
+    ] {
+        let [pages, skipped, accepted, searched, translated, scanned] = *decisions
+            .get(bucket)
+            .ok_or("selectivity bucket is absent")?;
+        writeln!(
+            table,
+            "{label}\\% & {} & {} & {} & {} & {} \\\\",
+            share(skipped, pages),
+            share(accepted, pages),
+            share(searched, pages),
+            share(translated, pages),
+            share(scanned, pages)
+        )?;
+    }
+    define(out, "WitPagedDecisionRows", table.trim_end());
+
+    let mut table = String::new();
+    for (group, label) in GROUPS {
+        let ratio = |denominator: &str| {
+            latency
+                .iter()
+                .filter(|((pair, _), _)| group_of.get(pair).is_some_and(|name| name == group))
+                .filter_map(|(_, arms)| {
+                    Some(arms.get("witness_direct_facts")? / arms.get(denominator)?)
+                })
+                .collect::<Vec<_>>()
+        };
+        let plain = ratio("parquet_plain_indexed");
+        if plain.is_empty() {
+            continue;
+        }
+        let zstd = ratio("parquet_zstd_indexed");
+        let pair_count = group_of.values().filter(|name| *name == group).count();
+        let [pages, skipped] = group_pages[group];
+        writeln!(
+            table,
+            "{label} & {pair_count} & {:.2} & {:.2} & {} \\\\",
+            median(&plain),
+            median(&zstd),
+            share(skipped, pages)
+        )?;
+    }
+    define(out, "WitPagedGroupRows", table.trim_end());
+
+    let columns = read_csv(&format!("{CENSUS}/columns.csv"))?;
+    let pages = read_csv(&format!("{CENSUS}/pages.csv"))?;
+    let mut census = BTreeMap::<String, [usize; 6]>::new();
+    let mut column_group = BTreeMap::<String, String>::new();
+    for row in &columns {
+        let group = columns.field(row, "group")?;
+        column_group.insert(columns.field(row, "column")?, group.clone());
+        let unique = columns.field(row, "unique_non_null")?.parse::<usize>()?;
+        let entry = census.entry(group).or_default();
+        entry[0] += 1;
+        entry[1] +=
+            usize::from(unique > 1 && columns.field(row, "global_monotone_non_null")? == "true");
+    }
+    for row in &pages {
+        if pages.field(row, "page_size")? != "1024" {
+            continue;
+        }
+        let group = column_group
+            .get(&pages.field(row, "column")?)
+            .ok_or("census page names an unknown column")?;
+        let unique = pages.field(row, "unique_non_null")?.parse::<usize>()?;
+        let entry = census.get_mut(group).ok_or("census group is absent")?;
+        entry[2] += 1;
+        entry[3] += usize::from(unique == 0);
+        entry[4] += usize::from(unique == 1);
+        entry[5] += usize::from(unique > 1 && pages.field(row, "monotone_non_null")? == "true");
+    }
+    let mut table = String::new();
+    for (group, label) in GROUPS {
+        let Some(
+            &[
+                columns,
+                monotone,
+                page_count,
+                all_null,
+                constant,
+                monotone_pages,
+            ],
+        ) = census.get(group)
+        else {
+            continue;
+        };
+        writeln!(
+            table,
+            "{label} & {columns} & {} & {} & {} & {} \\\\",
+            share(monotone, columns),
+            share(all_null, page_count),
+            share(constant, page_count),
+            share(monotone_pages, page_count)
+        )?;
+    }
+    define(out, "WitCensusGroupIncidenceRows", table.trim_end());
     Ok(())
 }
 
