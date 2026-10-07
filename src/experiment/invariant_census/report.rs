@@ -46,6 +46,7 @@ fn write_columns(result_dir: &str, rows: &[ColumnRow]) -> Result<(), Box<dyn Err
         "structural_piecewise_access_ready_bytes",
         "order_mapping_access_ready_bytes",
         "order_mapping_access_ready_premium",
+        "smallest_chunked_bytes",
     ])?;
     for row in rows {
         writer.write_record([
@@ -84,6 +85,9 @@ fn write_columns(result_dir: &str, rows: &[ColumnRow]) -> Result<(), Box<dyn Err
                 .unwrap_or_default(),
             row.order_mapping_access_ready_premium
                 .map(|value| format!("{value:.6}"))
+                .unwrap_or_default(),
+            row.smallest_chunked_bytes
+                .map(|value| value.to_string())
                 .unwrap_or_default(),
         ])?;
     }
@@ -137,6 +141,7 @@ fn write_candidates(result_dir: &str, rows: &[CandidateRow]) -> Result<(), Box<d
         "mapping_facts",
         "access_facts",
         "access_ready",
+        "chunked",
     ])?;
     for row in rows {
         writer.write_record([
@@ -155,6 +160,7 @@ fn write_candidates(result_dir: &str, rows: &[CandidateRow]) -> Result<(), Box<d
             row.mapping_facts.to_string(),
             row.access_facts.to_string(),
             row.access_ready.to_string(),
+            row.chunked.to_string(),
         ])?;
     }
     writer.flush()?;
@@ -231,6 +237,70 @@ fn write_summary(
                 / sources.len() as f64
         ),
     ));
+    // A constant column is trivially non-decreasing; order evidence that
+    // matters is reported over the columns that are not constant.
+    let constant = |row: &&ColumnRow| row.unique_non_null == 1;
+    let constant_columns = columns.iter().filter(constant).count();
+    metrics.push(("constant_columns".into(), constant_columns.to_string()));
+    metrics.push((
+        "constant_column_fraction".into(),
+        ratio(constant_columns, columns.len()),
+    ));
+    let nonconstant_monotone = columns
+        .iter()
+        .filter(|row| row.global_monotone_non_null && row.unique_non_null > 1)
+        .count();
+    metrics.push((
+        "nonconstant_monotone_columns".into(),
+        nonconstant_monotone.to_string(),
+    ));
+    metrics.push((
+        "nonconstant_monotone_column_fraction".into(),
+        ratio(nonconstant_monotone, columns.len()),
+    ));
+    let mut by_source = BTreeMap::<(&str, &str), (usize, usize)>::new();
+    for row in columns {
+        let entry = by_source
+            .entry((row.group.as_str(), row.source.as_str()))
+            .or_default();
+        entry.0 += 1;
+        entry.1 += usize::from(row.global_monotone_non_null && row.unique_non_null > 1);
+    }
+    metrics.push((
+        "nonconstant_monotone_source_weighted_fraction".into(),
+        format!(
+            "{:.6}",
+            by_source
+                .values()
+                .map(|(columns, monotone)| *monotone as f64 / *columns as f64)
+                .sum::<f64>()
+                / by_source.len() as f64
+        ),
+    ));
+    for (name, select) in [
+        (
+            "access_ready_premium_median",
+            (|row: &ColumnRow| Some(row.smallest_access_ready_bytes))
+                as fn(&ColumnRow) -> Option<usize>,
+        ),
+        ("chunked_premium_median", |row: &ColumnRow| {
+            row.smallest_chunked_bytes
+        }),
+    ] {
+        metrics.push((
+            name.into(),
+            format!(
+                "{:.6}",
+                median(
+                    columns
+                        .iter()
+                        .filter_map(|row| select(row)
+                            .map(|bytes| bytes as f64 / row.smallest_candidate_bytes as f64))
+                        .collect()
+                )
+            ),
+        ));
+    }
     let total_rows = columns
         .iter()
         .map(|row| row.rows - row.nulls)
@@ -263,6 +333,22 @@ fn write_summary(
         metrics.push((
             format!("page_{page_size}_monotone_fraction"),
             ratio(monotone, admitted.len()),
+        ));
+        let constant_pages = admitted
+            .iter()
+            .filter(|row| row.unique_non_null == 1)
+            .count();
+        metrics.push((
+            format!("page_{page_size}_constant_fraction"),
+            ratio(constant_pages, admitted.len()),
+        ));
+        let nonconstant_monotone = admitted
+            .iter()
+            .filter(|row| row.monotone_non_null && row.unique_non_null > 1)
+            .count();
+        metrics.push((
+            format!("page_{page_size}_nonconstant_monotone_fraction"),
+            ratio(nonconstant_monotone, admitted.len()),
         ));
         for threshold in DISPLACEMENT_THRESHOLDS {
             let count = admitted

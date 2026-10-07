@@ -22,6 +22,7 @@ pub struct ColumnRow {
     pub structural_piecewise_access_ready_bytes: Option<usize>,
     pub order_mapping_access_ready_bytes: Option<usize>,
     pub order_mapping_access_ready_premium: Option<f64>,
+    pub smallest_chunked_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +50,7 @@ pub struct CandidateRow {
     pub framed: bool,
     pub restart_bound: Option<usize>,
     pub access_ready: bool,
+    pub chunked: bool,
     pub semantic_facts: usize,
     pub mapping_facts: usize,
     pub access_facts: usize,

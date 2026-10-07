@@ -56,6 +56,12 @@ pub fn analyze_candidates(
             Property::Access(AccessInvariant::RestartBound { rows }) => Some(rows),
             _ => None,
         });
+        let chunked = facts.iter().any(|fact| {
+            matches!(
+                fact.property,
+                Property::Access(AccessInvariant::FrameChunks { .. })
+            )
+        });
         let access_ready = !framed && restart_bound.is_none_or(|rows| rows <= 256);
         rows.push(CandidateRow {
             column,
@@ -68,6 +74,7 @@ pub fn analyze_candidates(
             framed,
             restart_bound,
             access_ready,
+            chunked,
             semantic_facts: facts
                 .iter()
                 .filter(|fact| matches!(fact.property, Property::Value(_)))
@@ -107,6 +114,9 @@ fn validate_mapping_payloads(encoded: &EncodedColumn) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Decoded bytes per independently compressed chunk of a chunked frame.
+const CHUNK_BYTES: usize = 16 * 1024;
 
 fn recipes(nullable: bool, rows: usize) -> Vec<(String, Recipe)> {
     let bitpack = || Recipe::BitPack;
@@ -170,7 +180,14 @@ fn recipes(nullable: bool, rows: usize) -> Vec<(String, Recipe)> {
                 (label.clone(), wrap(recipe.clone())),
                 (
                     format!("Frame({label})"),
-                    Recipe::Frame(Box::new(wrap(recipe))),
+                    Recipe::Frame(Box::new(wrap(recipe.clone()))),
+                ),
+                (
+                    format!("ChunkedFrame16K({label})"),
+                    Recipe::ChunkedFrame {
+                        chunk_bytes: CHUNK_BYTES,
+                        values: Box::new(wrap(recipe)),
+                    },
                 ),
             ]
         })

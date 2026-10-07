@@ -111,6 +111,11 @@ fn analyze_column(id: usize, column: &Column) -> Result<ColumnAnalysis, String> 
             .min();
         let order_mapping_access_ready_premium = order_mapping_access_ready_bytes
             .map(|bytes| bytes as f64 / smallest_access_ready_bytes as f64 - 1.0);
+        let smallest_chunked_bytes = candidates
+            .iter()
+            .filter(|candidate| candidate.chunked)
+            .map(|candidate| candidate.bytes)
+            .min();
         let pages = analyze_pages(id, &column.values);
         let row = ColumnRow {
             id,
@@ -135,6 +140,7 @@ fn analyze_column(id: usize, column: &Column) -> Result<ColumnAnalysis, String> 
             structural_piecewise_access_ready_bytes,
             order_mapping_access_ready_bytes,
             order_mapping_access_ready_premium,
+            smallest_chunked_bytes,
         };
         Ok((row, pages, candidates))
     }
