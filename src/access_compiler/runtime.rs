@@ -180,6 +180,32 @@ impl<'a> ReadSession<'a> {
         ))
     }
 
+    /// Batch form of `read_u32`: replaces `out` with entries `indexes`,
+    /// read as one range and accounted as that many values.
+    pub fn read_u32_into(
+        &mut self,
+        field: FieldId,
+        indexes: Span,
+        out: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        self.record_primitive_values(indexes.len());
+        let start = indexes
+            .start
+            .checked_mul(4)
+            .ok_or("u32 field offset overflow")?;
+        let end = indexes
+            .end
+            .checked_mul(4)
+            .ok_or("u32 field offset overflow")?;
+        out.clear();
+        out.extend(
+            self.read_range(field, Span::new(start, end)?)?
+                .chunks_exact(4)
+                .map(|entry| u32::from_le_bytes(entry.try_into().unwrap()) as usize),
+        );
+        Ok(())
+    }
+
     pub fn read_i64(&mut self, field: FieldId, index: usize) -> Result<i64, String> {
         self.record_primitive_values(1);
         let offset = index.checked_mul(8).ok_or("i64 field offset overflow")?;
@@ -398,6 +424,30 @@ impl<'a> ReadSession<'a> {
                 table[offset..offset + 8].try_into().unwrap(),
             ));
         }
+        Ok(())
+    }
+
+    /// Replaces `out` with the first `entries` values of an i64 table field,
+    /// read as one range: for a kernel that will look up most of them.
+    pub fn read_i64_table(
+        &mut self,
+        field: FieldId,
+        entries: usize,
+        out: &mut Vec<i64>,
+    ) -> Result<(), String> {
+        out.clear();
+        if entries == 0 {
+            return Ok(());
+        }
+        let end = entries
+            .checked_mul(8)
+            .ok_or("dictionary view offset overflow")?;
+        let table = self.read_range(field, Span::new(0, end)?)?;
+        out.extend(
+            table
+                .chunks_exact(8)
+                .map(|entry| i64::from_le_bytes(entry.try_into().unwrap())),
+        );
         Ok(())
     }
 

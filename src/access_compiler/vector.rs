@@ -384,7 +384,6 @@ pub fn fused_sum_between(
     }
     let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
     let mut selected = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
-    let mut gathered = Vec::new();
     let mut value_batch = LaneBatch::default();
     let mut value_cursor = sums.cursor(value_session, rows.start)?;
     let mut total = 0_i128;
@@ -410,7 +409,7 @@ pub fn fused_sum_between(
                 u64::from(code.wrapping_sub(first) <= spread)
             });
             sums.fill(value_session, &mut value_cursor, batch, &mut value_batch)?;
-            let sum = sums.sum_taken(value_session, &value_batch, &selected, &mut gathered)?;
+            let sum = sums.sum_taken(&value_batch, &selected)?;
             total = total.checked_add(sum).ok_or("vector SUM overflow")?;
             matched += selected.iter().sum::<u64>() as usize;
         }
@@ -434,6 +433,9 @@ struct Packed {
     miniblock_rows: usize,
     miniblock_bytes: usize,
 }
+
+/// Runs whose lengths and values a run-length scan reads at once.
+const RLE_BATCH_RUNS: usize = 256;
 
 /// Widest code a batch of `BATCH_ROWS` codes sums in a `u64`.
 const SUMMABLE_WIDTH: u8 = 53;
@@ -587,7 +589,15 @@ struct Lane {
     validity: Option<Validity>,
     /// The table the codes index, and its entries, for dictionary codes.
     dictionary: Option<(FieldId, usize)>,
+    /// The table's entries, read once, for `Codes::DictionaryValues`.
+    entries: Vec<i64>,
+    /// Every entry is below 2^52 in magnitude, so a batch of them sums in
+    /// an `i64`.
+    narrow: bool,
 }
+
+/// Largest entry magnitude, in bits, that `Lane::narrow` admits.
+const NARROW_BITS: u32 = 52;
 
 /// One batch of a lane: a code per row, and, for a page with nulls, per row
 /// 1 if it holds a value and 0 if it is null; a null row's code is
@@ -694,10 +704,24 @@ impl Lane {
                 (Packed::at_node(decoder, ids)?, Some((dictionary, entries)))
             }
         };
-        Ok(packed.map(|packed| Self {
+        let Some(packed) = packed else {
+            return Ok(None);
+        };
+        let mut entries = Vec::new();
+        if codes == Codes::DictionaryValues
+            && let Some((table, count)) = dictionary
+        {
+            session.read_i64_table(table, count, &mut entries)?;
+        }
+        let narrow = entries
+            .iter()
+            .all(|entry| entry.unsigned_abs() < 1 << NARROW_BITS);
+        Ok(Some(Self {
             packed,
             validity,
             dictionary,
+            entries,
+            narrow,
         }))
     }
 
@@ -713,15 +737,8 @@ impl Lane {
     }
 
     /// SUM of the non-null values of `batch` at rows whose `take` is 1.
-    /// Dictionary ids become entries in `gathered`.
-    fn sum_taken(
-        &self,
-        session: &mut ReadSession<'_>,
-        batch: &LaneBatch,
-        take: &[u64],
-        gathered: &mut Vec<i128>,
-    ) -> Result<i128, String> {
-        let Some((table, entries)) = self.dictionary else {
+    fn sum_taken(&self, batch: &LaneBatch, take: &[u64]) -> Result<i128, String> {
+        if self.dictionary.is_none() {
             let (mut sum, mut count) = (0_u64, 0_u64);
             if batch.dense() {
                 for (&code, &take) in batch.codes.iter().zip(take) {
@@ -736,26 +753,54 @@ impl Lane {
                 }
             }
             return self.packed.add(0, count as usize, sum);
+        }
+        // Each taken id indexes the table; an id outside it fails the query.
+        // Untaken rows, null ones among them, read a clamped entry that the
+        // mask discards.
+        let Some(last) = self.entries.len().checked_sub(1) else {
+            return if take.iter().any(|&take| take != 0) {
+                Err("dictionary id is outside table".into())
+            } else {
+                Ok(0)
+            };
         };
-        if take.iter().all(|&take| take == 0) {
-            return Ok(0);
-        }
-        // A null row repeats a stored id, so every id names an entry unless
-        // the page is corrupt, which the gather reports.
-        gathered.clear();
-        gathered.extend(batch.codes.iter().map(|&id| i128::from(id)));
-        session.gather_i64_into(table, entries, gathered)?;
-        let mut sum = 0_i128;
-        let mut overflow = false;
-        let valid = |index: usize| batch.valid.get(index).copied().unwrap_or(1);
-        for (index, (&value, &take)) in gathered.iter().zip(take).enumerate() {
-            let take = i128::from(take & valid(index));
-            let (next, carried) = sum.overflowing_add(value & take.wrapping_neg());
-            sum = next;
-            overflow |= carried;
-        }
-        if overflow {
-            return Err("vector SUM overflow".into());
+        let entries = &self.entries;
+        let outside = |id: u64, take: u64| u64::from(id > last as u64) & take;
+        let entry = |id: u64| entries[(id as usize).min(last)];
+        let (sum, outside) = match (self.narrow, batch.dense()) {
+            (true, true) => {
+                let (mut sum, mut bad) = (0_i64, 0_u64);
+                for (&id, &take) in batch.codes.iter().zip(take) {
+                    bad |= outside(id, take);
+                    sum += entry(id) & (take as i64).wrapping_neg();
+                }
+                (i128::from(sum), bad)
+            }
+            (true, false) => {
+                let (mut sum, mut bad) = (0_i64, 0_u64);
+                for ((&id, &valid), &take) in batch.codes.iter().zip(&batch.valid).zip(take) {
+                    let take = take & valid;
+                    bad |= outside(id, take);
+                    sum += entry(id) & (take as i64).wrapping_neg();
+                }
+                (i128::from(sum), bad)
+            }
+            (false, dense) => {
+                let (mut sum, mut bad) = (0_i128, 0_u64);
+                for (index, (&id, &take)) in batch.codes.iter().zip(take).enumerate() {
+                    let take = if dense {
+                        take
+                    } else {
+                        take & batch.valid[index]
+                    };
+                    bad |= outside(id, take);
+                    sum += i128::from(entry(id)) & i128::from(take).wrapping_neg();
+                }
+                (sum, bad)
+            }
+        };
+        if outside != 0 {
+            return Err("dictionary id is outside table".into());
         }
         Ok(sum)
     }
@@ -848,10 +893,10 @@ impl Lane {
         selection: &Selection,
     ) -> Result<i128, String> {
         let mut total = 0_i128;
-        let (mut take, mut gathered) = (Vec::new(), Vec::new());
-        self.scan(session, hull, |session, row, batch| {
+        let mut take = Vec::new();
+        self.scan(session, hull, |_, row, batch| {
             batch.taken(selection, row, &mut take);
-            let sum = self.sum_taken(session, batch, &take, &mut gathered)?;
+            let sum = self.sum_taken(batch, &take)?;
             total = total
                 .checked_add(sum)
                 .ok_or("vector selected SUM overflow")?;
@@ -1356,22 +1401,55 @@ fn scan_node<'p>(
             }
             let (mut run, mut run_start, _) =
                 locate_indexed(session, run_index, run_lengths, runs, index_interval, start)?;
+            // Runs are read a batch at a time: their lengths as one range,
+            // their values with one scan of the value node.
+            let mut lengths = Vec::new();
+            let mut run_values: Vec<Option<i128>> = Vec::new();
             while run < runs && run_start < end {
-                let run_end = run_start
-                    .checked_add(session.read_u32(run_lengths, run)? as usize)
-                    .ok_or("run-length row overflow")?;
-                let span_start = start.max(run_start);
-                let span_end = end.min(run_end);
-                if span_start < span_end {
-                    let len = span_end - span_start;
-                    let chunk = match get_node(decoder, values, session, run)? {
-                        Some(value) => Chunk::Run { value, len },
-                        None => Chunk::Nulls { len },
-                    };
-                    sink(session, span_start, chunk)?;
+                let batch_end = (run + RLE_BATCH_RUNS).min(runs);
+                session.read_u32_into(run_lengths, Span::new(run, batch_end)?, &mut lengths)?;
+                run_values.clear();
+                scan_node(
+                    decoder,
+                    values,
+                    session,
+                    run,
+                    batch_end,
+                    &mut |_, _, chunk| {
+                        match chunk {
+                            Chunk::Values(values) => {
+                                run_values.extend(values.iter().map(|&value| Some(value)));
+                            }
+                            Chunk::Run { value, len } => {
+                                run_values.extend(std::iter::repeat_n(Some(value), len));
+                            }
+                            Chunk::Nulls { len } => {
+                                run_values.extend(std::iter::repeat_n(None, len));
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+                for (&length, &value) in lengths.iter().zip(&run_values) {
+                    if run_start >= end {
+                        break;
+                    }
+                    let run_end = run_start
+                        .checked_add(length)
+                        .ok_or("run-length row overflow")?;
+                    let span_start = start.max(run_start);
+                    let span_end = end.min(run_end);
+                    if span_start < span_end {
+                        let len = span_end - span_start;
+                        let chunk = match value {
+                            Some(value) => Chunk::Run { value, len },
+                            None => Chunk::Nulls { len },
+                        };
+                        sink(session, span_start, chunk)?;
+                    }
+                    run_start = run_end;
+                    run += 1;
                 }
-                run_start = run_end;
-                run += 1;
             }
             if run_start < end {
                 return Err("run lengths end before the column does".into());
@@ -1470,43 +1548,81 @@ fn scan_node<'p>(
             if end > logical_len {
                 return Err("nullable scan exceeds its column".into());
             }
-            let mut compact =
+            let compact =
                 nullable_prefix_rank(session, validity, rank_index, start, rank_interval)?;
             let first_byte = start / 8;
             let bits = session
                 .read_range(validity, Span::new(first_byte, (end - 1) / 8 + 1)?)?
                 .to_vec();
             let valid = |row: usize| bits[row / 8 - first_byte] >> (row % 8) & 1 == 1;
+            let present = (start..end).filter(|&row| valid(row)).count();
+            // The stored values are scanned once, and each chunk is laid over
+            // the next valid rows, with the null runs between them emitted
+            // as they are reached.
             let mut logical = start;
-            while logical < end {
-                let state = valid(logical);
-                let run_start = logical;
-                logical += 1;
-                while logical < end && valid(logical) == state {
-                    logical += 1;
+            let emit_nulls = |session: &mut ReadSession<'p>,
+                              logical: &mut usize,
+                              sink: &mut Sink<'_, 'p>|
+             -> Result<(), String> {
+                let null_start = *logical;
+                while *logical < end && !valid(*logical) {
+                    *logical += 1;
                 }
-                if state {
-                    let child_start = compact;
-                    compact += logical - run_start;
-                    scan_node(
-                        decoder,
-                        values,
-                        session,
-                        child_start,
-                        compact,
-                        &mut |session, row, chunk| {
-                            sink(session, run_start + row - child_start, chunk)
-                        },
-                    )?;
-                } else {
+                if *logical > null_start {
                     sink(
                         session,
-                        run_start,
+                        null_start,
                         Chunk::Nulls {
-                            len: logical - run_start,
+                            len: *logical - null_start,
                         },
                     )?;
                 }
+                Ok(())
+            };
+            scan_node(
+                decoder,
+                values,
+                session,
+                compact,
+                compact + present,
+                &mut |session, _, chunk| {
+                    let mut remaining = chunk.len();
+                    let mut offset = 0;
+                    let mut chunk = chunk;
+                    while remaining > 0 {
+                        emit_nulls(session, &mut logical, sink)?;
+                        let run_start = logical;
+                        while logical < end && valid(logical) && logical - run_start < remaining {
+                            logical += 1;
+                        }
+                        let len = logical - run_start;
+                        if len == 0 {
+                            return Err("nullable values outrun their validity".into());
+                        }
+                        match &mut chunk {
+                            Chunk::Values(values) => {
+                                sink(
+                                    session,
+                                    run_start,
+                                    Chunk::Values(&mut values[offset..offset + len]),
+                                )?;
+                            }
+                            Chunk::Run { value, .. } => {
+                                sink(session, run_start, Chunk::Run { value: *value, len })?;
+                            }
+                            Chunk::Nulls { .. } => {
+                                sink(session, run_start, Chunk::Nulls { len })?;
+                            }
+                        }
+                        offset += len;
+                        remaining -= len;
+                    }
+                    Ok(())
+                },
+            )?;
+            emit_nulls(session, &mut logical, sink)?;
+            if logical != end {
+                return Err("nullable values end before their validity".into());
             }
             Ok(())
         }

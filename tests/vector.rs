@@ -448,7 +448,11 @@ fn nullable_code_kernels_agree_with_the_truth() {
         column(0, 400, 7),
         column(29, 90, 1_000),
     ];
-    let values = [column(5, 50_000, -20_000), column(0, 1 << 30, 0)];
+    let values = [
+        column(5, 50_000, -20_000),
+        column(0, 1 << 30, 0),
+        column(11, 1_000, 1 << 60),
+    ];
     let bitpack = || Box::new(Recipe::BitPack);
     let nullable = |values: Recipe| Recipe::Nullable {
         rank_interval: 512,
@@ -480,11 +484,20 @@ fn nullable_code_kernels_agree_with_the_truth() {
         Span::new(777, 5_123).unwrap(),
         Span::new(2_000, 2_001).unwrap(),
     ];
+    // Whether the fused pass takes each value encoding: run-length values
+    // decline it and are summed by the general path.
     let value_recipes = [
-        nullable(Recipe::For(bitpack())),
-        nullable(Recipe::Dictionary(bitpack())),
+        (nullable(Recipe::For(bitpack())), true),
+        (nullable(Recipe::Dictionary(bitpack())), true),
+        (
+            nullable(Recipe::Rle {
+                index_interval: 32,
+                values: Box::new(Recipe::For(bitpack())),
+            }),
+            false,
+        ),
     ];
-    for (value, value_recipe) in values
+    for (value, (value_recipe, fused_takes)) in values
         .iter()
         .flat_map(|value| value_recipes.iter().map(move |recipe| (value, recipe)))
     {
@@ -532,7 +545,7 @@ fn nullable_code_kernels_agree_with_the_truth() {
                         .unwrap();
                         assert_eq!(
                             fused,
-                            Some(expected),
+                            fused_takes.then_some(expected),
                             "{} {low}..={high} {span:?}",
                             recipe.name()
                         );
