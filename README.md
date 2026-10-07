@@ -34,7 +34,17 @@ the evidence.
 
 Order and reachability are independent. In the census **0.0%** of columns hold
 the free structural proof *and* fast access: beyond 256 rows the two requirements
-contradict each other.
+contradict each other. Paged columns resolve this differently: every page proves
+or certifies its own order, and appending a page checks one seam to keep the
+whole column certified.
+
+### An encoding already carries a zone map
+
+A frame-of-reference base is the exact minimum of its page, and the bit width
+bounds the maximum; a sorted dictionary holds the exact minimum and maximum in
+its first and last entries. Witness derives these bounds as facts, at no byte
+cost, and a page whose bound excludes a predicate is skipped, while one whose
+bound lies inside it is accepted without decoding.
 
 ### Why this is not a cost model
 
@@ -46,15 +56,21 @@ contradict each other.
 
 ### What is measured
 
-A census of **109** columns from **33** sources, and a query study of **152**
+A census of **1784** columns from **93** sources, and a query study of **152**
 cells over **32** sources at 131,072 rows per column.
 
 | | |
 |---|---|
-| globally sorted | **26.6%** of columns |
-| where evidence exists and is reachable | **0.33x** a sortedness-aware Parquet reference |
+| non-decreasing, constant columns included | **10.4%** of columns |
+| where evidence exists and is reachable | **0.15x** a sortedness-aware Parquet reference |
 | price of keeping that access | **2.10x** the bytes |
-| cold disk, fewest-bytes plan | **1.28x** slower than reading the whole file (1,083 scattered reads against one) |
+| cold disk, fewest-bytes plan | **1.29x** slower than reading the whole file (1,083 scattered reads against one) |
+
+The paged study ([`experiments/results/paged_study/`](experiments/results/paged_study/))
+runs selective SUM queries over 364 column pairs paged at 16,384 rows against
+Parquet pruned by its page index, and
+[`experiments/results/paged_scale/`](experiments/results/paged_scale/) repeats
+them on TPC-H SF10 lineitem on 1 to 64 threads.
 
 Derived knowledge helps when it is present, cheap to reach, and not erased by the
 storage layer beneath it. A plain scan was always correct anyway.

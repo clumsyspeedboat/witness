@@ -7,21 +7,25 @@ These constraints are part of the result.
 - Witness is an exploratory study of representation-derived facts, generated
   query paths, and physical access cost. It is not a production storage
   engine, a universal format replacement, or a claim that it beats Parquet.
-- The census contains 109 columns from 33 public sources. It is deliberately
-  broader than the earlier six-pair study but is not a random sample of all
-  database workloads.
+- The census contains 1,784 columns from 93 public sources: every exact
+  column of the first table of each Public BI workbook, of TPC-H and TPC-DS
+  SF1, of the ClickBench hits partition, and of the NAB, household-power, and
+  taxi series. It is not a random sample of all database workloads. Constant
+  columns are non-decreasing too; the summary reports them separately, and
+  global order over non-constant columns is rare outside time series and
+  benchmark keys.
 - The canonical complete-query study contains 40 selector/value pairs and 152
   predicate cells. Sources, not cells or columns, are the resampling unit.
 - Access-ready Witness versus the Parquet boundary-search path has source
-  median 0.33x with a 95% bootstrap interval [0.10, 0.51]. The interval sits
+  median 0.15x with a 95% bootstrap interval [0.08, 0.16]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
-  (families, then sources within each) gives [0.07, 0.53]. Collapsing each
-  family to a single draw instead gives 0.49x [0.13, 1.23], which spans parity,
+  (families, then sources within each) gives [0.06, 0.30]. Collapsing each
+  family to a single draw instead gives 0.27x [0.10, 1.05], which spans parity,
   but that weights a one-column family like a ten-column one and the singleton
   families are the worst cases. Distribution-free, 9 of the 12 families favour
   the compiled plan: a Wilcoxon signed-rank test on the log ratios gives a
-  two-sided p=0.052. The weaker sign test, which discards magnitude, gives a
+  two-sided p=0.012. The weaker sign test, which discards magnitude, gives a
   one-sided p=0.073 on the same data. Read the separation as evidence for the
   mechanism on this corpus, not as a population-level claim.
 - Monotone and no-fact classes are imbalanced. The no-fact class has six
@@ -52,15 +56,16 @@ These constraints are part of the result.
 
 ## Storage and hardware scope
 
-- Primary performance results are single-threaded over resident serialized
-  buffers.
+- The single-page studies are single-threaded over resident serialized
+  buffers. The paged studies also run pages on up to 64 threads, but only
+  within one query; concurrent queries are not measured.
 - A separate mechanism study measures local XFS, root-volume ext4, and tmpfs,
   including per-page, sorted, coalesced, and full-read schedules.
   It does not establish behavior on NVMe, remote filesystems, object stores,
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.28x a full read; coalescing issued 119 calls and reached 1.00x. This is a
+  1.29x a full read; coalescing issued 119 calls and reached 1.00x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is
@@ -77,21 +82,17 @@ These constraints are part of the result.
 - Logical and delivered bytes are reader/layout accounting. Transferred bytes
   are measured by the prototype's positioned-read schedule, not hardware
   performance counters.
-- SIMD specialization, multithreading, concurrent readers, asynchronous I/O,
-  cache contention, and NUMA are out of scope.
-- The aggregation leg trails Parquet and we do not claim to know why. Two
-  candidate causes have been measured and removed. Tuning the bit-unpack kernel
-  (fixed-width load with a tail fallback, replacing a per-row offset
-  computation and byte-at-a-time assembly) changed aggregation by roughly 0-4%
-  while improving discovery by about a third. Removing a per-value heap
-  allocation on the scalar read path then cut aggregation by about a third,
-  with the gain scaling with selectivity as a per-value cost predicts, but the
-  ratio to Parquet barely moved because link-time optimization speeds the
-  reference up as well. The gap is therefore explained by neither decode
-  throughput nor allocation alone. Closing it against a vectorized reader is
-  out of scope.
-- Because that tuning helped one leg and not the other, latency ratios here are
-  not comparable to those in earlier revisions of this artifact. The release
+- Explicit SIMD specialization, concurrent readers, asynchronous I/O, cache
+  contention, and NUMA are out of scope.
+- Values travel through the executors as `i128`, so checked arithmetic never
+  narrows them; a 64-bit value path would decode faster.
+- Aggregation over a size-selected layout still trails Parquet row selection
+  at the median, because a Zstd frame enclosing the whole column must be
+  decompressed for any read; chunked frames remove that cost at about 2% more
+  bytes. The former deficit on directly addressable layouts was per-value
+  overhead, removed by batch decoding.
+- Latency ratios here are not comparable to those in earlier revisions of this
+  artifact. The release
   tag and source fingerprint identify which decoder produced a given number.
 - Results were measured with `lto = "fat"` and `codegen-units = 1`. Both the
   Witness arms and the Parquet/Arrow reference are linked into the same study
@@ -132,8 +133,9 @@ These constraints are part of the result.
   shorter delta restart intervals.
 - The access-ready byte premium is 2.10x in the canonical aggregate. The
   smaller delivered closure is therefore purchased, not free.
-- Witness currently stores independent column pages and experimental bundles;
-  it has no production multi-column table container, schema evolution,
+- Witness stores columns as independently encoded pages, appended and sealed,
+  with a checked order certificate across pages; pages are never updated in
+  place or deleted. It has no production multi-column table container, schema evolution,
   encryption, checksummed payload blocks, transactions, crash recovery, or
   concurrent writer protocol.
 - Tiny artifacts in the generated walkthrough are mechanics examples.
