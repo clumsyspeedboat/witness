@@ -89,6 +89,11 @@ name = "bounds"
 path = "tests/bounds.rs"
 required-features = ["experiment"]
 
+[[test]]
+name = "vector"
+path = "tests/vector.rs"
+required-features = ["experiment"]
+
 [[bin]]
 name = "generate_access_compiler"
 path = "src/bin/generate_access_compiler.rs"

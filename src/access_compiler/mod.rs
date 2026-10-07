@@ -17,6 +17,7 @@ mod runtime;
 mod schedule;
 mod static_baseline;
 mod support;
+pub mod vector;
 
 pub use certificates::{
     BlockBloom, BlockMinMax, CandidatePlan, SparseFence, intersect_candidates, refine_eq, refine_in,
