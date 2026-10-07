@@ -28,6 +28,11 @@ pub struct Page {
     /// First and last value of a dense page that proves itself
     /// non-decreasing, read when the page was sealed.
     pub ends: Option<(i128, i128)>,
+    /// Exact minimum and maximum of the non-null values, as a writer would
+    /// store them in a zone map; `None` when the page holds no value.
+    pub stats: Option<(i128, i128)>,
+    /// Non-null rows of the page, stored with the statistics.
+    pub non_null: usize,
 }
 
 impl Page {
@@ -160,11 +165,16 @@ impl PagedColumn {
             if extends {
                 self.ordered_pages += 1;
             }
+            let present = chunk.iter().flatten().map(|&value| i128::from(value));
+            let stats = present.clone().min().zip(present.clone().max());
+            let non_null = present.count();
             self.pages.push(Page {
                 start: self.rows,
                 column,
                 facts,
                 ends,
+                stats,
+                non_null,
             });
             self.rows += chunk.len();
         }
@@ -210,6 +220,18 @@ impl PagedColumn {
 
     pub fn pages(&self) -> &[Page] {
         &self.pages
+    }
+
+    /// Overwrites one page's stored statistics, as a writer whose zone map
+    /// fell out of step with its data would. The page's facts are untouched:
+    /// they are derived from the bytes that decode.
+    pub fn replace_statistics(
+        &mut self,
+        page: usize,
+        stats: Option<(i128, i128)>,
+    ) -> Result<(), String> {
+        self.pages.get_mut(page).ok_or("no such page")?.stats = stats;
+        Ok(())
     }
 
     pub fn rows(&self) -> usize {
@@ -270,6 +292,10 @@ pub enum SumAction {
 pub enum Planning {
     Facts,
     ScanOnly,
+    /// A plain zone map: exact per-page minima and maxima stored by the
+    /// writer, used to skip and accept pages and nothing else. It isolates
+    /// what stored statistics buy on the same executor as derived facts.
+    StoredStatistics,
 }
 
 /// Plans `low <= value <= high` on one page, then checks the plan.
@@ -283,13 +309,48 @@ pub fn plan_between(
     if low > high {
         return Err("page predicate bounds are invalid".into());
     }
-    let action = if planning == Planning::ScanOnly {
-        PageAction::Scan
-    } else {
-        choose_between(page, session, i128::from(low), i128::from(high))?
+    let action = match planning {
+        Planning::ScanOnly => PageAction::Scan,
+        Planning::Facts => choose_between(page, session, i128::from(low), i128::from(high))?,
+        Planning::StoredStatistics => choose_by_statistics(page, i128::from(low), i128::from(high)),
     };
     check_between(page, session, &action, low, high)?;
     Ok(action)
+}
+
+fn choose_by_statistics(page: &Page, low: i128, high: i128) -> PageAction {
+    let licence = Licence {
+        fact: Authorization::StoredStatistics,
+        evidence: page.stats,
+    };
+    match page.stats {
+        None => PageAction::Skip(licence),
+        Some((lower, upper)) if upper < low || lower > high => PageAction::Skip(licence),
+        Some((lower, upper)) if low <= lower && upper <= high => PageAction::Accept(licence),
+        Some(_) => PageAction::Scan,
+    }
+}
+
+/// Confirms a licence that cites stored statistics: they are the ones the
+/// page stores, and they decide the action. Stored statistics cannot be
+/// checked against the encoding, so a page whose statistics are wrong is
+/// planned wrongly; that is the trust they ask for.
+fn check_statistics(
+    page: &Page,
+    licence: &Licence,
+    low: i128,
+    high: i128,
+    accept: bool,
+) -> Result<(), String> {
+    if licence.evidence != page.stats {
+        return Err("stored-statistics licence disagrees with the page".into());
+    }
+    match (page.stats, accept) {
+        (None, false) => Ok(()),
+        (Some((lower, upper)), false) if upper < low || lower > high => Ok(()),
+        (Some((lower, upper)), true) if low <= lower && upper <= high => Ok(()),
+        _ => Err("stored statistics do not decide this action".into()),
+    }
 }
 
 fn choose_between(
@@ -382,6 +443,17 @@ pub fn check_between(
     let (low, high) = (i128::from(low), i128::from(high));
     match action {
         PageAction::Scan => Ok(()),
+        PageAction::Skip(licence) | PageAction::Accept(licence)
+            if licence.fact == Authorization::StoredStatistics =>
+        {
+            check_statistics(
+                page,
+                licence,
+                low,
+                high,
+                matches!(action, PageAction::Accept(_)),
+            )
+        }
         PageAction::Skip(licence) => match cited(page, licence)? {
             (FactScope::AllRows, ValueInvariant::AllNull) => Ok(()),
             (_, ValueInvariant::Bounded(source)) => {
@@ -482,6 +554,18 @@ pub fn plan_sum(
     session: &mut ReadSession<'_>,
     planning: Planning,
 ) -> Result<SumAction, String> {
+    if planning == Planning::StoredStatistics
+        && let Some((lower, upper)) = page.stats
+        && lower == upper
+        && page.non_null == page.rows()
+    {
+        let action = SumAction::Constant(Licence {
+            fact: Authorization::StoredStatistics,
+            evidence: page.stats,
+        });
+        check_sum(page, session, &action)?;
+        return Ok(action);
+    }
     if planning == Planning::Facts {
         for (scope, source) in root_bounds(page) {
             if scope != FactScope::AllRows {
@@ -510,6 +594,18 @@ pub fn check_sum(
 ) -> Result<(), String> {
     match action {
         SumAction::Decode => Ok(()),
+        SumAction::Constant(licence) if licence.fact == Authorization::StoredStatistics => {
+            match page.stats {
+                Some((lower, upper))
+                    if licence.evidence == page.stats
+                        && lower == upper
+                        && page.non_null == page.rows() =>
+                {
+                    Ok(())
+                }
+                _ => Err("constant SUM cites statistics that do not fix one value".into()),
+            }
+        }
         SumAction::Constant(licence) => match cited(page, licence)? {
             (FactScope::AllRows, ValueInvariant::Bounded(source)) => {
                 let (lower, upper) = reread(session, source, licence)?;
@@ -645,7 +741,9 @@ pub fn sum_where(
         Planning::Facts => selector
             .candidate_pages(i128::from(low), i128::from(high))?
             .unwrap_or((0, selector.pages.len())),
-        Planning::ScanOnly => (0, selector.pages.len()),
+        // A zone map consults every page's stored entry; the order
+        // certificate is a derived fact it does not have.
+        Planning::ScanOnly | Planning::StoredStatistics => (0, selector.pages.len()),
     };
     counts.skipped += selector.pages.len() - (end - first);
     if selector
@@ -826,6 +924,21 @@ fn root_bounds(page: &Page) -> Vec<(FactScope, super::BoundSource)> {
             _ => None,
         })
         .collect()
+}
+
+/// The tightest interval the page's bound facts give its non-null values,
+/// read from the encoded bytes; `None` when the page proves no bound. Next
+/// to `Page::stats` it measures how much slack a structural bound carries.
+pub fn derived_bounds(page: &Page) -> Result<Option<(i128, i128)>, String> {
+    let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+    let mut tightest: Option<(i128, i128)> = None;
+    for (_, source) in root_bounds(page) {
+        let (lower, upper) = bound_interval(&mut session, source)?;
+        tightest = Some(tightest.map_or((lower, upper), |(low, high)| {
+            (low.max(lower), high.min(upper))
+        }));
+    }
+    Ok(tightest)
 }
 
 fn sorted_dictionary_root(page: &Page) -> bool {

@@ -93,7 +93,11 @@ fn paged_answers_equal_the_truth_with_and_without_facts() {
             .map(|&value| i128::from(value))
             .sum();
         let matched: usize = expected.iter().map(|range| range.len()).sum();
-        for planning in [Planning::Facts, Planning::ScanOnly] {
+        for planning in [
+            Planning::Facts,
+            Planning::ScanOnly,
+            Planning::StoredStatistics,
+        ] {
             for threads in [1, 8] {
                 let (ranges, _) = paged::between(&selector, low, high, planning, threads).unwrap();
                 assert_eq!(ranges, expected, "{low}..={high} {planning:?} x{threads}");
@@ -230,6 +234,124 @@ fn the_checker_rejects_actions_their_licences_do_not_support() {
             1
         )
         .is_err()
+    );
+}
+
+#[test]
+fn stored_statistics_decide_what_an_exact_zone_map_decides() {
+    let values = mixed_column();
+    let column = PagedColumn::from_values(&values, PAGE, &policy()).unwrap();
+    for (low, high) in predicates() {
+        let (mut skipped, mut accepted) = (0, 0);
+        for page in values.chunks(PAGE) {
+            let present = page.iter().flatten();
+            match present.clone().min().zip(present.max()) {
+                None => skipped += 1,
+                Some((&minimum, &maximum)) if maximum < low || minimum > high => skipped += 1,
+                Some((&minimum, &maximum)) if low <= minimum && maximum <= high => accepted += 1,
+                Some(_) => {}
+            }
+        }
+        let (_, counts) =
+            paged::between(&column, low, high, Planning::StoredStatistics, 1).unwrap();
+        assert_eq!(
+            (counts.skipped, counts.accepted, counts.scanned),
+            (skipped, accepted, column.pages().len() - skipped - accepted),
+            "{low}..={high}"
+        );
+    }
+}
+
+#[test]
+fn the_checker_holds_statistics_licences_to_the_stored_statistics() {
+    let values = mixed_column();
+    let column = PagedColumn::from_values(&values, PAGE, &policy()).unwrap();
+    let constant = column
+        .pages()
+        .iter()
+        .find(|page| page.column.truth.iter().all(|value| *value == Some(4_242)))
+        .unwrap();
+    let mut session = ReadSession::new(&constant.column.page, ClosureMode::Selective);
+    let accept = paged::plan_between(
+        constant,
+        &mut session,
+        4_000,
+        5_000,
+        Planning::StoredStatistics,
+    )
+    .unwrap();
+    let PageAction::Accept(licence) = accept.clone() else {
+        panic!("a constant page inside the predicate is accepted: {accept:?}")
+    };
+    assert_eq!(licence.fact, Authorization::StoredStatistics);
+    assert!(
+        paged::check_between(
+            constant,
+            &mut session,
+            &PageAction::Skip(licence.clone()),
+            4_000,
+            5_000
+        )
+        .is_err()
+    );
+    assert!(paged::check_between(constant, &mut session, &accept, 4_300, 5_000).is_err());
+    let forged = Licence {
+        evidence: Some((4_000, 5_000)),
+        ..licence
+    };
+    assert!(
+        paged::check_between(
+            constant,
+            &mut session,
+            &PageAction::Accept(forged),
+            4_000,
+            5_000
+        )
+        .is_err()
+    );
+    // Equal stored ends on a dense page fix its SUM.
+    let plan = paged::plan_sum(constant, &mut session, Planning::StoredStatistics).unwrap();
+    assert!(matches!(plan, SumAction::Constant(_)), "{plan:?}");
+}
+
+#[test]
+fn stale_statistics_plan_wrongly_and_facts_do_not() {
+    let values = mixed_column();
+    let mut column = PagedColumn::from_values(&values, PAGE, &policy()).unwrap();
+    let (low, high) = (4_242, 4_242);
+    let truth = truth_ranges(&values, low, high);
+    let constant = column
+        .pages()
+        .iter()
+        .position(|page| page.column.truth.iter().all(|value| *value == Some(4_242)))
+        .unwrap();
+    // Statistics recorded before the page was rewritten: they claim the
+    // page lies far above the predicate, so the zone map skips it.
+    column
+        .replace_statistics(constant, Some((1_000_000, 2_000_000)))
+        .unwrap();
+    let (stale, _) = paged::between(&column, low, high, Planning::StoredStatistics, 1).unwrap();
+    assert_ne!(stale, truth);
+    let (facts, _) = paged::between(&column, low, high, Planning::Facts, 1).unwrap();
+    assert_eq!(facts, truth);
+}
+
+#[test]
+fn derived_bounds_contain_every_value_of_their_page() {
+    let column = PagedColumn::from_values(&mixed_column(), PAGE, &policy()).unwrap();
+    let mut bounded = 0;
+    for page in column.pages() {
+        let Some((lower, upper)) = paged::derived_bounds(page).unwrap() else {
+            continue;
+        };
+        bounded += 1;
+        if let Some((minimum, maximum)) = page.stats {
+            assert!(lower <= minimum && maximum <= upper, "{page:?}");
+        }
+    }
+    assert!(
+        bounded >= column.pages().len() / 2,
+        "{bounded} bounded pages"
     );
 }
 

@@ -128,6 +128,10 @@ pub enum Authorization {
         scope: FactScope,
         property: Property,
     },
+    /// A summary the writer stored beside the data, such as a per-page
+    /// minimum and maximum. The reader trusts it without being able to check
+    /// it against the encoding; no single-page plan accepts it.
+    StoredStatistics,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +209,11 @@ impl PlanIr {
         for node in &self.nodes {
             let id = node.id.0;
             match &node.authorization {
+                Authorization::StoredStatistics => {
+                    return Err(format!(
+                        "plan node {id} cites stored statistics, which no single-page plan trusts"
+                    ));
+                }
                 Authorization::Unconditional if node.op.skips_scan_work() => {
                     return Err(format!(
                         "plan node {id} ({:?}) skips scan work without citing a fact",
