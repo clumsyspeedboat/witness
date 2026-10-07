@@ -118,16 +118,25 @@ impl Selection {
     /// The selected rows as ordered, disjoint spans.
     pub fn ranges(&self) -> Vec<Span> {
         let mut ranges = Vec::new();
-        for row in self.rows.start..self.rows.end {
-            if self.contains(row) {
-                push_range(&mut ranges, row, row + 1);
+        for (index, &word) in self.words.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let low = bits.trailing_zeros() as usize;
+                let run = (!(bits >> low)).trailing_zeros() as usize;
+                let start = self.rows.start + index * 64 + low;
+                push_range(&mut ranges, start, start + run);
+                bits = if low + run >= 64 {
+                    0
+                } else {
+                    bits & (!0 << (low + run))
+                };
             }
         }
         ranges
     }
 
     /// The span from the first selected row through the last, if any.
-    fn hull(&self) -> Option<Span> {
+    pub fn hull(&self) -> Option<Span> {
         let first = self.words.iter().position(|word| *word != 0)?;
         let last = self.words.iter().rposition(|word| *word != 0)?;
         let start = first * 64 + self.words[first].trailing_zeros() as usize;

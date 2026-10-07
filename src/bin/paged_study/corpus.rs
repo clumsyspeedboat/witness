@@ -54,6 +54,22 @@ pub fn pairs() -> Result<(Vec<Column>, Vec<Pair>), Box<dyn Error>> {
             }
         }
     }
+    // WITNESS_PAGED_MAX_PAIRS keeps an evenly spread subset, for iterating.
+    if let Some(limit) = std::env::var("WITNESS_PAGED_MAX_PAIRS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&limit| limit > 0 && limit < pairs.len())
+    {
+        let step = pairs.len() as f64 / limit as f64;
+        let keep = (0..limit)
+            .map(|slot| (slot as f64 * step) as usize)
+            .collect::<std::collections::BTreeSet<_>>();
+        pairs = pairs
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, pair)| keep.contains(&index).then_some(pair))
+            .collect();
+    }
     Ok((columns, pairs))
 }
 

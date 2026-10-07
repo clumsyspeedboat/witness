@@ -609,7 +609,16 @@ pub fn sum_where(
         let sum = match &selected {
             Selected::Spans(ranges) => execute_sum(value_page, &mut session, &sum_action, ranges)?,
             Selected::Bitmap(selection) => {
-                execute_sum_selection(value_page, &mut session, &sum_action, selection)?
+                // A fused pass decodes every row between the first and last
+                // match; when the matches form few spans, summing span by
+                // span decodes only the matching rows.
+                let ranges = selection.ranges();
+                let hull = selection.hull().map_or(0, |hull| hull.len());
+                if ranges.len() * SPAN_COST_ROWS < hull {
+                    execute_sum(value_page, &mut session, &sum_action, &ranges)?
+                } else {
+                    execute_sum_selection(value_page, &mut session, &sum_action, selection)?
+                }
             }
         };
         Ok((sum, matched, counts))
@@ -624,6 +633,10 @@ pub fn sum_where(
     }
     Ok((total, matched, counts))
 }
+
+/// Rows a fused pass may decode per span it saves: a span costs one scan
+/// dispatch, about as much as decoding this many rows in a batch.
+const SPAN_COST_ROWS: usize = 64;
 
 /// The rows one selector page selects, in the form its action produced.
 enum Selected {
