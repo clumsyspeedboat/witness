@@ -116,13 +116,35 @@ pub fn between(
     Ok(ranges)
 }
 
-/// Rows of `rows` that hold a value rather than a null.
+/// Rows of `rows` that hold a value rather than a null. A nullable root
+/// answers from its validity bits alone; any other root has no nulls.
 pub fn non_null(
     decoder: &DecoderIr,
     session: &mut ReadSession<'_>,
     rows: Span,
 ) -> Result<Vec<Span>, String> {
+    if rows.end > decoder.len()? {
+        return Err("vector scan exceeds the column".into());
+    }
     let mut ranges = Vec::new();
+    if rows.is_empty() {
+        return Ok(ranges);
+    }
+    match *decoder.node(decoder.root())? {
+        DecoderNode::Nullable { validity, .. } => {
+            let first_byte = rows.start / 8;
+            let bits =
+                session.read_range(validity, Span::new(first_byte, (rows.end - 1) / 8 + 1)?)?;
+            for row in rows.start..rows.end {
+                if bits[row / 8 - first_byte] >> (row % 8) & 1 == 1 {
+                    push_range(&mut ranges, row, row + 1);
+                }
+            }
+            return Ok(ranges);
+        }
+        DecoderNode::Rle { .. } | DecoderNode::Patch { .. } => {}
+        _ => return Ok(vec![rows]),
+    }
     scan(decoder, session, rows, &mut |_, row, chunk| {
         if !matches!(chunk, Chunk::Nulls { .. }) {
             push_range(&mut ranges, row, row + chunk.len());

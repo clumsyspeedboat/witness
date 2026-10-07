@@ -94,6 +94,11 @@ name = "vector"
 path = "tests/vector.rs"
 required-features = ["experiment"]
 
+[[test]]
+name = "paged"
+path = "tests/paged.rs"
+required-features = ["experiment"]
+
 [[bin]]
 name = "generate_access_compiler"
 path = "src/bin/generate_access_compiler.rs"

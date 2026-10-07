@@ -12,6 +12,7 @@ mod ids;
 mod interpreter;
 mod invariants;
 mod layout;
+pub mod paged;
 mod plan;
 mod runtime;
 mod schedule;
