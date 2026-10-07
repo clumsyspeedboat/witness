@@ -135,6 +135,18 @@ impl Selection {
         ranges
     }
 
+    /// How many disjoint spans `ranges` would return, without building them:
+    /// one per selected bit whose predecessor is not selected.
+    pub fn run_count(&self) -> usize {
+        let mut carry = 0;
+        let mut runs = 0;
+        for &word in &self.words {
+            runs += (word & !(word << 1 | carry)).count_ones() as usize;
+            carry = word >> 63;
+        }
+        runs
+    }
+
     /// The span from the first selected row through the last, if any.
     pub fn hull(&self) -> Option<Span> {
         let first = self.words.iter().position(|word| *word != 0)?;
@@ -161,27 +173,16 @@ pub fn between_selection(
     }
     let (low, high) = (i128::from(low), i128::from(high));
     let mut selection = Selection::empty(rows);
-    // A frame-of-reference root over bit-packed codes compares the codes
+    // Bit-packed codes, under a frame-of-reference base or not, are compared
     // against the predicate shifted by the base, which is exact and skips
     // adding the base to every value.
-    if let DecoderNode::For { base, values } = *decoder.node(decoder.root())?
-        && matches!(decoder.node(values)?, DecoderNode::BitUnpack { .. })
-    {
+    if let Some(packed) = Packed::at_root(decoder, session)? {
         if rows.end > decoder.len()? {
             return Err("vector scan exceeds the column".into());
         }
-        let base = i128::from(session.read_i64(base, 0)?);
-        scan_node(
-            decoder,
-            values,
-            session,
-            rows.start,
-            rows.end,
-            &mut |_, row, chunk| {
-                select_chunk(&mut selection, row, chunk, low - base, high - base);
-                Ok(())
-            },
-        )?;
+        if let Some((first, last)) = packed.code_range(low - packed.base, high - packed.base) {
+            packed.select(session, rows, first, last, &mut selection)?;
+        }
         return Ok(selection);
     }
     scan(decoder, session, rows, &mut |_, row, chunk| {
@@ -258,6 +259,9 @@ pub fn sum_selection(
     let Some(hull) = selection.hull() else {
         return Ok(0);
     };
+    if let Some(packed) = Packed::at_root(decoder, session)? {
+        return packed.sum_selection(session, hull, selection);
+    }
     let mut total = 0_i128;
     scan(decoder, session, hull, &mut |_, row, chunk| {
         match chunk {
@@ -288,6 +292,275 @@ pub fn sum_selection(
     Ok(total)
 }
 
+/// How a fused pass may compare a selector page's codes: as values offset
+/// by a frame-of-reference base, or as ids into a sorted dictionary, which
+/// only a translation licence permits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeCompare {
+    Offset,
+    SortedDictionary,
+}
+
+/// SUM and count of `value` over the rows in `rows` whose `selector` value
+/// lies in `[low, high] = bounds`, in one pass over both pages' codes: each row is
+/// compared, masked and added without a branch, and no selection is built.
+/// `None` when either page is not bit-packed codes in the form `compare`
+/// names, and the caller decodes instead.
+pub fn fused_sum_between(
+    selector: &DecoderIr,
+    selector_session: &mut ReadSession<'_>,
+    value: &DecoderIr,
+    value_session: &mut ReadSession<'_>,
+    rows: Span,
+    (low, high): (i64, i64),
+    compare: CodeCompare,
+) -> Result<Option<(i128, usize)>, String> {
+    if low > high {
+        return Err("vector BETWEEN bounds are invalid".into());
+    }
+    if rows.end > selector.len()? || rows.end > value.len()? {
+        return Err("vector scan exceeds the column".into());
+    }
+    let Some(sums) = Packed::at_root(value, value_session)? else {
+        return Ok(None);
+    };
+    let (codes, range, entries) = match compare {
+        CodeCompare::Offset => {
+            let Some(codes) = Packed::at_root(selector, selector_session)? else {
+                return Ok(None);
+            };
+            let range =
+                codes.code_range(i128::from(low) - codes.base, i128::from(high) - codes.base);
+            (codes, range, None)
+        }
+        CodeCompare::SortedDictionary => {
+            let &DecoderNode::Dictionary {
+                ids,
+                dictionary,
+                entries,
+                sorted_unique: true,
+            } = selector.node(selector.root())?
+            else {
+                return Ok(None);
+            };
+            let Some(codes) = Packed::at_node(selector, ids)? else {
+                return Ok(None);
+            };
+            let first = table_bound(selector_session, dictionary, entries, low, false)?;
+            let end = table_bound(selector_session, dictionary, entries, high, true)?;
+            let range = (first < end).then(|| (first as u64, end as u64 - 1));
+            (codes, range, Some(entries as u64))
+        }
+    };
+    // With no code in range nothing matches, but dictionary ids are still
+    // read to confirm they lie inside the table, as a decode would.
+    let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
+    let mut selected = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
+    let mut total = 0_i128;
+    let mut matched = 0_usize;
+    let mut outside = false;
+    codes.scan(selector_session, rows, |row, selector_codes| {
+        if let Some(entries) = entries {
+            outside |= selector_codes.iter().any(|&id| id >= entries);
+        }
+        if range.is_none() {
+            return Ok(());
+        }
+        selected.clear();
+        selected.extend(
+            selector_codes
+                .iter()
+                .map(|&code| u64::from(code.wrapping_sub(first) <= spread)),
+        );
+        let batch = Span::new(row, row + selector_codes.len())?;
+        let mut taken = 0_u64;
+        let mut sum = 0_u64;
+        sums.scan(value_session, batch, |_, value_codes| {
+            for (&take, &code) in selected.iter().zip(value_codes) {
+                sum += code & take.wrapping_neg();
+                taken += take;
+            }
+            Ok(())
+        })?;
+        total = sums.add(total, taken as usize, sum)?;
+        matched += taken as usize;
+        Ok(())
+    })?;
+    if outside {
+        return Err("dictionary id is outside table".into());
+    }
+    Ok(Some((total, matched)))
+}
+
+/// A root of bit-packed codes, optionally offset by a frame-of-reference
+/// base: the shape most pages take. Its kernels work on 64-bit codes and add
+/// the base once per batch rather than once per row. Codes at most
+/// `SUMMABLE_WIDTH` bits wide sum without overflow over a batch.
+struct Packed {
+    base: i128,
+    stream: FieldId,
+    width: u8,
+    miniblock_rows: usize,
+    miniblock_bytes: usize,
+}
+
+/// Widest code a batch of `BATCH_ROWS` codes sums in a `u64`.
+const SUMMABLE_WIDTH: u8 = 53;
+
+impl Packed {
+    fn at_root(decoder: &DecoderIr, session: &mut ReadSession<'_>) -> Result<Option<Self>, String> {
+        let (base, codes) = match *decoder.node(decoder.root())? {
+            DecoderNode::For { base, values } => (Some(base), values),
+            _ => (None, decoder.root()),
+        };
+        let Some(mut packed) = Self::at_node(decoder, codes)? else {
+            return Ok(None);
+        };
+        if let Some(base) = base {
+            packed.base = i128::from(session.read_i64(base, 0)?);
+        }
+        Ok(Some(packed))
+    }
+
+    /// Bare bit-packed codes at `node`, with no base.
+    fn at_node(decoder: &DecoderIr, node: NodeId) -> Result<Option<Self>, String> {
+        let DecoderNode::BitUnpack {
+            stream,
+            width,
+            miniblock_rows,
+            miniblock_bytes,
+            ..
+        } = *decoder.node(node)?
+        else {
+            return Ok(None);
+        };
+        Ok((width <= SUMMABLE_WIDTH).then_some(Self {
+            base: 0,
+            stream,
+            width,
+            miniblock_rows,
+            miniblock_bytes,
+        }))
+    }
+
+    /// The codes whose values lie in `[low, high]` once the base is removed,
+    /// clipped to the codes the width can hold; `None` when there are none.
+    fn code_range(&self, low: i128, high: i128) -> Option<(u64, u64)> {
+        let largest = (1_i128 << self.width) - 1;
+        let (first, last) = (low.max(0), high.min(largest));
+        (first <= last).then_some((first as u64, last as u64))
+    }
+
+    /// Streams `rows` as batches of codes, each with the row it starts at.
+    fn scan(
+        &self,
+        session: &mut ReadSession<'_>,
+        rows: Span,
+        mut sink: impl FnMut(usize, &[u64]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if rows.start >= rows.end {
+            return Ok(());
+        }
+        session.touch_bits(
+            self.stream,
+            rows,
+            self.width,
+            self.miniblock_rows,
+            self.miniblock_bytes,
+        )?;
+        let mut codes = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
+        let mut row = rows.start;
+        while row < rows.end {
+            let end = (row + BATCH_ROWS).min(rows.end);
+            session.unpack_bits_into(
+                self.stream,
+                Span::new(row, end)?,
+                self.width,
+                self.miniblock_rows,
+                self.miniblock_bytes,
+                &mut codes,
+            )?;
+            sink(row, &codes)?;
+            row = end;
+        }
+        Ok(())
+    }
+
+    /// `count` values whose codes sum to `codes`, added to `total`.
+    fn add(&self, total: i128, count: usize, codes: u64) -> Result<i128, String> {
+        self.base
+            .checked_mul(count as i128)
+            .and_then(|base| base.checked_add(i128::from(codes)))
+            .and_then(|batch| total.checked_add(batch))
+            .ok_or_else(|| "vector SUM overflow".into())
+    }
+
+    fn sum_ranges(&self, session: &mut ReadSession<'_>, ranges: &[Span]) -> Result<i128, String> {
+        let mut total = 0_i128;
+        for range in ranges {
+            self.scan(session, *range, |_, codes| {
+                total = self.add(total, codes.len(), codes.iter().sum())?;
+                Ok(())
+            })?;
+        }
+        Ok(total)
+    }
+
+    fn sum_selection(
+        &self,
+        session: &mut ReadSession<'_>,
+        hull: Span,
+        selection: &Selection,
+    ) -> Result<i128, String> {
+        let mut total = 0_i128;
+        self.scan(session, hull, |row, codes| {
+            let offset = row - selection.rows.start;
+            let (mut sum, mut count) = (0_u64, 0_u64);
+            for (index, &code) in codes.iter().enumerate() {
+                let bit = offset + index;
+                let take = selection.words[bit / 64] >> (bit % 64) & 1;
+                sum += code & take.wrapping_neg();
+                count += take;
+            }
+            total = self.add(total, count as usize, sum)?;
+            Ok(())
+        })?;
+        Ok(total)
+    }
+
+    /// Sets the bit of every row in `rows` whose code lies in
+    /// `[first, last]`, with one unsigned comparison per code.
+    fn select(
+        &self,
+        session: &mut ReadSession<'_>,
+        rows: Span,
+        first: u64,
+        last: u64,
+        selection: &mut Selection,
+    ) -> Result<(), String> {
+        let spread = last - first;
+        self.scan(session, rows, |row, codes| {
+            let offset = row - selection.rows.start;
+            if offset.is_multiple_of(64) {
+                for (word, block) in codes.chunks(64).enumerate() {
+                    let mut bits = 0_u64;
+                    for (index, &code) in block.iter().enumerate() {
+                        bits |= u64::from(code.wrapping_sub(first) <= spread) << index;
+                    }
+                    selection.words[offset / 64 + word] |= bits;
+                }
+            } else {
+                for (index, &code) in codes.iter().enumerate() {
+                    let bit = offset + index;
+                    selection.words[bit / 64] |=
+                        u64::from(code.wrapping_sub(first) <= spread) << (bit % 64);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
 fn select_chunk(selection: &mut Selection, row: usize, chunk: Chunk<'_>, low: i128, high: i128) {
     match chunk {
         Chunk::Values(values) => {
@@ -312,6 +585,9 @@ pub fn sum_ranges(
     ranges: &[Span],
 ) -> Result<i128, String> {
     validate_ranges(decoder, ranges)?;
+    if let Some(packed) = Packed::at_root(decoder, session)? {
+        return packed.sum_ranges(session, ranges);
+    }
     let mut total = 0_i128;
     for range in ranges {
         scan(decoder, session, *range, &mut |_, _, chunk| {

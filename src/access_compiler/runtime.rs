@@ -316,22 +316,22 @@ impl<'a> ReadSession<'a> {
     }
 
     /// Batch form of `read_bit_values`: replaces the contents of `out` with
-    /// `rows`, reusing its allocation. It reads the same byte range and
+    /// `rows`, as `u64` codes or widened values, reusing its allocation. It reads the same byte range and
     /// records the same access, so batch and per-value kernels are accounted
     /// identically.
-    pub fn unpack_bits_into(
+    pub fn unpack_bits_into<T: From<u64> + Default + Clone>(
         &mut self,
         field: FieldId,
         rows: Span,
         width: u8,
         miniblock_rows: usize,
         miniblock_bytes: usize,
-        out: &mut Vec<i128>,
+        out: &mut Vec<T>,
     ) -> Result<(), String> {
         out.clear();
         self.record_primitive_values(rows.len());
         if width == 0 {
-            out.resize(rows.len(), 0);
+            out.resize(rows.len(), T::default());
             return Ok(());
         }
         if width > 64 || miniblock_rows == 0 || miniblock_bytes == 0 {
@@ -609,14 +609,14 @@ fn chunk_range(chunk: usize, chunks: usize, decoded: Span) -> (usize, usize) {
 
 /// Unpacks `rows` from `bytes`, the delivered slice starting at stream byte
 /// `first_byte`. Callers have validated that the slice covers every row.
-fn unpack_into(
+fn unpack_into<T: From<u64>>(
     bytes: &[u8],
     rows: Span,
     width: u8,
     miniblock_rows: usize,
     miniblock_bytes: usize,
     first_byte: usize,
-    out: &mut Vec<i128>,
+    out: &mut Vec<T>,
 ) {
     let width_bits = width as usize;
     let mask = if width == 64 {
@@ -649,6 +649,10 @@ fn unpack_into(
         let first_bit = rows.start * width_bits - first_byte * 8;
         // Rows whose 8-byte window lies inside the slice take a branch-free
         // load; only the last few rows of a span need the careful path.
+        // Groups of eight rows span exactly `width` bytes, so with the width
+        // known at compile time every load in a group sits at a constant
+        // offset of one 64-byte window and needs no bounds check.
+        let grouped = unpack_groups(bytes, first_bit, width_bits, rows.len(), out);
         let fast = if width_bits <= 57 && bytes.len() >= 8 {
             let limit = (bytes.len() - 8) * 8 + 7;
             if first_bit > limit {
@@ -659,21 +663,75 @@ fn unpack_into(
         } else {
             0
         };
-        out.extend((0..fast).map(|index| {
+        let fast = fast.max(grouped);
+        out.extend((grouped..fast).map(|index| {
             let bit = first_bit + index * width_bits;
             let offset = bit >> 3;
             let word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-            i128::from((word >> (bit & 7)) & mask)
+            T::from((word >> (bit & 7)) & mask)
         }));
         out.extend((fast..rows.len()).map(|index| {
             let bit = first_bit + index * width_bits;
-            i128::from(extract(bit >> 3, bit & 7))
+            T::from(extract(bit >> 3, bit & 7))
         }));
     } else {
         out.extend((rows.start..rows.end).map(|row| {
             let bit_offset = (row % miniblock_rows) * width_bits;
             let offset = (row / miniblock_rows) * miniblock_bytes + bit_offset / 8 - first_byte;
-            i128::from(extract(offset, bit_offset % 8))
+            T::from(extract(offset, bit_offset % 8))
+        }));
+    }
+}
+
+/// Widest code `unpack_group` handles: its shifts stay inside one `u64`.
+const GROUPED_WIDTH: usize = 50;
+const GROUP_WINDOW: usize = 64;
+
+/// Unpacks whole groups of eight rows from bit `first_bit` while a 64-byte
+/// window fits, returning how many rows it appended.
+fn unpack_groups<T: From<u64>>(
+    bytes: &[u8],
+    first_bit: usize,
+    width: usize,
+    rows: usize,
+    out: &mut Vec<T>,
+) -> usize {
+    let start = first_bit / 8;
+    if width == 0 || width > GROUPED_WIDTH || bytes.len() < start + GROUP_WINDOW {
+        return 0;
+    }
+    let groups = ((bytes.len() - start - GROUP_WINDOW) / width + 1).min(rows / 8);
+    let shift = first_bit % 8;
+    macro_rules! dispatch {
+        ($($width:literal)*) => {
+            match width {
+                $($width => unpack_group::<$width, T>(bytes, start, shift, groups, out),)*
+                _ => return 0,
+            }
+        };
+    }
+    dispatch!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+        26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50);
+    groups * 8
+}
+
+fn unpack_group<const WIDTH: usize, T: From<u64>>(
+    bytes: &[u8],
+    start: usize,
+    shift: usize,
+    groups: usize,
+    out: &mut Vec<T>,
+) {
+    let mask = (1_u64 << WIDTH) - 1;
+    out.reserve(groups * 8);
+    for group in 0..groups {
+        let offset = start + group * WIDTH;
+        let window: &[u8; GROUP_WINDOW] = bytes[offset..offset + GROUP_WINDOW].try_into().unwrap();
+        out.extend((0..8).map(|index| {
+            let bit = index * WIDTH;
+            let byte = bit / 8;
+            let word = u64::from_le_bytes(window[byte..byte + 8].try_into().unwrap());
+            T::from((word >> (shift + bit % 8)) & mask)
         }));
     }
 }

@@ -119,6 +119,7 @@ fn selections_agree_with_spans() {
                 vector::between_selection(&column.decoder, &mut session(&column), rows, low, high)
                     .unwrap();
             assert_eq!(selection.ranges(), ranges, "{}", case.name());
+            assert_eq!(selection.run_count(), ranges.len(), "{}", case.name());
             assert_eq!(
                 selection.count(),
                 ranges.iter().map(|range| range.len()).sum::<usize>()
@@ -285,4 +286,139 @@ fn unordered_patch_positions_fail_closed() {
         corrupt.decoder.node(corrupt.decoder.root()).unwrap(),
         DecoderNode::Patch { .. }
     ));
+}
+
+/// Every code width, packed bare and under a frame-of-reference base, from
+/// unaligned first rows: sums and selections match the truth, so batch
+/// unpacking agrees with the stored bits wherever a span starts.
+#[test]
+fn packed_kernels_agree_with_the_truth_at_every_width() {
+    for width in 1..=63_u32 {
+        for base in [0_i64, -1_000_003] {
+            let mut state = u64::from(width) * 31 + base.unsigned_abs();
+            let largest = (1_i64 << width) - 1;
+            let mut values = (0..3_000)
+                .map(|_| base + (next(&mut state) as i64 & largest))
+                .collect::<Vec<_>>();
+            values[17] = base + largest;
+            values[18] = base;
+            let recipe = if base == 0 {
+                Recipe::BitPack
+            } else {
+                Recipe::For(Box::new(Recipe::BitPack))
+            };
+            let column = encode(&recipe, InputColumn::dense(values.clone())).unwrap();
+            for _ in 0..8 {
+                let (a, b) = (next(&mut state) % 3_000, next(&mut state) % 3_000);
+                let rows = Span::new(a.min(b), a.max(b) + 1).unwrap();
+                let sum = vector::sum(&column.decoder, &mut session(&column), rows).unwrap();
+                assert_eq!(
+                    sum,
+                    truth_sum(&column, &[rows]),
+                    "width {width} base {base}"
+                );
+                let (x, y) = (
+                    values[next(&mut state) % 3_000],
+                    values[next(&mut state) % 3_000],
+                );
+                let (low, high) = (x.min(y), x.max(y));
+                let selection = vector::between_selection(
+                    &column.decoder,
+                    &mut session(&column),
+                    rows,
+                    low,
+                    high,
+                )
+                .unwrap();
+                for (row, &value) in values.iter().enumerate().take(rows.end).skip(rows.start) {
+                    assert_eq!(
+                        selection.contains(row),
+                        low <= value && value <= high,
+                        "width {width} base {base} row {row}"
+                    );
+                }
+                let selected =
+                    vector::sum_selection(&column.decoder, &mut session(&column), &selection)
+                        .unwrap();
+                assert_eq!(
+                    selected,
+                    truth_sum(&column, &selection.ranges()),
+                    "width {width} base {base}"
+                );
+            }
+        }
+    }
+}
+
+/// The fused SUM over frame-of-reference and sorted-dictionary selectors
+/// equals the truth, and declines pages that are not plain codes.
+#[test]
+fn fused_sums_agree_with_the_truth() {
+    let mut state = 99_u64;
+    let rows = 5_000;
+    let selector = (0..rows)
+        .map(|_| (next(&mut state) % 300) as i64 - 120)
+        .collect::<Vec<_>>();
+    let value = (0..rows)
+        .map(|_| (next(&mut state) % 70_000) as i64 - 9_000)
+        .collect::<Vec<_>>();
+    let bitpack = || Box::new(Recipe::BitPack);
+    let value_column = encode(&Recipe::For(bitpack()), InputColumn::dense(value.clone())).unwrap();
+    for (recipe, compare) in [
+        (Recipe::For(bitpack()), vector::CodeCompare::Offset),
+        (
+            Recipe::Dictionary(bitpack()),
+            vector::CodeCompare::SortedDictionary,
+        ),
+    ] {
+        let column = encode(&recipe, InputColumn::dense(selector.clone())).unwrap();
+        for (low, high) in [
+            (-120, 179),
+            (-5, 5),
+            (0, 0),
+            (200, 400),
+            (-500, -121),
+            (37, 120),
+        ] {
+            for span in [Span::new(0, rows).unwrap(), Span::new(333, 4_097).unwrap()] {
+                let (mut sum, mut matched) = (0_i128, 0_usize);
+                for row in span.start..span.end {
+                    if low <= selector[row] && selector[row] <= high {
+                        sum += i128::from(value[row]);
+                        matched += 1;
+                    }
+                }
+                let fused = vector::fused_sum_between(
+                    &column.decoder,
+                    &mut session(&column),
+                    &value_column.decoder,
+                    &mut session(&value_column),
+                    span,
+                    (low, high),
+                    compare,
+                )
+                .unwrap();
+                assert_eq!(fused, Some((sum, matched)), "{low}..={high} {compare:?}");
+            }
+        }
+    }
+    let delta = encode(
+        &Recipe::Delta {
+            restart_interval: 256,
+            deltas: bitpack(),
+        },
+        InputColumn::dense(selector.clone()),
+    )
+    .unwrap();
+    let declined = vector::fused_sum_between(
+        &delta.decoder,
+        &mut session(&delta),
+        &value_column.decoder,
+        &mut session(&value_column),
+        Span::new(0, rows).unwrap(),
+        (0, 10),
+        vector::CodeCompare::Offset,
+    )
+    .unwrap();
+    assert_eq!(declined, None);
 }

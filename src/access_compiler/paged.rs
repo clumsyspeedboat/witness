@@ -778,6 +778,31 @@ pub fn sum_where(
         let mut session =
             ReadSession::new_untracked(&selector_page.column.page, ClosureMode::Selective);
         let action = action.clone();
+        // A scan of frame-of-reference codes, or a translation of sorted
+        // dictionary ids, over a value page of plain codes runs as one fused
+        // pass over both pages.
+        let compare = match action {
+            PageAction::Scan => Some(vector::CodeCompare::Offset),
+            PageAction::Translate(_) => Some(vector::CodeCompare::SortedDictionary),
+            _ => None,
+        };
+        if let Some(compare) = compare {
+            let mut value_session =
+                ReadSession::new_untracked(&value_page.column.page, ClosureMode::Selective);
+            if plan_sum(value_page, &mut value_session, planning)? == SumAction::Decode
+                && let Some((sum, matched)) = vector::fused_sum_between(
+                    &selector_page.column.decoder,
+                    &mut session,
+                    &value_page.column.decoder,
+                    &mut value_session,
+                    Span::new(0, selector_page.rows())?,
+                    (low, high),
+                    compare,
+                )?
+            {
+                return Ok((sum, matched, counts));
+            }
+        }
         // Search and acceptance select a few contiguous spans; a scan or a
         // code translation may select rows anywhere, which a bitmap carries
         // at one bit per row and the value page consumes in one pass.
@@ -813,10 +838,9 @@ pub fn sum_where(
                 // A fused pass decodes every row between the first and last
                 // match; when the matches form few spans, summing span by
                 // span decodes only the matching rows.
-                let ranges = selection.ranges();
                 let hull = selection.hull().map_or(0, |hull| hull.len());
-                if ranges.len() * SPAN_COST_ROWS < hull {
-                    execute_sum(value_page, &mut session, &sum_action, &ranges)?
+                if selection.run_count() * SPAN_COST_ROWS < hull {
+                    execute_sum(value_page, &mut session, &sum_action, &selection.ranges())?
                 } else {
                     execute_sum_selection(value_page, &mut session, &sum_action, selection)?
                 }
