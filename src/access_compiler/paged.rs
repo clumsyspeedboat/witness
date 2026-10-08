@@ -737,9 +737,9 @@ pub fn sum_where(
     {
         return Err("SUM WHERE needs two columns paged alike".into());
     }
-    // Planning reads a few bytes per page, so every page is planned first,
-    // on one thread; only pages left with work are spread over threads, and
-    // a query whose pages are nearly all skipped never pays to start any.
+    // Every page is planned first, then only pages left with work are
+    // executed; both phases share the worker pool, so a query that skips
+    // nearly every page executes almost nothing.
     let mut counts = PageCounts::default();
     let mut work = Vec::new();
     // On a column ordered across pages, only a contiguous run of pages can
@@ -761,20 +761,16 @@ pub fn sum_where(
     {
         return Err("SUM WHERE pages cover different rows".into());
     }
-    for (index, (selector_page, _)) in selector
-        .pages
-        .iter()
-        .zip(&value.pages)
-        .enumerate()
-        .take(end)
-        .skip(first)
-    {
-        let mut session =
-            ReadSession::new_untracked(&selector_page.column.page, ClosureMode::Selective);
-        let action = plan_between(selector_page, &mut session, low, high, planning)?;
+    // Pages are planned on the worker pool once there are enough of them;
+    // a column of a few pages is planned on the calling thread.
+    let actions = run_pages(end - first, threads, |offset| {
+        let page = &selector.pages[first + offset];
+        plan_between(page, &mut untracked(page), low, high, planning)
+    })?;
+    for (offset, action) in actions.into_iter().enumerate() {
         counts.record(&action);
         if !matches!(action, PageAction::Skip(_)) {
-            work.push((index, action));
+            work.push((first + offset, action));
         }
     }
     let page_results = run_pages(work.len(), threads, |slot| {
@@ -863,6 +859,249 @@ pub fn sum_where(
         counts.add(&page_counts);
     }
     Ok((total, matched, counts))
+}
+
+/// One conjunct of a conjunctive predicate: `low <= value <= high` on
+/// `column`.
+#[derive(Clone, Copy, Debug)]
+pub struct Conjunct<'c> {
+    pub column: &'c PagedColumn,
+    pub low: i64,
+    pub high: i64,
+}
+
+/// What a conjunctive query computes over its matching rows.
+#[derive(Clone, Copy, Debug)]
+pub enum Aggregate<'c> {
+    Count,
+    Sum(&'c PagedColumn),
+    /// SUM of the product of two columns, over rows where both are non-null.
+    SumProduct(&'c PagedColumn, &'c PagedColumn),
+}
+
+/// `SELECT aggregate WHERE c1 AND c2 AND ...` over columns paged alike: the
+/// aggregate and the matching row count. Each conjunct plans every page from
+/// its column's facts (or the zone map, or nothing), and every action is
+/// checked. A page is skipped when any conjunct skips it; a dense page that a
+/// conjunct accepts is not constrained by it; the remaining conjuncts are
+/// evaluated as row selections and intersected, the cheapest first, until
+/// none is left or no row remains.
+///
+/// `PageCounts::skipped` counts skipped pages; the other counts tally the
+/// actions taken by the conjuncts of pages that were not skipped.
+pub fn aggregate_where(
+    conjuncts: &[Conjunct<'_>],
+    aggregate: Aggregate<'_>,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    let Some(first) = conjuncts.first() else {
+        return Err("a conjunctive query needs a conjunct".into());
+    };
+    let shape = first.column;
+    let mut columns = conjuncts
+        .iter()
+        .map(|conjunct| conjunct.column)
+        .collect::<Vec<_>>();
+    match aggregate {
+        Aggregate::Count => {}
+        Aggregate::Sum(value) => columns.push(value),
+        Aggregate::SumProduct(left, right) => columns.extend([left, right]),
+    }
+    for column in &columns {
+        if column.rows != shape.rows
+            || column.page_rows != shape.page_rows
+            || column.pages.len() != shape.pages.len()
+            || column
+                .pages
+                .iter()
+                .zip(&shape.pages)
+                .any(|(page, other)| page.start != other.start || page.rows() != other.rows())
+        {
+            return Err("a conjunctive query needs columns paged alike".into());
+        }
+    }
+    for conjunct in conjuncts {
+        if conjunct.low > conjunct.high {
+            return Err("BETWEEN needs low <= high".into());
+        }
+    }
+    // An ordered column narrows the pages any conjunct on it can match.
+    let (mut first_page, mut end_page) = (0, shape.pages.len());
+    if planning == Planning::Facts {
+        for conjunct in conjuncts {
+            if let Some((start, end)) = conjunct
+                .column
+                .candidate_pages(i128::from(conjunct.low), i128::from(conjunct.high))?
+            {
+                first_page = first_page.max(start);
+                end_page = end_page.min(end);
+            }
+        }
+    }
+    let end_page = end_page.max(first_page);
+    let mut counts = PageCounts {
+        skipped: shape.pages.len() - (end_page - first_page),
+        ..PageCounts::default()
+    };
+    let mut work = Vec::new();
+    // Each page is planned conjunct by conjunct, stopping at the first skip;
+    // pages are planned on the worker pool once there are enough of them.
+    let planned = run_pages(end_page - first_page, threads, |offset| {
+        let index = first_page + offset;
+        let mut actions = Vec::with_capacity(conjuncts.len());
+        for (slot, conjunct) in conjuncts.iter().enumerate() {
+            let page = &conjunct.column.pages[index];
+            let action = plan_between(
+                page,
+                &mut untracked(page),
+                conjunct.low,
+                conjunct.high,
+                planning,
+            )?;
+            if matches!(action, PageAction::Skip(_)) {
+                return Ok(None);
+            }
+            actions.push((slot, action));
+        }
+        Ok(Some(actions))
+    })?;
+    for (offset, actions) in planned.into_iter().enumerate() {
+        let index = first_page + offset;
+        let Some(mut actions) = actions else {
+            counts.skipped += 1;
+            continue;
+        };
+        for (_, action) in &actions {
+            counts.record(action);
+        }
+        // A dense accepted page selects every row; it constrains nothing.
+        actions.retain(|(slot, action)| {
+            let page = &conjuncts[*slot].column.pages[index];
+            !(matches!(action, PageAction::Accept(_)) && page.non_null == page.rows())
+        });
+        actions.sort_by_key(|(_, action)| action_cost(action));
+        work.push((index, actions));
+    }
+    let page_results = run_pages(work.len(), threads, |slot| {
+        let (index, actions) = &work[slot];
+        let rows = Span::new(0, shape.pages[*index].rows())?;
+        // Scans and code translations run as one fused pass over the page
+        // when every page involved is plain codes.
+        if !actions.is_empty()
+            && actions
+                .iter()
+                .all(|(_, action)| matches!(action, PageAction::Scan | PageAction::Translate(_)))
+        {
+            let mut pages = actions
+                .iter()
+                .map(|(conjunct_slot, action)| {
+                    let conjunct = &conjuncts[*conjunct_slot];
+                    let page = &conjunct.column.pages[*index];
+                    vector::ConjunctPage {
+                        decoder: &page.column.decoder,
+                        session: untracked(page),
+                        low: conjunct.low,
+                        high: conjunct.high,
+                        compare: if matches!(action, PageAction::Translate(_)) {
+                            vector::CodeCompare::SortedDictionary
+                        } else {
+                            vector::CodeCompare::Offset
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut fused = match aggregate {
+                Aggregate::Count => vector::FusedAggregate::Count,
+                Aggregate::Sum(column) => {
+                    vector::FusedAggregate::Sum(Box::new(value_page(column, *index)))
+                }
+                Aggregate::SumProduct(left, right) => {
+                    vector::FusedAggregate::SumProduct(Box::new([
+                        value_page(left, *index),
+                        value_page(right, *index),
+                    ]))
+                }
+            };
+            if let Some((value, matched)) = vector::fused_conjunction(&mut pages, &mut fused, rows)?
+            {
+                return Ok((value, matched, 0));
+            }
+        }
+        let mut selection = vector::Selection::full(rows);
+        for (conjunct_slot, action) in actions {
+            let conjunct = &conjuncts[*conjunct_slot];
+            let page = &conjunct.column.pages[*index];
+            let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+            let matched =
+                execute_between_selection(page, &mut session, action, conjunct.low, conjunct.high)?;
+            for (word, other) in selection.words.iter_mut().zip(&matched.words) {
+                *word &= other;
+            }
+            if selection.words.iter().all(|word| *word == 0) {
+                return Ok((0, 0, 0));
+            }
+        }
+        let matched = selection.count();
+        let mut constant = 0;
+        let value = match aggregate {
+            Aggregate::Count => matched as i128,
+            Aggregate::Sum(column) => {
+                let page = &column.pages[*index];
+                let mut session =
+                    ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+                let action = plan_sum(page, &mut session, planning)?;
+                constant += usize::from(matches!(action, SumAction::Constant(_)));
+                execute_sum_selection(page, &mut session, &action, &selection)?
+            }
+            Aggregate::SumProduct(left, right) => {
+                let (left, right) = (&left.pages[*index], &right.pages[*index]);
+                let mut left_session =
+                    ReadSession::new_untracked(&left.column.page, ClosureMode::Selective);
+                let mut right_session =
+                    ReadSession::new_untracked(&right.column.page, ClosureMode::Selective);
+                vector::sum_product_selection(
+                    &left.column.decoder,
+                    &mut left_session,
+                    &right.column.decoder,
+                    &mut right_session,
+                    &selection,
+                )?
+            }
+        };
+        Ok((value, matched, constant))
+    })?;
+    let mut total = 0_i128;
+    let mut matched = 0;
+    for (value, rows, constant) in page_results {
+        total = total.checked_add(value).ok_or("aggregate overflow")?;
+        matched += rows;
+        counts.constant_sums += constant;
+    }
+    Ok((total, matched, counts))
+}
+
+fn untracked(page: &Page) -> ReadSession<'_> {
+    ReadSession::new_untracked(&page.column.page, ClosureMode::Selective)
+}
+
+fn value_page(column: &PagedColumn, index: usize) -> vector::ValuePage<'_, '_> {
+    let page = &column.pages[index];
+    vector::ValuePage {
+        decoder: &page.column.decoder,
+        session: untracked(page),
+    }
+}
+
+/// Order in which a page evaluates its conjuncts: searches touch a few rows,
+/// code comparisons read codes only, scans decode every row.
+fn action_cost(action: &PageAction) -> u8 {
+    match action {
+        PageAction::Skip(_) | PageAction::Accept(_) => 0,
+        PageAction::Search { .. } | PageAction::SearchPiecewise { .. } => 1,
+        PageAction::Translate(_) => 2,
+        PageAction::Scan => 3,
+    }
 }
 
 /// Fewest pages assigned per worker; smaller queries stay on the caller.

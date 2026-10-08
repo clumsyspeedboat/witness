@@ -88,6 +88,17 @@ impl Selection {
         }
     }
 
+    /// Every row of `rows`, set a word at a time.
+    pub fn full(rows: Span) -> Self {
+        let mut words = vec![!0_u64; rows.len().div_ceil(64)];
+        if let Some(last) = words.last_mut()
+            && !rows.len().is_multiple_of(64)
+        {
+            *last = (1 << (rows.len() % 64)) - 1;
+        }
+        Self { rows, words }
+    }
+
     /// Selects every row in `start..end`, which must lie within `rows`.
     pub fn set_range(&mut self, start: usize, end: usize) {
         for row in start..end {
@@ -192,11 +203,19 @@ pub fn between_selection(
     // Bit-packed codes, under a frame-of-reference base or not and with or
     // without nulls, are compared against the predicate shifted by the base,
     // which is exact and skips adding the base to every value.
-    if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)? {
-        let base = lane.packed.base;
-        if let Some(range) = lane.packed.code_range(low - base, high - base) {
-            lane.select(session, rows, range, &mut selection)?;
-        }
+    if let Some(SelectorLane {
+        lane,
+        matcher,
+        entries,
+        ..
+    }) = selector_lane(
+        decoder,
+        session,
+        low as i64,
+        high as i64,
+        CodeCompare::Offset,
+    )? {
+        lane.select_with(session, rows, &matcher, entries, &mut selection)?;
         return Ok(selection);
     }
     scan(decoder, session, rows, &mut |_, row, chunk| {
@@ -230,11 +249,16 @@ pub fn dictionary_selection(
     let mut selection = Selection::empty(rows);
     let low_id = table_bound(session, dictionary, entries, low, false)?;
     let high_id = table_bound(session, dictionary, entries, high, true)?;
-    if let Some(lane) = Lane::at_root(decoder, session, Codes::SortedDictionary)? {
+    if let Some(SelectorLane {
+        lane,
+        matcher,
+        entries,
+        ..
+    }) = selector_lane(decoder, session, low, high, CodeCompare::SortedDictionary)?
+    {
         // Ids are read even when none can match, to confirm that every one
         // lies inside the table, as a decode would.
-        let range = (low_id < high_id).then(|| (low_id as u64, high_id as u64 - 1));
-        lane.select_ids(session, rows, range, entries as u64, &mut selection)?;
+        lane.select_with(session, rows, &matcher, entries, &mut selection)?;
         return Ok(selection);
     }
     if low_id < high_id {
@@ -309,6 +333,291 @@ pub fn sum_selection(
     Ok(total)
 }
 
+/// One conjunct of a fused conjunctive pass: a selector page, its session,
+/// the predicate, and how its codes may be compared.
+pub struct ConjunctPage<'a, 'p> {
+    pub decoder: &'a DecoderIr,
+    pub session: ReadSession<'p>,
+    pub low: i64,
+    pub high: i64,
+    pub compare: CodeCompare,
+}
+
+/// A value page and its session, for a fused conjunctive aggregate.
+pub struct ValuePage<'a, 'p> {
+    pub decoder: &'a DecoderIr,
+    pub session: ReadSession<'p>,
+}
+
+/// What a fused conjunctive pass computes over the rows every conjunct keeps.
+pub enum FusedAggregate<'a, 'p> {
+    Count,
+    Sum(Box<ValuePage<'a, 'p>>),
+    SumProduct(Box<[ValuePage<'a, 'p>; 2]>),
+}
+
+/// The aggregate and matching row count of a conjunction over `rows`, in one
+/// pass a batch at a time: the first conjunct yields the positions it
+/// matches, each later conjunct keeps the positions it also matches, and
+/// values are read only at the survivors. Conjuncts run in order of their
+/// estimated selectivity, read from their code ranges. `None` when a page is
+/// not bit-packed codes in the form its conjunct or the aggregate needs, and
+/// the caller evaluates the conjuncts one by one instead.
+pub fn fused_conjunction(
+    conjuncts: &mut [ConjunctPage<'_, '_>],
+    aggregate: &mut FusedAggregate<'_, '_>,
+    rows: Span,
+) -> Result<Option<(i128, usize)>, String> {
+    struct Test {
+        lane: Lane,
+        cursor: LaneCursor,
+        matcher: Matcher,
+        entries: Option<u64>,
+        selectivity: f64,
+    }
+    let mut tests = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts.iter_mut() {
+        if conjunct.low > conjunct.high {
+            return Err("vector BETWEEN bounds are invalid".into());
+        }
+        validate_rows(conjunct.decoder, rows)?;
+        let Some(SelectorLane {
+            lane,
+            matcher,
+            entries,
+            domain,
+        }) = selector_lane(
+            conjunct.decoder,
+            &mut conjunct.session,
+            conjunct.low,
+            conjunct.high,
+            conjunct.compare,
+        )?
+        else {
+            return Ok(None);
+        };
+        let cursor = lane.cursor(&mut conjunct.session, rows.start)?;
+        let selectivity = matcher.selectivity(domain);
+        tests.push(Test {
+            lane,
+            cursor,
+            matcher,
+            entries,
+            selectivity,
+        });
+    }
+    let mut values = Vec::new();
+    let mut value_sessions: Vec<&mut ReadSession<'_>> = Vec::new();
+    match aggregate {
+        FusedAggregate::Count => {}
+        FusedAggregate::Sum(page) => {
+            validate_rows(page.decoder, rows)?;
+            let Some(lane) = Lane::summable(page.decoder, &mut page.session)? else {
+                return Ok(None);
+            };
+            values.push(lane);
+            value_sessions.push(&mut page.session);
+        }
+        FusedAggregate::SumProduct(pair) => {
+            let [left, right] = pair.as_mut();
+            validate_rows(left.decoder, rows)?;
+            validate_rows(right.decoder, rows)?;
+            let (Some(a), Some(b)) = (
+                Lane::summable(left.decoder, &mut left.session)?,
+                Lane::summable(right.decoder, &mut right.session)?,
+            ) else {
+                return Ok(None);
+            };
+            values.extend([a, b]);
+            value_sessions.push(&mut left.session);
+            value_sessions.push(&mut right.session);
+        }
+    }
+    let mut value_cursors = values
+        .iter()
+        .zip(value_sessions.iter_mut())
+        .map(|(lane, session)| lane.cursor(session, rows.start))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut order = (0..tests.len()).collect::<Vec<_>>();
+    order.sort_by(|&a, &b| tests[a].selectivity.total_cmp(&tests[b].selectivity));
+    let mut batch = LaneBatch::default();
+    let mut value_batches = (0..values.len())
+        .map(|_| LaneBatch::default())
+        .collect::<Vec<_>>();
+    let mut gathered = vec![Vec::new(); values.len()];
+    let mut positions = Vec::with_capacity(BATCH_ROWS);
+    let (mut total, mut matched) = (0_i128, 0_usize);
+    let mut row = rows.start;
+    while row < rows.end {
+        let end = (row + BATCH_ROWS).min(rows.end);
+        let span = Span::new(row, end)?;
+        positions.clear();
+        positions.extend(0..span.len() as u32);
+        // With no conjunct, every row is alive.
+        let mut alive = if order.is_empty() { span.len() } else { 0 };
+        for (rank, &slot) in order.iter().enumerate() {
+            let test = &mut tests[slot];
+            let session = &mut conjuncts[slot].session;
+            // Lanes advance batch by batch; one whose rows are no longer
+            // needed is still filled, to keep its cursor in step and to
+            // check dictionary ids as a decode would.
+            test.lane
+                .fill(session, &mut test.cursor, span, &mut batch)?;
+            if let Some(entries) = test.entries
+                && batch.outside(entries) != 0
+            {
+                return Err("dictionary id is outside table".into());
+            }
+            let matcher = &test.matcher;
+            let hit = |code: u64| matcher.hit(code) as usize;
+            let dense = batch.dense();
+            if rank == 0 {
+                for index in 0..span.len() {
+                    let valid = dense || batch.valid[index] != 0;
+                    positions[alive] = index as u32;
+                    alive += hit(batch.codes[index]) & usize::from(valid);
+                }
+            } else {
+                let mut kept = 0;
+                for cursor in 0..alive {
+                    let index = positions[cursor] as usize;
+                    let valid = dense || batch.valid[index] != 0;
+                    positions[kept] = index as u32;
+                    kept += hit(batch.codes[index]) & usize::from(valid);
+                }
+                alive = kept;
+            }
+        }
+        matched += alive;
+        for ((lane, session), (cursor, (values_batch, values_out))) in
+            values.iter().zip(value_sessions.iter_mut()).zip(
+                value_cursors
+                    .iter_mut()
+                    .zip(value_batches.iter_mut().zip(gathered.iter_mut())),
+            )
+        {
+            lane.fill(session, cursor, span, values_batch)?;
+            lane.gather_at(values_batch, &positions[..alive], values_out)?;
+        }
+        if alive > 0 {
+            total = match gathered.as_slice() {
+                [] => total,
+                [single] => {
+                    let mut sum = 0_i128;
+                    for value in single.iter().flatten() {
+                        sum += value;
+                    }
+                    total.checked_add(sum).ok_or("vector SUM overflow")?
+                }
+                [left, right] => {
+                    let mut sum = 0_i128;
+                    for (x, y) in left.iter().zip(right) {
+                        if let (Some(x), Some(y)) = (x, y) {
+                            sum = x
+                                .checked_mul(*y)
+                                .and_then(|product| sum.checked_add(product))
+                                .ok_or("vector product SUM overflow")?;
+                        }
+                    }
+                    total
+                        .checked_add(sum)
+                        .ok_or("vector product SUM overflow")?
+                }
+                _ => return Err("fused aggregate reads at most two columns".into()),
+            };
+        }
+        row = end;
+    }
+    if matches!(aggregate, FusedAggregate::Count) {
+        total = matched as i128;
+    }
+    Ok(Some((total, matched)))
+}
+
+/// Exact SUM of `a * b` over the selected rows at which both values are
+/// non-null, for two columns over the same rows. Pages of codes run on
+/// lanes, a batch at a time; others are decoded over the selection's hull.
+pub fn sum_product_selection(
+    a: &DecoderIr,
+    a_session: &mut ReadSession<'_>,
+    b: &DecoderIr,
+    b_session: &mut ReadSession<'_>,
+    selection: &Selection,
+) -> Result<i128, String> {
+    validate_selection(a, selection)?;
+    validate_selection(b, selection)?;
+    let Some(hull) = selection.hull() else {
+        return Ok(0);
+    };
+    if let (Some(left), Some(right)) =
+        (Lane::summable(a, a_session)?, Lane::summable(b, b_session)?)
+    {
+        let (mut left_cursor, mut right_cursor) = (
+            left.cursor(a_session, hull.start)?,
+            right.cursor(b_session, hull.start)?,
+        );
+        let (mut left_batch, mut right_batch) = (LaneBatch::default(), LaneBatch::default());
+        let (mut left_values, mut right_values, mut take) = (Vec::new(), Vec::new(), Vec::new());
+        let mut total = 0_i128;
+        let mut row = hull.start;
+        while row < hull.end {
+            let end = (row + BATCH_ROWS).min(hull.end);
+            let batch = Span::new(row, end)?;
+            left.fill(a_session, &mut left_cursor, batch, &mut left_batch)?;
+            right.fill(b_session, &mut right_cursor, batch, &mut right_batch)?;
+            left_batch.taken(selection, row, &mut take);
+            left.values_into(&left_batch, &take, &mut left_values)?;
+            right.values_into(&right_batch, &take, &mut right_values)?;
+            for ((&x, &y), (&taken, (left_valid, right_valid))) in
+                left_values.iter().zip(&right_values).zip(
+                    take.iter()
+                        .zip(left_batch.validity().zip(right_batch.validity())),
+                )
+            {
+                let mask = i128::from(taken & left_valid & right_valid).wrapping_neg();
+                let product = x.checked_mul(y).ok_or("vector product overflow")?;
+                total = total
+                    .checked_add(product & mask)
+                    .ok_or("vector product SUM overflow")?;
+            }
+            row = end;
+        }
+        return Ok(total);
+    }
+    let decode = |decoder: &DecoderIr, session: &mut ReadSession<'_>| {
+        let mut values = vec![None; hull.len()];
+        scan(decoder, session, hull, &mut |_, start, chunk| {
+            let offset = start - hull.start;
+            match chunk {
+                Chunk::Values(chunk) => {
+                    for (index, &value) in chunk.iter().enumerate() {
+                        values[offset + index] = Some(value);
+                    }
+                }
+                Chunk::Run { value, len } => {
+                    values[offset..offset + len].fill(Some(value));
+                }
+                Chunk::Nulls { .. } => {}
+            }
+            Ok(())
+        })?;
+        Ok::<_, String>(values)
+    };
+    let (left, right) = (decode(a, a_session)?, decode(b, b_session)?);
+    let mut total = 0_i128;
+    for (offset, (x, y)) in left.iter().zip(&right).enumerate() {
+        if let (Some(x), Some(y)) = (x, y)
+            && selection.contains(hull.start + offset)
+        {
+            total = x
+                .checked_mul(*y)
+                .and_then(|product| total.checked_add(product))
+                .ok_or("vector product SUM overflow")?;
+        }
+    }
+    Ok(total)
+}
+
 /// How a fused pass may compare a selector page's codes: as values offset
 /// by a frame-of-reference base, or as ids into a sorted dictionary, which
 /// only a translation licence permits.
@@ -344,36 +653,20 @@ pub fn fused_sum_between(
     let Some(sums) = Lane::summable(value, value_session)? else {
         return Ok(None);
     };
-    let (codes, range, entries) = match compare {
-        CodeCompare::Offset => {
-            let Some(codes) = Lane::at_root(selector, selector_session, Codes::Offset)? else {
-                return Ok(None);
-            };
-            let base = codes.packed.base;
-            let range = codes
-                .packed
-                .code_range(i128::from(low) - base, i128::from(high) - base);
-            (codes, range, None)
-        }
-        CodeCompare::SortedDictionary => {
-            let Some(codes) = Lane::at_root(selector, selector_session, Codes::SortedDictionary)?
-            else {
-                return Ok(None);
-            };
-            let (dictionary, entries) =
-                codes.dictionary.ok_or("dictionary lane lacks its table")?;
-            let first = table_bound(selector_session, dictionary, entries, low, false)?;
-            let end = table_bound(selector_session, dictionary, entries, high, true)?;
-            let range = (first < end).then(|| (first as u64, end as u64 - 1));
-            (codes, range, Some(entries as u64))
-        }
+    let Some(SelectorLane {
+        lane: codes,
+        matcher,
+        entries,
+        ..
+    }) = selector_lane(selector, selector_session, low, high, compare)?
+    else {
+        return Ok(None);
     };
     // With no code in range nothing matches, but dictionary ids are still
     // read to confirm they lie inside the table, as a decode would.
-    if range.is_none() && entries.is_none() {
+    if matches!(matcher, Matcher::Nothing) && entries.is_none() {
         return Ok(Some((0, 0)));
     }
-    let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
     let mut selected = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
     let mut value_batch = LaneBatch::default();
     let mut value_cursor = sums.cursor(value_session, rows.start)?;
@@ -395,10 +688,8 @@ pub fn fused_sum_between(
         if let Some(entries) = entries {
             outside |= selector_batch.outside(entries);
         }
-        if range.is_some() {
-            selector_batch.test_into(&mut selected, |code| {
-                u64::from(code.wrapping_sub(first) <= spread)
-            });
+        if !matches!(matcher, Matcher::Nothing) {
+            matcher.test_into(&selector_batch, &mut selected);
             sums.fill(value_session, &mut value_cursor, batch, &mut value_batch)?;
             let sum = sums.sum_taken(&value_batch, &selected)?;
             total = total.checked_add(sum).ok_or("vector SUM overflow")?;
@@ -621,6 +912,12 @@ impl LaneBatch {
         }
     }
 
+    /// 1 or 0 per row: whether the row holds a value.
+    fn validity(&self) -> impl Iterator<Item = u64> + '_ {
+        let dense = self.dense();
+        (0..self.codes.len()).map(move |index| if dense { 1 } else { self.valid[index] })
+    }
+
     /// Nonzero if a non-null row's id lies outside a table of `entries`.
     fn outside(&self, entries: u64) -> u64 {
         if self.dense() {
@@ -796,6 +1093,67 @@ impl Lane {
         Ok(sum)
     }
 
+    /// The values of `batch` at `positions`, `None` at null rows. A
+    /// dictionary id outside the table fails.
+    fn gather_at(
+        &self,
+        batch: &LaneBatch,
+        positions: &[u32],
+        out: &mut Vec<Option<i128>>,
+    ) -> Result<(), String> {
+        out.clear();
+        let dense = batch.dense();
+        for &position in positions {
+            let index = position as usize;
+            if !dense && batch.valid[index] == 0 {
+                out.push(None);
+                continue;
+            }
+            let code = batch.codes[index];
+            out.push(Some(match self.dictionary {
+                None => self.packed.base + i128::from(code),
+                Some(_) => i128::from(
+                    *self
+                        .entries
+                        .get(code as usize)
+                        .ok_or("dictionary id is outside table")?,
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    /// The value of every row of `batch`, 0 at null rows. Dictionary ids
+    /// of rows `take` marks must lie inside the table.
+    fn values_into(
+        &self,
+        batch: &LaneBatch,
+        take: &[u64],
+        out: &mut Vec<i128>,
+    ) -> Result<(), String> {
+        out.clear();
+        match self.dictionary {
+            None => out.extend(
+                batch
+                    .codes
+                    .iter()
+                    .map(|&code| self.packed.base + i128::from(code)),
+            ),
+            Some((_, entries)) => {
+                let last = self.entries.len().checked_sub(1);
+                for ((&id, valid), &take) in batch.codes.iter().zip(batch.validity()).zip(take) {
+                    if take & valid != 0 && id >= entries as u64 {
+                        return Err("dictionary id is outside table".into());
+                    }
+                    out.push(
+                        last.map_or(0, |last| i128::from(self.entries[(id as usize).min(last)])),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn cursor(&self, session: &mut ReadSession<'_>, row: usize) -> Result<LaneCursor, String> {
         let compact = match self.validity {
             Some(validity) => nullable_prefix_rank(
@@ -896,49 +1254,164 @@ impl Lane {
         Ok(total)
     }
 
-    /// Sets the bit of every non-null row in `rows` whose code lies in
-    /// `[first, last]`, with one unsigned comparison per code.
-    fn select(
+    /// Sets the bit of every non-null row in `rows` that `matcher` keeps,
+    /// failing if a non-null row's id lies outside a table of `entries`.
+    fn select_with(
         &self,
         session: &mut ReadSession<'_>,
         rows: Span,
-        (first, last): (u64, u64),
+        matcher: &Matcher,
+        entries: Option<u64>,
         selection: &mut Selection,
     ) -> Result<(), String> {
-        let spread = last - first;
         let mut bits = Vec::new();
         self.scan(session, rows, |_, row, batch| {
-            batch.test_into(&mut bits, |code| {
-                u64::from(code.wrapping_sub(first) <= spread)
-            });
-            set_bits(selection, row, &bits);
-            Ok(())
-        })
-    }
-
-    /// `select` over dictionary ids, failing if a non-null row's id lies
-    /// outside the table. With no range, ids are only checked.
-    fn select_ids(
-        &self,
-        session: &mut ReadSession<'_>,
-        rows: Span,
-        range: Option<(u64, u64)>,
-        entries: u64,
-        selection: &mut Selection,
-    ) -> Result<(), String> {
-        let (first, spread) = range.map_or((1, 0), |(first, last)| (first, last - first));
-        let mut bits = Vec::new();
-        self.scan(session, rows, |_, row, batch| {
-            if batch.outside(entries) != 0 {
+            if let Some(entries) = entries
+                && batch.outside(entries) != 0
+            {
                 return Err("dictionary id is outside table".into());
             }
-            if range.is_some() {
-                batch.test_into(&mut bits, |id| u64::from(id.wrapping_sub(first) <= spread));
+            if !matches!(matcher, Matcher::Nothing) {
+                matcher.test_into(batch, &mut bits);
                 set_bits(selection, row, &bits);
             }
             Ok(())
         })
     }
+}
+
+/// How a selector lane decides whether a row's value lies in the predicate.
+enum Matcher {
+    /// Codes in `[first, first + spread]`: offset codes, or ids into a
+    /// sorted dictionary.
+    Range { first: u64, spread: u64 },
+    /// The outcome for each dictionary id, from testing every entry once:
+    /// a scan of a dictionary page that needs no order between its entries.
+    Entries(Vec<u64>),
+    /// No code can match.
+    Nothing,
+}
+
+impl Matcher {
+    /// Fraction of codes that match, for ordering conjuncts.
+    fn selectivity(&self, domain: f64) -> f64 {
+        match self {
+            Self::Range { spread, .. } => (*spread as f64 + 1.0) / domain.max(1.0),
+            Self::Entries(hits) => hits.iter().sum::<u64>() as f64 / hits.len().max(1) as f64,
+            Self::Nothing => 0.0,
+        }
+    }
+
+    /// Replaces `out` with 1 or 0 per row of `batch`: whether it holds a
+    /// matching value. The variant is chosen once per batch.
+    fn test_into(&self, batch: &LaneBatch, out: &mut Vec<u64>) {
+        match self {
+            Self::Range { first, spread } => {
+                batch.test_into(out, |code| u64::from(code.wrapping_sub(*first) <= *spread));
+            }
+            Self::Entries(hits) => {
+                batch.test_into(out, |code| hits.get(code as usize).copied().unwrap_or(0));
+            }
+            Self::Nothing => {
+                out.clear();
+                out.resize(batch.codes.len(), 0);
+            }
+        }
+    }
+
+    fn hit(&self, code: u64) -> u64 {
+        match self {
+            Self::Range { first, spread } => u64::from(code.wrapping_sub(*first) <= *spread),
+            Self::Entries(hits) => hits.get(code as usize).copied().unwrap_or(0),
+            Self::Nothing => 0,
+        }
+    }
+}
+
+/// A selector page read as a lane, with the matcher for its predicate.
+struct SelectorLane {
+    lane: Lane,
+    matcher: Matcher,
+    /// The table size its ids must stay below, for dictionary pages.
+    entries: Option<u64>,
+    /// How many distinct codes the page can hold.
+    domain: f64,
+}
+
+/// A selector page read as a lane, the matcher for `[low, high]`, the
+/// table size its ids must stay below, and the size of its code domain.
+/// Offset codes compare with the predicate shifted by the base. Under
+/// `CodeCompare::Offset` a dictionary page is scanned by testing each entry
+/// once, which needs no order; `SortedDictionary` compares ids with the
+/// predicate's id range, which a translation licence permits. `None` when
+/// the page is not codes in either form.
+fn selector_lane(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    low: i64,
+    high: i64,
+    compare: CodeCompare,
+) -> Result<Option<SelectorLane>, String> {
+    let (low, high) = (i128::from(low), i128::from(high));
+    if compare == CodeCompare::Offset {
+        if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)? {
+            let base = lane.packed.base;
+            let matcher = match lane.packed.code_range(low - base, high - base) {
+                Some((first, last)) => Matcher::Range {
+                    first,
+                    spread: last - first,
+                },
+                None => Matcher::Nothing,
+            };
+            let domain = (1_u128 << lane.packed.width) as f64;
+            return Ok(Some(SelectorLane {
+                lane,
+                matcher,
+                entries: None,
+                domain,
+            }));
+        }
+        let Some(lane) = Lane::at_root(decoder, session, Codes::DictionaryValues)? else {
+            return Ok(None);
+        };
+        let (_, entries) = lane.dictionary.ok_or("dictionary lane lacks its table")?;
+        let hits = lane
+            .entries
+            .iter()
+            .map(|&entry| u64::from(low <= i128::from(entry) && i128::from(entry) <= high))
+            .collect::<Vec<_>>();
+        let matcher = if hits.contains(&1) {
+            Matcher::Entries(hits)
+        } else {
+            Matcher::Nothing
+        };
+        return Ok(Some(SelectorLane {
+            lane,
+            matcher,
+            entries: Some(entries as u64),
+            domain: entries as f64,
+        }));
+    }
+    let Some(lane) = Lane::at_root(decoder, session, Codes::SortedDictionary)? else {
+        return Ok(None);
+    };
+    let (table, entries) = lane.dictionary.ok_or("dictionary lane lacks its table")?;
+    let first = table_bound(session, table, entries, low as i64, false)?;
+    let end = table_bound(session, table, entries, high as i64, true)?;
+    let matcher = if first < end {
+        Matcher::Range {
+            first: first as u64,
+            spread: (end - 1 - first) as u64,
+        }
+    } else {
+        Matcher::Nothing
+    };
+    Ok(Some(SelectorLane {
+        lane,
+        matcher,
+        entries: Some(entries as u64),
+        domain: entries as f64,
+    }))
 }
 
 /// ORs one bit per row, starting at `row`, into `selection`, a whole word at
