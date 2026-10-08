@@ -21,6 +21,8 @@
 /experiments/results/access_crossover/*.acp
 /experiments/results/paged_study/parquet/
 /experiments/results/paged_scale/parquet/
+/experiments/results/paged_conjunctive/parquet/
+/experiments/results/repeats/*/*/parquet/
 
 # Local tools and editor state.
 **/__pycache__/
