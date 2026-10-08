@@ -64,7 +64,7 @@ printf '3/8 membership-certificate controls\n'
 printf '4/8 physical access and storage schedules\n'
 ./experiments/run_real_access.sh
 
-printf '5/8 paged queries, page sizes, scaling, conjunctions, Parquet facts, DuckDB, and repeats\n'
+printf '5/8 paged queries, page sizes, scaling, conjunctions, floats, strings, cold reads, Parquet facts, DuckDB, and repeats\n'
 cargo run --locked --release --features experiment --bin paged_study
 for rows in 4096 65536; do
   WITNESS_PAGE_ROWS=$rows cargo run --locked --release --features experiment --bin paged_study
@@ -72,6 +72,9 @@ done
 cargo run --locked --release --features experiment --bin paged_scale_study
 cargo run --locked --release --features experiment --bin paged_conjunctive_study
 cargo run --locked --release --features experiment --bin parquet_facts_study
+cargo run --locked --release --features experiment --bin paged_float_study
+cargo run --locked --release --features experiment --bin paged_string_study
+cargo run --locked --release --features experiment --bin paged_cold_study
 python3 experiments/duckdb_baseline.py
 ./experiments/run_repeats.sh
 
@@ -112,6 +115,9 @@ printf '8/8 provenance and checksums\n'
     experiments/results/duckdb/*.csv \
     experiments/results/paged_conjunctive/*.csv \
     experiments/results/parquet_facts/*.csv \
+    experiments/results/paged_float/*.csv \
+    experiments/results/paged_string/*.csv \
+    experiments/results/paged_cold/*.csv \
     experiments/results/repeats/*/*/*.csv \
     "$PAIRED_16K"/*.csv \
     experiments/results/additional_plans.csv \

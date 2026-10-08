@@ -23,6 +23,9 @@
 /experiments/results/paged_scale/parquet/
 /experiments/results/paged_conjunctive/parquet/
 /experiments/results/repeats/*/*/parquet/
+/experiments/results/paged_float/parquet/
+/experiments/results/paged_string/parquet/
+/experiments/results/paged_cold/files/
 
 # Local tools and editor state.
 **/__pycache__/

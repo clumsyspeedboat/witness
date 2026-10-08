@@ -25,6 +25,10 @@ PATTERNS = (
     "census/tpcds/*.csv",
     "census/tpch/*.csv",
     "scale/tpch_sf10/*.csv",
+    "strings/clickbench/*.parquet",
+    "strings/publicbi/*.parquet",
+    "strings/tpcds/*.parquet",
+    "strings/tpch/*.parquet",
 )
 FIXED = (
     "realKnownCause__nyc_taxi.csv",

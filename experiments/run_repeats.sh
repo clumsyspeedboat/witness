@@ -18,7 +18,7 @@ for run in 2 3; do
     WITNESS_PAGED_SCALE_RESULT_DIR="$dir/paged_scale" \
     WITNESS_PAGED_CONJUNCTIVE_RESULT_DIR="$dir/paged_conjunctive" \
     WITNESS_DUCKDB_RESULT_DIR="$dir/duckdb" \
-    python3 experiments/duckdb_baseline.py
+    python3 experiments/duckdb_baseline.py paged scale conjunctive
   # The exported Parquet files are inputs to DuckDB, not results.
   rm -rf "$dir"/paged_study/parquet "$dir"/paged_scale/parquet "$dir"/paged_conjunctive/parquet
 done

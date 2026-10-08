@@ -13,7 +13,7 @@ time, measured at the Python client. The client round trip of a query that
 reads nothing is recorded once as a floor. One profiled run records the
 rows DuckDB's scans read, which shows how much its zone maps pruned.
 
-Usage: experiments/duckdb_baseline.py [paged|scale|conjunctive ...]
+Usage: experiments/duckdb_baseline.py [paged|scale|conjunctive|float|string ...]
 """
 
 import csv
@@ -31,10 +31,12 @@ SCALE = os.environ.get("WITNESS_PAGED_SCALE_RESULT_DIR", "experiments/results/pa
 CONJUNCTIVE = os.environ.get(
     "WITNESS_PAGED_CONJUNCTIVE_RESULT_DIR", "experiments/results/paged_conjunctive"
 )
+FLOAT = os.environ.get("WITNESS_PAGED_FLOAT_RESULT_DIR", "experiments/results/paged_float")
+STRING = os.environ.get("WITNESS_PAGED_STRING_RESULT_DIR", "experiments/results/paged_string")
 OUTPUT = os.environ.get("WITNESS_DUCKDB_RESULT_DIR", "experiments/results/duckdb")
 REPEATS = 5
 TARGET_NS = 2_000_000
-THREADS = {"paged": [1], "scale": [1, 64], "conjunctive": [1, 64]}
+THREADS = {"paged": [1], "scale": [1, 64], "conjunctive": [1, 64], "float": [1], "string": [1]}
 HEADER = [
     "study",
     "table",
@@ -119,7 +121,69 @@ def conjunctive_queries():
     ]
 
 
-QUERIES = {"paged": paged_queries, "scale": scale_queries, "conjunctive": conjunctive_queries}
+def pair_queries(directory, where):
+    """Queries of a pair study, one table per pair, with `where` building
+    each predicate from its row of queries.csv."""
+    tables = {}
+    with open(f"{directory}/queries.csv", newline="") as source:
+        for row in csv.DictReader(source):
+            if row["arm"] != "witness_direct_facts":
+                continue
+            tables.setdefault(row["pair"], []).append(
+                (
+                    row["predicate"],
+                    where(row),
+                    "SUM(value)",
+                    int(row["matched_rows"]),
+                    int(row["expected_sum"]),
+                )
+            )
+    return [
+        (f"pair_{pair}", f"{directory}/parquet/pair_{pair}.parquet", queries)
+        for pair, queries in sorted(tables.items(), key=lambda item: int(item[0]))
+    ]
+
+
+def float_where(row):
+    # The bounds are the exact doubles printed to round-trip.
+    return (
+        f"timestamp BETWEEN CAST('{row['low']}' AS DOUBLE) "
+        f"AND CAST('{row['high']}' AS DOUBLE)"
+    )
+
+
+def string_where(row):
+    """Text columns compare with text literals, which keeps DuckDB's filter
+    pushdown; a bound that is not valid UTF-8, or a binary column, compares
+    as bytes. Both orders are byte order, as in Witness."""
+    terms = []
+    for side, bound in (("low", ">"), ("high", "<")):
+        kind = row[f"{side}_kind"]
+        if kind == "unbounded":
+            continue
+        operator = bound + ("=" if kind == "included" else "")
+        raw = bytes.fromhex(row[side])
+        try:
+            text = raw.decode("utf-8") if row["utf8"] == "true" else None
+        except UnicodeDecodeError:
+            text = None
+        if text is not None:
+            literal = text.replace("'", "''")
+            terms.append(f"timestamp {operator} '{literal}'")
+        elif row["utf8"] == "true":
+            terms.append(f"encode(timestamp) {operator} from_hex('{row[side]}')")
+        else:
+            terms.append(f"timestamp {operator} from_hex('{row[side]}')")
+    return " AND ".join(terms) or "TRUE"
+
+
+QUERIES = {
+    "paged": paged_queries,
+    "scale": scale_queries,
+    "conjunctive": conjunctive_queries,
+    "float": lambda: pair_queries(FLOAT, float_where),
+    "string": lambda: pair_queries(STRING, string_where),
+}
 
 
 def answer(con, sql):
@@ -199,7 +263,7 @@ def measure(study, tables, writer, scratch):
 
 
 def main():
-    studies = sys.argv[1:] or ["paged", "scale", "conjunctive"]
+    studies = sys.argv[1:] or ["paged", "scale", "conjunctive", "float", "string"]
     os.makedirs(OUTPUT, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="witness-duckdb-")
     try:
