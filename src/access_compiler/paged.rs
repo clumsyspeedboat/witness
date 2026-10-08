@@ -301,12 +301,60 @@ pub enum SumAction {
 /// ablation that turns every page into a scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Planning {
+    /// Every fact the page proves: bounds to skip and accept, order to
+    /// search, a sorted dictionary to translate, the column certificate.
     Facts,
     ScanOnly,
     /// A plain zone map: exact per-page minima and maxima stored by the
     /// writer, used to skip and accept pages and nothing else. It isolates
     /// what stored statistics buy on the same executor as derived facts.
     StoredStatistics,
+    /// Derived bounds alone: facts skip and accept pages, but never search,
+    /// translate, or use the column certificate. Against `StoredStatistics`
+    /// it isolates replacing stored bounds with derived ones.
+    FactBounds,
+    /// A zone map's skips and accepts plus every encoding shortcut that
+    /// `Facts` uses. Against `Facts` it isolates stored against derived
+    /// bounds with the shortcuts held equal.
+    StoredStatisticsPlus,
+    /// Plans from bounds kept in a footer, as a zone map is, where each
+    /// page's `stats` hold its derived bounds; every page the query reads
+    /// re-derives its bound from those bytes and fails on a mismatch, so only
+    /// pages skipped or accepted without being read rely on the footer.
+    DerivedFooter,
+}
+
+impl Planning {
+    /// The planner's name in result files.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Facts => "facts",
+            Self::ScanOnly => "scan",
+            Self::StoredStatistics => "zonemap",
+            Self::FactBounds => "factbounds",
+            Self::StoredStatisticsPlus => "zonemapplus",
+            Self::DerivedFooter => "footer",
+        }
+    }
+
+    /// Whether stored per-page statistics decide skips and accepts.
+    pub fn uses_statistics(self) -> bool {
+        matches!(
+            self,
+            Self::StoredStatistics | Self::StoredStatisticsPlus | Self::DerivedFooter
+        )
+    }
+
+    /// Whether bounds derived from the encoding decide skips and accepts.
+    pub fn uses_bounds(self) -> bool {
+        matches!(self, Self::Facts | Self::FactBounds)
+    }
+
+    /// Whether encoding facts may license a search, a code translation, or
+    /// the column certificate.
+    pub fn uses_shortcuts(self) -> bool {
+        matches!(self, Self::Facts | Self::StoredStatisticsPlus)
+    }
 }
 
 /// Plans `low <= value <= high` on one page, then checks the plan.
@@ -320,10 +368,35 @@ pub fn plan_between(
     if low > high {
         return Err("page predicate bounds are invalid".into());
     }
-    let action = match planning {
-        Planning::ScanOnly => PageAction::Scan,
-        Planning::Facts => choose_between(page, session, i128::from(low), i128::from(high))?,
-        Planning::StoredStatistics => choose_by_statistics(page, i128::from(low), i128::from(high)),
+    let (low_bound, high_bound) = (i128::from(low), i128::from(high));
+    let is_shortcut = |action: &PageAction| {
+        matches!(
+            action,
+            PageAction::Search { .. }
+                | PageAction::SearchPiecewise { .. }
+                | PageAction::Translate(_)
+        )
+    };
+    let action = if planning == Planning::ScanOnly {
+        PageAction::Scan
+    } else if planning.uses_statistics() {
+        match choose_by_statistics(page, low_bound, high_bound) {
+            // A page the statistics cannot decide may still take a shortcut.
+            PageAction::Scan if planning.uses_shortcuts() => {
+                let candidate = choose_between(page, session, low_bound, high_bound)?;
+                if is_shortcut(&candidate) {
+                    candidate
+                } else {
+                    PageAction::Scan
+                }
+            }
+            action => action,
+        }
+    } else {
+        match choose_between(page, session, low_bound, high_bound)? {
+            action if is_shortcut(&action) && !planning.uses_shortcuts() => PageAction::Scan,
+            action => action,
+        }
     };
     check_between(page, session, &action, low, high)?;
     Ok(action)
@@ -335,7 +408,10 @@ fn choose_by_statistics(page: &Page, low: i128, high: i128) -> PageAction {
         evidence: page.stats,
     };
     match page.stats {
-        None => PageAction::Skip(licence),
+        // No entry: the page holds no value, or its summary has no interval
+        // for it, as a derived bound may not; only the first can be skipped.
+        None if page.non_null == 0 => PageAction::Skip(licence),
+        None => PageAction::Scan,
         Some((lower, upper)) if upper < low || lower > high => PageAction::Skip(licence),
         Some((lower, upper)) if low <= lower && upper <= high => PageAction::Accept(licence),
         Some(_) => PageAction::Scan,
@@ -357,7 +433,7 @@ fn check_statistics(
         return Err("stored-statistics licence disagrees with the page".into());
     }
     match (page.stats, accept) {
-        (None, false) => Ok(()),
+        (None, false) if page.non_null == 0 => Ok(()),
         (Some((lower, upper)), false) if upper < low || lower > high => Ok(()),
         (Some((lower, upper)), true) if low <= lower && upper <= high => Ok(()),
         _ => Err("stored statistics do not decide this action".into()),
@@ -568,7 +644,7 @@ pub fn plan_sum(
     session: &mut ReadSession<'_>,
     planning: Planning,
 ) -> Result<SumAction, String> {
-    if planning == Planning::StoredStatistics
+    if planning.uses_statistics()
         && let Some((lower, upper)) = page.stats
         && lower == upper
         && page.non_null == page.rows()
@@ -580,7 +656,7 @@ pub fn plan_sum(
         check_sum(page, session, &action)?;
         return Ok(action);
     }
-    if planning == Planning::Facts {
+    if planning.uses_bounds() {
         for (scope, source) in root_bounds(page) {
             if scope != FactScope::AllRows {
                 continue;
@@ -857,13 +933,14 @@ pub fn sum_where_in(
     let mut work = Vec::new();
     // On a column ordered across pages, only a contiguous run of pages can
     // match; every page outside it is skipped without being planned.
-    let (first, end) = match planning {
-        Planning::Facts => selector
+    // The order certificate is a derived fact; planners without the
+    // encoding's shortcuts consult every page.
+    let (first, end) = if planning.uses_shortcuts() {
+        selector
             .candidate_pages_in(selector_store, i128::from(low), i128::from(high))?
-            .unwrap_or((0, selector.pages.len())),
-        // A zone map consults every page's stored entry; the order
-        // certificate is a derived fact it does not have.
-        Planning::ScanOnly | Planning::StoredStatistics => (0, selector.pages.len()),
+            .unwrap_or((0, selector.pages.len()))
+    } else {
+        (0, selector.pages.len())
     };
     counts.skipped += selector.pages.len() - (end - first);
     if selector
@@ -925,6 +1002,7 @@ pub fn sum_where_in(
             };
             counts.account(&value_session);
             if let Some((sum, matched)) = fused {
+                verify_footer(selector_page, &mut session, planning)?;
                 counts.account(&session);
                 return Ok((sum, matched, counts));
             }
@@ -952,6 +1030,9 @@ pub fn sum_where_in(
             Selected::Spans(ranges) => ranges.iter().map(|range| range.len()).sum::<usize>(),
             Selected::Bitmap(selection) => selection.count(),
         };
+        if !matches!(action, PageAction::Accept(_)) {
+            verify_footer(selector_page, &mut session, planning)?;
+        }
         counts.account(&session);
         if matched == 0 {
             return Ok((0, 0, counts));
@@ -1055,7 +1136,7 @@ pub fn aggregate_where(
     }
     // An ordered column narrows the pages any conjunct on it can match.
     let (mut first_page, mut end_page) = (0, shape.pages.len());
-    if planning == Planning::Facts {
+    if planning.uses_shortcuts() {
         for conjunct in conjuncts {
             if let Some((start, end)) = conjunct
                 .column
@@ -1206,6 +1287,20 @@ pub fn aggregate_where(
         counts.constant_sums += constant;
     }
     Ok((total, matched, counts))
+}
+
+/// Under `Planning::DerivedFooter`, re-derives the bound of a page the query
+/// has read, from the bytes in `session`, and fails if the footer entry
+/// planned from (the page's `stats`) disagrees.
+fn verify_footer(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    planning: Planning,
+) -> Result<(), String> {
+    if planning == Planning::DerivedFooter && derived_bounds_in(page, session)? != page.stats {
+        return Err("footer bound disagrees with the page it describes".into());
+    }
+    Ok(())
 }
 
 fn untracked(page: &Page) -> ReadSession<'_> {

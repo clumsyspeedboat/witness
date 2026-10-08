@@ -97,6 +97,8 @@ fn paged_answers_equal_the_truth_with_and_without_facts() {
             Planning::Facts,
             Planning::ScanOnly,
             Planning::StoredStatistics,
+            Planning::FactBounds,
+            Planning::StoredStatisticsPlus,
         ] {
             for threads in [1, 8] {
                 let (ranges, _) = paged::between(&selector, low, high, planning, threads).unwrap();
@@ -445,4 +447,99 @@ fn a_constant_value_page_sums_without_decoding() {
         paged::sum_where(&selector, &value, 100, 3_000, Planning::Facts, 2).unwrap();
     assert_eq!((sum, rows), (7 * 2_901, 2_901));
     assert_eq!(counts.constant_sums, 3);
+}
+
+#[test]
+fn ablation_planners_take_only_the_actions_they_are_allowed() {
+    let values = mixed_column();
+    let column = PagedColumn::from_values(&values, PAGE, &policy()).unwrap();
+    for (low, high) in predicates() {
+        let (_, bounds) = paged::between(&column, low, high, Planning::FactBounds, 1).unwrap();
+        assert_eq!(
+            (bounds.searched, bounds.translated),
+            (0, 0),
+            "{low}..={high}"
+        );
+        let (_, zone) = paged::between(&column, low, high, Planning::StoredStatistics, 1).unwrap();
+        let (_, plus) =
+            paged::between(&column, low, high, Planning::StoredStatisticsPlus, 1).unwrap();
+        // The zone map's skips and accepts, plus shortcuts on the rest.
+        assert_eq!((plus.skipped, plus.accepted), (zone.skipped, zone.accepted));
+        assert!(plus.scanned <= zone.scanned);
+    }
+}
+
+#[test]
+fn a_derived_footer_is_checked_on_every_page_the_query_reads() {
+    let values = mixed_column();
+    let measure = (0..values.len())
+        .map(|row| Some(row as i64 % 50))
+        .collect::<Vec<_>>();
+    let mut column = PagedColumn::from_values(&values, PAGE, &policy()).unwrap();
+    let value = PagedColumn::from_values(&measure, PAGE, &policy()).unwrap();
+    // The footer holds each page's derived bounds.
+    for index in 0..column.pages().len() {
+        let bound = paged::derived_bounds(&column.pages()[index]).unwrap();
+        column.replace_statistics(index, bound).unwrap();
+    }
+    let truth = |low: i64, high: i64| {
+        values
+            .iter()
+            .zip(&measure)
+            .fold(
+                (0_i128, 0_usize),
+                |(sum, rows), (value, measure)| match value {
+                    Some(value) if low <= *value && *value <= high => {
+                        (sum + i128::from(measure.unwrap()), rows + 1)
+                    }
+                    _ => (sum, rows),
+                },
+            )
+    };
+    for (low, high) in predicates() {
+        let (sum, rows, _) =
+            paged::sum_where(&column, &value, low, high, Planning::DerivedFooter, 1).unwrap();
+        assert_eq!((sum, rows), truth(low, high), "{low}..={high}");
+    }
+    // A footer entry that disagrees with a page the query reads fails the
+    // query; one for a page it skips without reading is trusted.
+    let scanned = column
+        .pages()
+        .iter()
+        // A bound wide enough that a two-value predicate at its lower end
+        // must scan the page.
+        .position(|page| page.stats.is_some_and(|(low, high)| high - low > 4))
+        .unwrap();
+    let original = column.pages()[scanned].stats;
+    let (low, high) = original.unwrap();
+    let mut stale = column.clone();
+    stale
+        .replace_statistics(scanned, Some((low - 1, high + 1)))
+        .unwrap();
+    let (query_low, query_high) = (low as i64, low as i64 + 1);
+    assert!(
+        paged::sum_where(
+            &stale,
+            &value,
+            query_low,
+            query_high,
+            Planning::DerivedFooter,
+            1
+        )
+        .is_err()
+    );
+    let mut misleading = column.clone();
+    misleading
+        .replace_statistics(scanned, Some((high + 10, high + 20)))
+        .unwrap();
+    let (sum, rows, _) = paged::sum_where(
+        &misleading,
+        &value,
+        query_low,
+        query_high,
+        Planning::DerivedFooter,
+        1,
+    )
+    .unwrap();
+    assert_ne!((sum, rows), truth(query_low, query_high));
 }

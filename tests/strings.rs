@@ -115,6 +115,9 @@ fn string_predicates_equal_the_truth_under_every_planner() {
             Planning::Facts,
             Planning::StoredStatistics,
             Planning::ScanOnly,
+            Planning::FactBounds,
+            Planning::StoredStatisticsPlus,
+            Planning::DerivedFooter,
         ] {
             let (total, rows, _, read) =
                 string_sum_where(&column, view, &measure, planning).unwrap();

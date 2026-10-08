@@ -227,10 +227,11 @@ pub enum StringAction {
     Scan,
 }
 
-/// Plans `range` on page `page` and checks the plan. `Planning::Facts` uses
-/// the dictionary's order; `Planning::StoredStatistics` uses the page's exact
-/// smallest and largest string, as a zone map stores them; `Planning::ScanOnly`
-/// uses nothing. `probes` counts the dictionary entries read.
+/// Plans `range` on page `page` and checks the plan. Planners with the
+/// encoding's shortcuts use the dictionary's order; the others use only the
+/// page's smallest and largest string, which a zone map stores and the
+/// dictionary's ends equal; `Planning::ScanOnly` uses nothing. `probes`
+/// counts the dictionary entries read.
 pub fn plan_string(
     column: &StringColumn,
     page: usize,
@@ -240,10 +241,13 @@ pub fn plan_string(
 ) -> Result<StringAction, String> {
     let dictionary = column.dictionary(page);
     let entries = dictionary.len();
+    // The dictionary's ends are its page's exact minimum and maximum, so
+    // derived bounds and a zone map decide alike; only the order fact,
+    // which every shortcut-using planner has, adds the id translation.
     let action = match planning {
         Planning::ScanOnly => StringAction::Scan,
         _ if entries == 0 => StringAction::Skip,
-        Planning::StoredStatistics => {
+        _ if !planning.uses_shortcuts() => {
             *probes += 2;
             let (smallest, largest) = (dictionary.entry(0), dictionary.entry(entries - 1));
             if above(smallest, range.high) || below(largest, range.low) {
@@ -254,7 +258,7 @@ pub fn plan_string(
                 StringAction::Scan
             }
         }
-        Planning::Facts => {
+        _ => {
             let first = dictionary.lower(range.low, probes);
             let end = dictionary.upper(range.high, probes);
             if first >= end {
@@ -294,14 +298,14 @@ pub fn check_string(
             };
         }
         StringAction::SkipAt(at) => {
-            if planning != Planning::Facts {
+            if !planning.uses_shortcuts() {
                 return Err("only dictionary order places a skip between entries".into());
             }
             (at as usize, at as usize)
         }
         StringAction::Accept => (0, entries),
         StringAction::Translate { first, last } => {
-            if planning != Planning::Facts {
+            if !planning.uses_shortcuts() {
                 return Err("only dictionary order licenses an id translation".into());
             }
             (first as usize, last as usize + 1)
