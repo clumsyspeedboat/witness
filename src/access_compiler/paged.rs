@@ -191,6 +191,16 @@ impl PagedColumn {
     /// and after the last page starting at or below `high` holds none. The
     /// pages just outside the range are re-read to confirm the boundary.
     fn candidate_pages(&self, low: i128, high: i128) -> Result<Option<(usize, usize)>, String> {
+        self.candidate_pages_in(&InMemory, low, high)
+    }
+
+    /// `candidate_pages`, confirming the boundary pages from `store`.
+    fn candidate_pages_in(
+        &self,
+        store: &dyn PageStore,
+        low: i128,
+        high: i128,
+    ) -> Result<Option<(usize, usize)>, String> {
         if !self.ordered() {
             return Ok(None);
         }
@@ -202,9 +212,11 @@ impl PagedColumn {
         let end = self
             .pages
             .partition_point(|page| page.ends.is_some_and(|(start, _)| start <= high));
+        // The two confirming reads go through `store`; they are not added to
+        // a query's I/O counts, being two reads however large the column.
         let confirm = |index: usize, row_of: fn(&Page) -> usize| -> Result<i128, String> {
             let page = &self.pages[index];
-            let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+            let mut session = store.session(page, index, Access::Plan)?;
             vector::get(&page.column.decoder, &mut session, row_of(page))?
                 .ok_or_else(|| "ordered page holds a null".into())
         };
@@ -694,9 +706,20 @@ pub struct PageCounts {
     pub translated: usize,
     pub scanned: usize,
     pub constant_sums: usize,
+    /// Positioned reads issued against a file-backed page store, and the
+    /// bytes they transferred; zero for pages held in memory.
+    pub io_operations: usize,
+    pub io_bytes: usize,
 }
 
 impl PageCounts {
+    /// Adds the reads a session transferred.
+    fn account(&mut self, session: &ReadSession<'_>) {
+        let metrics = session.metrics();
+        self.io_operations += metrics.transfer_operations;
+        self.io_bytes += metrics.transferred_bytes;
+    }
+
     fn record(&mut self, action: &PageAction) {
         match action {
             PageAction::Skip(_) => self.skipped += 1,
@@ -714,6 +737,77 @@ impl PageCounts {
         self.translated += other.translated;
         self.scanned += other.scanned;
         self.constant_sums += other.constant_sums;
+        self.io_operations += other.io_operations;
+        self.io_bytes += other.io_bytes;
+    }
+}
+
+/// Where the bytes of a column's pages are read from. Planning and execution
+/// read every field through a session the store opens, so the same plans run
+/// over pages in memory or in a file, and a file store accounts for the reads.
+pub trait PageStore: Sync {
+    /// A session over `page`, the `index`-th page of its column, opened for
+    /// `access`.
+    fn session<'a>(
+        &'a self,
+        page: &'a Page,
+        index: usize,
+        access: Access,
+    ) -> Result<ReadSession<'a>, String>;
+}
+
+/// Why a session reads a page. Planning reads a few fields; executing a
+/// page reads most of it, so a file store fetches the whole page with its
+/// first read instead of one read per batch of rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Access {
+    Plan,
+    Execute,
+}
+
+/// Pages read from memory, without access accounting.
+pub struct InMemory;
+
+impl PageStore for InMemory {
+    fn session<'a>(
+        &'a self,
+        page: &'a Page,
+        _: usize,
+        _: Access,
+    ) -> Result<ReadSession<'a>, String> {
+        Ok(ReadSession::new_untracked(
+            &page.column.page,
+            ClosureMode::Selective,
+        ))
+    }
+}
+
+/// Pages of one column stored in a file, page `i` starting at `offsets[i]`.
+/// Each field a session needs is fetched with a positioned read, and the
+/// session counts the reads and the bytes they transfer.
+pub struct FileStore<'f> {
+    pub file: &'f std::fs::File,
+    pub offsets: Vec<u64>,
+}
+
+impl PageStore for FileStore<'_> {
+    fn session<'a>(
+        &'a self,
+        page: &'a Page,
+        index: usize,
+        access: Access,
+    ) -> Result<ReadSession<'a>, String> {
+        let offset = *self.offsets.get(index).ok_or("file store lacks the page")?;
+        let mode = match access {
+            Access::Plan => ClosureMode::Selective,
+            Access::Execute => ClosureMode::FullPage,
+        };
+        Ok(ReadSession::from_file(
+            &page.column.page,
+            mode,
+            self.file,
+            offset,
+        ))
     }
 }
 
@@ -723,6 +817,25 @@ impl PageCounts {
 pub fn sum_where(
     selector: &PagedColumn,
     value: &PagedColumn,
+    low: i64,
+    high: i64,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    sum_where_in(
+        (selector, &InMemory),
+        (value, &InMemory),
+        low,
+        high,
+        planning,
+        threads,
+    )
+}
+
+/// `sum_where` over pages read from the given stores.
+pub fn sum_where_in(
+    (selector, selector_store): (&PagedColumn, &dyn PageStore),
+    (value, value_store): (&PagedColumn, &dyn PageStore),
     low: i64,
     high: i64,
     planning: Planning,
@@ -746,7 +859,7 @@ pub fn sum_where(
     // match; every page outside it is skipped without being planned.
     let (first, end) = match planning {
         Planning::Facts => selector
-            .candidate_pages(i128::from(low), i128::from(high))?
+            .candidate_pages_in(selector_store, i128::from(low), i128::from(high))?
             .unwrap_or((0, selector.pages.len())),
         // A zone map consults every page's stored entry; the order
         // certificate is a derived fact it does not have.
@@ -764,10 +877,16 @@ pub fn sum_where(
     // Pages are planned on the worker pool once there are enough of them;
     // a column of a few pages is planned on the calling thread.
     let actions = run_pages(end - first, threads, |offset| {
-        let page = &selector.pages[first + offset];
-        plan_between(page, &mut untracked(page), low, high, planning)
+        let index = first + offset;
+        let page = &selector.pages[index];
+        let mut session = selector_store.session(page, index, Access::Plan)?;
+        let action = plan_between(page, &mut session, low, high, planning)?;
+        let mut reads = PageCounts::default();
+        reads.account(&session);
+        Ok((action, reads))
     })?;
-    for (offset, action) in actions.into_iter().enumerate() {
+    for (offset, (action, reads)) in actions.into_iter().enumerate() {
+        counts.add(&reads);
         counts.record(&action);
         if !matches!(action, PageAction::Skip(_)) {
             work.push((first + offset, action));
@@ -778,8 +897,7 @@ pub fn sum_where(
         let selector_page = &selector.pages[*index];
         let value_page = &value.pages[*index];
         let mut counts = PageCounts::default();
-        let mut session =
-            ReadSession::new_untracked(&selector_page.column.page, ClosureMode::Selective);
+        let mut session = selector_store.session(selector_page, *index, Access::Execute)?;
         let action = action.clone();
         // A scan of frame-of-reference codes, or a translation of sorted
         // dictionary ids, over a value page of plain codes runs as one fused
@@ -790,10 +908,10 @@ pub fn sum_where(
             _ => None,
         };
         if let Some(compare) = compare {
-            let mut value_session =
-                ReadSession::new_untracked(&value_page.column.page, ClosureMode::Selective);
-            if plan_sum(value_page, &mut value_session, planning)? == SumAction::Decode
-                && let Some((sum, matched)) = vector::fused_sum_between(
+            let mut value_session = value_store.session(value_page, *index, Access::Execute)?;
+            let fused = if plan_sum(value_page, &mut value_session, planning)? == SumAction::Decode
+            {
+                vector::fused_sum_between(
                     &selector_page.column.decoder,
                     &mut session,
                     &value_page.column.decoder,
@@ -802,7 +920,12 @@ pub fn sum_where(
                     (low, high),
                     compare,
                 )?
-            {
+            } else {
+                None
+            };
+            counts.account(&value_session);
+            if let Some((sum, matched)) = fused {
+                counts.account(&session);
                 return Ok((sum, matched, counts));
             }
         }
@@ -810,7 +933,10 @@ pub fn sum_where(
         // code translation may select rows anywhere, which a bitmap carries
         // at one bit per row and the value page consumes in one pass.
         let selected = match action {
-            PageAction::Skip(_) => return Ok((0, 0, counts)),
+            PageAction::Skip(_) => {
+                counts.account(&session);
+                return Ok((0, 0, counts));
+            }
             PageAction::Translate(_) | PageAction::Scan => Selected::Bitmap(
                 execute_between_selection(selector_page, &mut session, &action, low, high)?,
             ),
@@ -826,11 +952,11 @@ pub fn sum_where(
             Selected::Spans(ranges) => ranges.iter().map(|range| range.len()).sum::<usize>(),
             Selected::Bitmap(selection) => selection.count(),
         };
+        counts.account(&session);
         if matched == 0 {
             return Ok((0, 0, counts));
         }
-        let mut session =
-            ReadSession::new_untracked(&value_page.column.page, ClosureMode::Selective);
+        let mut session = value_store.session(value_page, *index, Access::Execute)?;
         let sum_action = plan_sum(value_page, &mut session, planning)?;
         if matches!(sum_action, SumAction::Constant(_)) {
             counts.constant_sums += 1;
@@ -849,6 +975,7 @@ pub fn sum_where(
                 }
             }
         };
+        counts.account(&session);
         Ok((sum, matched, counts))
     })?;
     let mut total = 0_i128;
@@ -1224,10 +1351,18 @@ fn root_bounds(page: &Page) -> Vec<(FactScope, super::BoundSource)> {
 /// read from the encoded bytes; `None` when the page proves no bound. Next
 /// to `Page::stats` it measures how much slack a structural bound carries.
 pub fn derived_bounds(page: &Page) -> Result<Option<(i128, i128)>, String> {
-    let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+    derived_bounds_in(page, &mut untracked(page))
+}
+
+/// `derived_bounds`, reading the bound fields through `session`, so the
+/// reads land wherever the session's store keeps the page.
+pub fn derived_bounds_in(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+) -> Result<Option<(i128, i128)>, String> {
     let mut tightest: Option<(i128, i128)> = None;
     for (_, source) in root_bounds(page) {
-        let (lower, upper) = bound_interval(&mut session, source)?;
+        let (lower, upper) = bound_interval(session, source)?;
         tightest = Some(tightest.map_or((lower, upper), |(low, high)| {
             (low.max(lower), high.min(upper))
         }));

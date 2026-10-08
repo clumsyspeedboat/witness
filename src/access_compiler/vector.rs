@@ -618,6 +618,46 @@ pub fn sum_product_selection(
     Ok(total)
 }
 
+/// Rows of `rows` whose value, an id into a table of `hits.len()` entries,
+/// indexes an entry marked true. Every value must be a valid id.
+pub fn selection_by_table(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    rows: Span,
+    hits: &[bool],
+) -> Result<Selection, String> {
+    validate_rows(decoder, rows)?;
+    let mut selection = Selection::empty(rows);
+    let table = hits.iter().map(|&hit| u64::from(hit)).collect::<Vec<_>>();
+    let mut outside = false;
+    scan(decoder, session, rows, &mut |_, row, chunk| {
+        let offset = row - rows.start;
+        match chunk {
+            Chunk::Values(values) => {
+                for (index, &value) in values.iter().enumerate() {
+                    let hit = usize::try_from(value).ok().and_then(|id| table.get(id));
+                    outside |= hit.is_none();
+                    let bit = offset + index;
+                    selection.words[bit / 64] |= hit.copied().unwrap_or(0) << (bit % 64);
+                }
+            }
+            Chunk::Run { value, len } => {
+                match usize::try_from(value).ok().and_then(|id| table.get(id)) {
+                    Some(1) => selection.set_range(row, row + len),
+                    Some(_) => {}
+                    None => outside = true,
+                }
+            }
+            Chunk::Nulls { .. } => {}
+        }
+        Ok(())
+    })?;
+    if outside {
+        return Err("id lies outside its table".into());
+    }
+    Ok(selection)
+}
+
 /// How a fused pass may compare a selector page's codes: as values offset
 /// by a frame-of-reference base, or as ids into a sorted dictionary, which
 /// only a translation licence permits.
