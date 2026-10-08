@@ -13,6 +13,7 @@ mod interpreter;
 mod invariants;
 mod layout;
 pub mod paged;
+pub mod paged_file;
 mod plan;
 mod runtime;
 mod schedule;
