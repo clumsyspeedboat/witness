@@ -4,7 +4,7 @@ WitDictCells,14
 WitDictEntries,"2,522"
 WitDictProbes,24
 WitDictReduction,5461
-WitDictLatency,0.86
+WitDictLatency,0.83
 WitRleColumns,436
 WitRleReductionMedian,79
-WitRleLatency,0.100
+WitRleLatency,0.097

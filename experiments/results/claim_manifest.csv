@@ -4,28 +4,28 @@ WitColumns,72
 WitSources,32
 WitRowsPerColumn,"131,072"
 WitCells,152
-WitSourceDirectBoundaryMedian,0.13
+WitSourceDirectBoundaryMedian,0.14
 WitSourceDirectBoundaryCiLow,0.08
 WitSourceDirectBoundaryCiHigh,0.14
-WitSourceDirectStorageMedian,0.07
+WitSourceDirectStorageMedian,0.08
 WitSourceDirectStorageCiLow,0.05
-WitSourceDirectStorageCiHigh,0.09
-WitClusterDirectBoundaryMedian,0.13
+WitSourceDirectStorageCiHigh,0.10
+WitClusterDirectBoundaryMedian,0.14
 WitClusterDirectBoundaryCiLow,0.06
 WitClusterDirectBoundaryCiHigh,0.25
 WitFamilies,12
 WitFamilyWins,9
 WitFamilySignP,0.073
 WitFamilyWilcoxonP,0.012
-WitFamilyDirectBoundaryMedian,0.23
+WitFamilyDirectBoundaryMedian,0.24
 WitFamilyDirectBoundaryCiLow,0.09
-WitFamilyDirectBoundaryCiHigh,1.06
-WitClusterDirectStorageMedian,0.07
+WitFamilyDirectBoundaryCiHigh,1.03
+WitClusterDirectStorageMedian,0.08
 WitClusterDirectStorageCiLow,0.04
 WitClusterDirectStorageCiHigh,0.27
-WitFamilyDirectStorageMedian,0.19
+WitFamilyDirectStorageMedian,0.20
 WitFamilyDirectStorageCiLow,0.06
-WitFamilyDirectStorageCiHigh,0.49
+WitFamilyDirectStorageCiHigh,0.51
 WitCensusColumns,1784
 WitCensusSources,93
 WitCensusRowsMillions,112.3
@@ -49,30 +49,30 @@ WitCensusStructuralPremiumMedian,0.053
 WitCensusSegmentFraction,33.1
 WitCensusCandidates,27867
 WitDiscoveryShare,0.56
-WitDiscoveryShareTenth,0.63
-WitDiscoveryShareOnePct,0.62
+WitDiscoveryShareTenth,0.62
+WitDiscoveryShareOnePct,0.61
 WitDiscoveryShareTenPct,0.53
-WitDiscoveryShareFiftyPct,0.41
-WitKnownOverParquet,1.00
+WitDiscoveryShareFiftyPct,0.42
+WitKnownOverParquet,1.01
 WitKnownDirectOverParquet,0.14
-WitFilterBeatsScan,103
-WitCompleteOverScan,0.87
+WitFilterBeatsScan,97
+WitCompleteOverScan,0.86
 WitDirectOverStorage,0.11
-WitDirectOverBoundary,0.14
+WitDirectOverBoundary,0.15
 WitDirectOverBoundaryLargePage,0.07
 WitDirectBeatsBoundary,140
-WitStorageBeatsBoundary,56
-WitStorageOverBoundary,1.32
+WitStorageBeatsBoundary,55
+WitStorageOverBoundary,1.29
 WitAccessPremium,2.10
-WitSixteenKDirectOverBoundary,0.15
-WitSixteenKDirectOverStorage,0.12
-WitSixteenKDiscoveryShare,0.57
-WitSixteenKDirectBeatsBoundary,146
+WitSixteenKDirectOverBoundary,0.14
+WitSixteenKDirectOverStorage,0.11
+WitSixteenKDiscoveryShare,0.58
+WitSixteenKDirectBeatsBoundary,147
 WitBloomAbsentCells,1773
 WitBloomAbsentSources,93
 WitBloomAbsentCandidate,0.000
 WitBloomAbsentModeledBytes,0.172
-WitBloomAbsentLatency,0.004
+WitBloomAbsentLatency,0.005
 WitBloomAbsentCiLow,0.004
 WitBloomAbsentCiHigh,0.005
 WitBloomRareCells,1773
@@ -81,57 +81,57 @@ WitBloomRareCandidate,0.013
 WitBloomRareModeledBytes,0.186
 WitBloomRareLatency,0.021
 WitBloomRareCiLow,0.017
-WitBloomRareCiHigh,0.072
+WitBloomRareCiHigh,0.062
 WitBloomFrequentCells,1773
 WitBloomFrequentSources,93
 WitBloomFrequentCandidate,1.000
 WitBloomFrequentModeledBytes,1.172
-WitBloomFrequentLatency,0.765
+WitBloomFrequentLatency,0.766
 WitBloomFrequentCiLow,0.625
-WitBloomFrequentCiHigh,0.927
+WitBloomFrequentCiHigh,0.931
 WitBloomInCells,1773
 WitBloomInSources,93
 WitBloomInCandidate,1.000
 WitBloomInModeledBytes,1.172
-WitBloomInLatency,0.806
-WitBloomInCiLow,0.643
-WitBloomInCiHigh,0.916
+WitBloomInLatency,0.779
+WitBloomInCiLow,0.645
+WitBloomInCiHigh,0.922
 WitFenceRareCells,164
 WitFenceRareSources,91
 WitFenceRareCandidate,1.000
 WitFenceRareModeledBytes,1.167
-WitFenceRareLatency,0.621
+WitFenceRareLatency,0.587
 WitFenceRareCiLow,0.044
-WitFenceRareCiHigh,1.522
+WitFenceRareCiHigh,1.510
 WitColdRequiredMb,20.44
 WitColdFileMb,27.68
 WitColdPageCalls,1083
 WitColdCoalescedCalls,119
 WitColdFullCalls,1
 WitColdCoalescedMb,22.80
-WitColdPageOverFull,1.30
-WitColdSortedOverFull,1.01
-WitColdCoalescedOverFull,1.00
+WitColdPageOverFull,1.26
+WitColdSortedOverFull,0.99
+WitColdCoalescedOverFull,0.98
 WitNonMonotoneSources,6
 WitNonMonotoneCells,40
 WitNonMonotoneDirectOverBoundary,0.47
-WitNonMonotoneDirectOverEqualPage,0.62
+WitNonMonotoneDirectOverEqualPage,0.63
 WitNonMonotoneDirectWins,4
 WitMonotoneSources,26
 WitMonotoneCells,112
 WitMonotoneDirectOverBoundary,0.10
 WitMonotoneDirectOverEqualPage,0.04
 WitMonotoneDirectWins,25
-WitFrontierPlot,"(2.108,0.393)(3.963,0.170)(1.111,0.882)(4.672,0.324)(6.468,0.084)(5.039,0.143)(2.034,0.041)(4.412,0.054)(3.088,0.061)(1.652,0.051)(2.778,0.056)(2.015,0.039)(1.694,0.042)(2.486,0.041)(2.247,0.041)(2.410,0.042)(2.075,0.048)(2.685,0.044)(3.673,0.077)(4.452,0.090)(7.101,0.067)(12.812,0.092)(5.304,0.091)(5.106,0.096)(6.915,0.069)(5.793,0.093)(9.431,0.091)(7.693,0.052)(1.070,0.929)(1.820,0.017)(1.840,0.592)(1.799,0.207)"
-WitFrontierCloudwatchPlot,"(6.468,0.084)(5.039,0.143)(2.034,0.041)(4.412,0.054)(3.088,0.061)(1.652,0.051)"
-WitFrontierTrafficPlot,"(2.015,0.039)(1.694,0.042)(2.486,0.041)(2.247,0.041)(2.410,0.042)(2.075,0.048)(2.685,0.044)"
-WitFrontierTweetsPlot,"(3.673,0.077)(4.452,0.090)(7.101,0.067)(12.812,0.092)(5.304,0.091)(5.106,0.096)(6.915,0.069)(5.793,0.093)(9.431,0.091)(7.693,0.052)"
-WitFrontierSingletonPlot,"(1.070,0.929)(1.111,0.882)(1.799,0.207)(1.820,0.017)(1.840,0.592)(2.108,0.393)(2.778,0.056)(3.963,0.170)(4.672,0.324)"
+WitFrontierPlot,"(2.108,0.422)(3.963,0.169)(1.111,0.887)(4.672,0.318)(6.468,0.084)(5.039,0.146)(2.034,0.042)(4.412,0.056)(3.088,0.062)(1.652,0.051)(2.778,0.057)(2.015,0.041)(1.694,0.040)(2.486,0.042)(2.247,0.043)(2.410,0.044)(2.075,0.048)(2.685,0.045)(3.673,0.076)(4.452,0.086)(7.101,0.067)(12.812,0.094)(5.304,0.096)(5.106,0.098)(6.915,0.074)(5.793,0.095)(9.431,0.092)(7.693,0.053)(1.070,0.923)(1.820,0.016)(1.840,0.589)(1.799,0.228)"
+WitFrontierCloudwatchPlot,"(6.468,0.084)(5.039,0.146)(2.034,0.042)(4.412,0.056)(3.088,0.062)(1.652,0.051)"
+WitFrontierTrafficPlot,"(2.015,0.041)(1.694,0.040)(2.486,0.042)(2.247,0.043)(2.410,0.044)(2.075,0.048)(2.685,0.045)"
+WitFrontierTweetsPlot,"(3.673,0.076)(4.452,0.086)(7.101,0.067)(12.812,0.094)(5.304,0.096)(5.106,0.098)(6.915,0.074)(5.793,0.095)(9.431,0.092)(7.693,0.053)"
+WitFrontierSingletonPlot,"(1.070,0.923)(1.111,0.887)(1.799,0.228)(1.820,0.016)(1.840,0.589)(2.108,0.422)(2.778,0.057)(3.963,0.169)(4.672,0.318)"
 WitFrontierSingletons,9
-WitCurveMonotonePlot,"(0.1,0.0631)(1.0,0.0691)(10.0,0.1537)(50.0,0.2018)"
-WitEcdfMonotonePlot,"(0.0347,0.0089)(0.0380,0.0179)(0.0380,0.0268)(0.0383,0.0357)(0.0383,0.0446)(0.0387,0.0536)(0.0390,0.0625)(0.0414,0.0714)(0.0429,0.0804)(0.0434,0.0893)(0.0440,0.0982)(0.0452,0.1071)(0.0459,0.1161)(0.0464,0.1250)(0.0469,0.1339)(0.0474,0.1429)(0.0481,0.1518)(0.0504,0.1607)(0.0512,0.1696)(0.0519,0.1786)(0.0524,0.1875)(0.0542,0.1964)(0.0543,0.2054)(0.0560,0.2143)(0.0569,0.2232)(0.0621,0.2321)(0.0623,0.2411)(0.0626,0.2500)(0.0636,0.2589)(0.0639,0.2679)(0.0644,0.2768)(0.0645,0.2857)(0.0646,0.2946)(0.0647,0.3036)(0.0649,0.3125)(0.0651,0.3214)(0.0659,0.3304)(0.0667,0.3393)(0.0669,0.3482)(0.0674,0.3571)(0.0675,0.3661)(0.0678,0.3750)(0.0678,0.3839)(0.0684,0.3929)(0.0685,0.4018)(0.0697,0.4107)(0.0706,0.4196)(0.0772,0.4286)(0.0780,0.4375)(0.0888,0.4464)(0.0895,0.4554)(0.0901,0.4643)(0.0904,0.4732)(0.0911,0.4821)(0.0924,0.4911)(0.0928,0.5000)(0.0934,0.5089)(0.0936,0.5179)(0.0949,0.5268)(0.0973,0.5357)(0.0979,0.5446)(0.1014,0.5536)(0.1018,0.5625)(0.1038,0.5714)(0.1047,0.5804)(0.1147,0.5893)(0.1149,0.5982)(0.1236,0.6071)(0.1239,0.6161)(0.1292,0.6250)(0.1315,0.6339)(0.1348,0.6429)(0.1512,0.6518)(0.1565,0.6607)(0.1726,0.6696)(0.1735,0.6786)(0.1800,0.6875)(0.1821,0.6964)(0.1825,0.7054)(0.1852,0.7143)(0.1863,0.7232)(0.1863,0.7321)(0.1894,0.7411)(0.1925,0.7500)(0.1929,0.7589)(0.1940,0.7679)(0.1950,0.7768)(0.1968,0.7857)(0.2112,0.7946)(0.2248,0.8036)(0.2440,0.8125)(0.2443,0.8214)(0.2681,0.8304)(0.2698,0.8393)(0.2720,0.8482)(0.2776,0.8571)(0.2878,0.8661)(0.2958,0.8750)(0.2958,0.8839)(0.2966,0.8929)(0.3029,0.9018)(0.3029,0.9107)(0.3153,0.9196)(0.3196,0.9286)(0.4123,0.9375)(0.5834,0.9464)(0.7862,0.9554)(0.8751,0.9643)(1.9874,0.9732)(2.1244,0.9821)(2.5796,0.9911)(2.5931,1.0000)"
-WitCurveNoFactPlot,"(0.1,0.2120)(1.0,0.1956)(10.0,0.3137)(50.0,0.5249)"
-WitEcdfNoFactPlot,"(0.0033,0.0250)(0.0098,0.0500)(0.0112,0.0750)(0.0698,0.1000)(0.1645,0.1250)(0.1727,0.1500)(0.1911,0.1750)(0.1952,0.2000)(0.1956,0.2250)(0.1994,0.2500)(0.2076,0.2750)(0.2086,0.3000)(0.2097,0.3250)(0.2154,0.3500)(0.2173,0.3750)(0.2719,0.4000)(0.2762,0.4250)(0.2892,0.4500)(0.3137,0.4750)(0.3599,0.5000)(0.4042,0.5250)(0.4320,0.5500)(0.4620,0.5750)(0.5180,0.6000)(0.5228,0.6250)(0.5270,0.6500)(0.5671,0.6750)(0.5998,0.7000)(0.6778,0.7250)(0.6856,0.7500)(0.7850,0.7750)(0.9257,0.8000)(1.1692,0.8250)(1.2255,0.8500)(1.8123,0.8750)(1.8145,0.9000)(2.3186,0.9250)(2.6767,0.9500)(2.7836,0.9750)(2.7948,1.0000)"
+WitCurveMonotonePlot,"(0.1,0.0634)(1.0,0.0688)(10.0,0.1556)(50.0,0.2007)"
+WitEcdfMonotonePlot,"(0.0345,0.0089)(0.0372,0.0179)(0.0373,0.0268)(0.0377,0.0357)(0.0379,0.0446)(0.0379,0.0536)(0.0380,0.0625)(0.0382,0.0714)(0.0407,0.0804)(0.0420,0.0893)(0.0425,0.0982)(0.0436,0.1071)(0.0454,0.1161)(0.0454,0.1250)(0.0462,0.1339)(0.0465,0.1429)(0.0485,0.1518)(0.0488,0.1607)(0.0505,0.1696)(0.0514,0.1786)(0.0519,0.1875)(0.0533,0.1964)(0.0548,0.2054)(0.0567,0.2143)(0.0585,0.2232)(0.0603,0.2321)(0.0623,0.2411)(0.0633,0.2500)(0.0634,0.2589)(0.0636,0.2679)(0.0637,0.2768)(0.0639,0.2857)(0.0643,0.2946)(0.0647,0.3036)(0.0649,0.3125)(0.0654,0.3214)(0.0656,0.3304)(0.0661,0.3393)(0.0662,0.3482)(0.0662,0.3571)(0.0671,0.3661)(0.0672,0.3750)(0.0675,0.3839)(0.0682,0.3929)(0.0690,0.4018)(0.0692,0.4107)(0.0705,0.4196)(0.0764,0.4286)(0.0770,0.4375)(0.0886,0.4464)(0.0893,0.4554)(0.0896,0.4643)(0.0898,0.4732)(0.0900,0.4821)(0.0906,0.4911)(0.0910,0.5000)(0.0912,0.5089)(0.0924,0.5179)(0.0930,0.5268)(0.0973,0.5357)(0.0976,0.5446)(0.0997,0.5536)(0.1014,0.5625)(0.1042,0.5714)(0.1054,0.5804)(0.1092,0.5893)(0.1145,0.5982)(0.1224,0.6071)(0.1225,0.6161)(0.1279,0.6250)(0.1301,0.6339)(0.1361,0.6429)(0.1548,0.6518)(0.1591,0.6607)(0.1715,0.6696)(0.1750,0.6786)(0.1808,0.6875)(0.1843,0.6964)(0.1846,0.7054)(0.1865,0.7143)(0.1913,0.7232)(0.1916,0.7321)(0.1927,0.7411)(0.1927,0.7500)(0.1952,0.7589)(0.1955,0.7679)(0.1964,0.7768)(0.1978,0.7857)(0.2086,0.7946)(0.2230,0.8036)(0.2406,0.8125)(0.2469,0.8214)(0.2717,0.8304)(0.2733,0.8393)(0.2734,0.8482)(0.2774,0.8571)(0.2845,0.8661)(0.3005,0.8750)(0.3027,0.8839)(0.3044,0.8929)(0.3072,0.9018)(0.3087,0.9107)(0.3180,0.9196)(0.3241,0.9286)(0.4100,0.9375)(0.5808,0.9464)(0.7547,0.9554)(0.8699,0.9643)(1.8907,0.9732)(2.1095,0.9821)(2.4643,0.9911)(2.5889,1.0000)"
+WitCurveNoFactPlot,"(0.1,0.2423)(1.0,0.2221)(10.0,0.3118)(50.0,0.5335)"
+WitEcdfNoFactPlot,"(0.0033,0.0250)(0.0098,0.0500)(0.0112,0.0750)(0.0714,0.1000)(0.1718,0.1250)(0.1849,0.1500)(0.2012,0.1750)(0.2135,0.2000)(0.2188,0.2250)(0.2221,0.2500)(0.2373,0.2750)(0.2381,0.3000)(0.2398,0.3250)(0.2424,0.3500)(0.2464,0.3750)(0.2852,0.4000)(0.2896,0.4250)(0.3042,0.4500)(0.3118,0.4750)(0.3624,0.5000)(0.4168,0.5250)(0.4445,0.5500)(0.4671,0.5750)(0.5286,0.6000)(0.5291,0.6250)(0.5379,0.6500)(0.5544,0.6750)(0.5892,0.7000)(0.6680,0.7250)(0.6888,0.7500)(0.7883,0.7750)(0.9293,0.8000)(1.3204,0.8250)(1.3349,0.8500)(2.0561,0.8750)(2.1347,0.9000)(2.3070,0.9250)(2.6546,0.9500)(3.2347,0.9750)(3.2709,1.0000)"
 WitCensusGroupRows,"clickbench & 77 & 5.05 & 22.1 & 30.5 \\
 household & 8 & 0.52 & 12.5 & 16.6 \\
 large & 18 & 1.18 & 0.0 & 0.0 \\
@@ -153,12 +153,12 @@ WitDictCells,14
 WitDictEntries,"2,522"
 WitDictProbes,24
 WitDictReduction,5461
-WitDictLatency,0.86
+WitDictLatency,0.83
 WitRleColumns,436
 WitRleReductionMedian,79
-WitRleLatency,0.100
+WitRleLatency,0.097
 WitCrateVersion,0.2.0
-WitRuleFingerprint,0x6a5e5c8d177627c7
+WitRuleFingerprint,0x89babf06a8f56497
 WitCertificateHeaderBytes,16
 WitPagedPairs,364
 WitPagedTables,63
@@ -166,46 +166,46 @@ WitPagedPageRows,"16,384"
 WitPagedPagesMedian,62
 WitPagedCells,"1,166"
 WitPagedPlainMedian,0.33
-WitPagedPlainWins,"1,120"
+WitPagedPlainWins,"1,121"
 WitPagedPlainTenth,0.42
-WitPagedPlainOnePct,0.42
+WitPagedPlainOnePct,0.41
 WitPagedPlainTenPct,0.27
 WitPagedPlainFiftyPct,0.22
 WitPagedZstdMedian,0.21
-WitPagedZstdWins,"1,154"
+WitPagedZstdWins,"1,157"
 WitPagedZstdTenth,0.24
 WitPagedZstdOnePct,0.24
 WitPagedZstdTenPct,0.18
 WitPagedZstdFiftyPct,0.16
 WitPagedCompactZstdMedian,0.60
-WitPagedCompactZstdWins,948
+WitPagedCompactZstdWins,954
 WitPagedScanOverPlainMedian,0.36
 WitPagedFactsOverScanGeo,0.89
 WitPagedSkippedPages,9.1
 WitPagedBoundSkipRecovery,96.8
 WitPagedBoundAcceptRecovery,95.5
-WitPagedDeriveNsPerPage,262
-WitPagedPlanNsPerPage,109
+WitPagedDeriveNsPerPage,266
+WitPagedPlanNsPerPage,107
 WitPagedPlanBytesPerPage,8.5
-WitPagedPlanOverScanPercent,0.21
+WitPagedPlanOverScanPercent,0.22
 WitPagedDirectOverPlainBytes,1.02
 WitScaleRows,"59,986,052"
 WitScalePages,"3,662"
 WitScaleQueries,35
-WitScaleOneThreadOverParquet,0.19
+WitScaleOneThreadOverParquet,0.21
 WitScaleOneThreadWins,35
-WitScaleSpeedupSixtyFour,20.5
-WitScaleSpeedupPlot,"(1,1.00)(2,1.81)(4,3.55)(8,6.65)(16,9.74)(32,13.82)(64,20.48)"
+WitScaleSpeedupSixtyFour,20.3
+WitScaleSpeedupPlot,"(1,1.00)(2,1.81)(4,3.52)(8,6.58)(16,9.69)(32,13.97)(64,20.27)"
 WitPagedDecisionRows,"0.1\% & 10.3 & 2.0 & 0.6 & 30.0 & 57.2 \\
 1\% & 8.7 & 0.0 & 0.1 & 24.5 & 66.7 \\
 10\% & 11.6 & 1.3 & 0.3 & 27.4 & 59.5 \\
 50\% & 5.8 & 6.2 & 0.6 & 28.4 & 59.0 \\"
-WitPagedGroupRows,"Public BI & 248 & 0.34 & 0.22 & 10.6 \\
-TPC-DS & 75 & 0.28 & 0.20 & 4.2 \\
+WitPagedGroupRows,"Public BI & 248 & 0.34 & 0.21 & 10.6 \\
+TPC-DS & 75 & 0.29 & 0.20 & 4.2 \\
 TPC-H & 18 & 0.40 & 0.19 & 0.0 \\
-ClickBench & 8 & 0.68 & 0.59 & 0.0 \\
-Household & 7 & 0.42 & 0.33 & 15.1 \\
-NYC taxi & 8 & 0.34 & 0.20 & 18.2 \\"
+ClickBench & 8 & 0.67 & 0.59 & 0.0 \\
+Household & 7 & 0.41 & 0.33 & 15.1 \\
+NYC taxi & 8 & 0.32 & 0.20 & 18.2 \\"
 WitCensusGroupIncidenceRows,"Public BI & 1380 & 0.1 & 10.8 & 18.9 & 1.3 \\
 TPC-DS & 224 & 13.8 & 0.0 & 2.6 & 13.0 \\
 TPC-H & 29 & 20.7 & 0.0 & 3.8 & 19.5 \\
@@ -214,37 +214,37 @@ NAB & 48 & 50.0 & 0.0 & 0.0 & 50.0 \\
 Household & 8 & 12.5 & 0.0 & 4.1 & 12.5 \\
 NYC taxi & 18 & 0.0 & 0.0 & 0.0 & 0.0 \\"
 WitScaleOrderkeyTenthMs,0.05
-WitScaleOrderkeyTenthParquetMs,0.57
-WitScaleOrderkeyFiftyPctMs,17.69
-WitScaleOrderkeyFiftyPctParquetMs,142.09
+WitScaleOrderkeyTenthParquetMs,0.63
+WitScaleOrderkeyFiftyPctMs,17.44
+WitScaleOrderkeyFiftyPctParquetMs,127.24
 WitPagedFactsOverZonemapGeo,0.96
 WitPagedFactsOverZonemapMedian,1.00
-WitPagedFactsBeatZonemap,135
-WitPagedFactsTrailZonemap,60
+WitPagedFactsBeatZonemap,134
+WitPagedFactsTrailZonemap,58
 WitPagedFactsOverZonemapTenth,1.00
 WitPagedFactsOverZonemapOnePct,1.00
 WitPagedFactsOverZonemapTenPct,1.00
 WitPagedFactsOverZonemapFiftyPct,1.00
 WitPagedZonemapOverScanGeo,0.93
-WitPagedZonemapOverPlainMedian,0.34
-WitPagedFactsOverBestPlainMedian,0.46
-WitPagedFactsOverBestPlainWins,"1,083"
-WitPagedFactsOverBestPlainTenth,0.49
-WitPagedFactsOverBestPlainOnePct,0.47
-WitPagedFactsOverBestPlainTenPct,0.43
+WitPagedZonemapOverPlainMedian,0.33
+WitPagedFactsOverBestPlainMedian,0.44
+WitPagedFactsOverBestPlainWins,"1,085"
+WitPagedFactsOverBestPlainTenth,0.48
+WitPagedFactsOverBestPlainOnePct,0.46
+WitPagedFactsOverBestPlainTenPct,0.42
 WitPagedFactsOverBestPlainFiftyPct,0.37
 WitPagedNoIndexOverIndexedMedian,0.71
 WitPagedNoIndexOverIndexedTenth,0.90
-WitPagedFactsOverNoIndexMedian,0.44
+WitPagedFactsOverNoIndexMedian,0.43
 WitPagedRowsFourKPlainMedian,0.31
-WitPagedRowsFourKFactsOverZonemapGeo,1.02
+WitPagedRowsFourKFactsOverZonemapGeo,1.01
 WitPagedRowsFourKDirectOverPlainBytes,1.05
 WitPagedRowsSixtyFourKPlainMedian,0.34
-WitPagedRowsSixtyFourKFactsOverZonemapGeo,0.92
+WitPagedRowsSixtyFourKFactsOverZonemapGeo,0.93
 WitPagedRowsSixtyFourKDirectOverPlainBytes,1.00
-WitPagedSizeRows,"4,096 & 0.31 & 1.02 & 1.05 & 0.82 \\
-16,384 & 0.33 & 0.96 & 1.02 & 0.21 \\
-65,536 & 0.34 & 0.92 & 1.00 & 0.05 \\"
+WitPagedSizeRows,"4,096 & 0.31 & 1.01 & 1.05 & 0.86 \\
+16,384 & 0.33 & 0.96 & 1.02 & 0.22 \\
+65,536 & 0.34 & 0.93 & 1.00 & 0.06 \\"
 WitBoundsPages,"17,738"
 WitBoundsBoundedPercent,89.7
 WitBoundsExactPercent,55.4
@@ -259,37 +259,37 @@ WitCheckerAccepted,"7,617"
 WitCheckerHarmful,"379,753"
 WitCheckerHarmfulRejected,"379,753"
 WitCheckerHarmlessRejected,"103,522"
-WitDuckNativeMedian,0.69
-WitDuckNativeWins,883
+WitDuckNativeMedian,0.68
+WitDuckNativeWins,872
 WitDuckNativeQueries,"1,166"
-WitDuckParquetMedian,0.43
-WitDuckParquetWins,"1,107"
+WitDuckParquetMedian,0.42
+WitDuckParquetWins,"1,095"
 WitDuckParquetQueries,"1,166"
 WitDuckScannedPercent,100
 WitDuckNativeTenth,0.69
-WitDuckNativeOnePct,0.72
+WitDuckNativeOnePct,0.71
 WitDuckNativeTenPct,0.67
-WitDuckNativeFiftyPct,0.68
-WitDuckScaleOrderkeyTenthMs,1.02
-WitDuckScaleOrderkeyFiftyPctMs,59.59
-WitDuckScaleOneMedian,0.62
+WitDuckNativeFiftyPct,0.67
+WitDuckScaleOrderkeyTenthMs,0.99
+WitDuckScaleOrderkeyFiftyPctMs,56.62
+WitDuckScaleOneMedian,0.65
 WitDuckScaleOneWins,35
-WitDuckScaleSixtyFourMedian,0.62
+WitDuckScaleSixtyFourMedian,0.74
 WitDuckScaleSixtyFourWins,35
 WitDuckVersion,1.5.3
-WitDuckClientFloorUs,113
-WitConjunctiveRows,"Q6 & 1 & 314.9 & 325.3 & 326.0 & 281.9 \\
-Q6 & 64 & 12.5 & 12.1 & 12.1 & 10.2 \\
-Q6, key range & 1 & 44.4 & 43.7 & 213.6 & 42.3 \\
-Q6, key range & 64 & 3.9 & 4.6 & 10.0 & 3.4 \\"
-WitQSixFactsOverDuckOne,1.12
-WitQSixFactsOverZonemapOne,0.97
-WitQSixFactsOverDuckSixtyFour,1.22
-WitQSixFactsOverZonemapSixtyFour,1.03
-WitQSixKeyFactsOverDuckOne,1.05
+WitDuckClientFloorUs,114
+WitConjunctiveRows,"Q6 & 1 & 315.3 & 393.8 & 332.4 & 290.7 \\
+Q6 & 64 & 11.0 & 11.4 & 11.6 & 10.7 \\
+Q6, key range & 1 & 47.6 & 46.8 & 219.4 & 42.9 \\
+Q6, key range & 64 & 4.2 & 4.4 & 8.7 & 3.6 \\"
+WitQSixFactsOverDuckOne,1.08
+WitQSixFactsOverZonemapOne,0.80
+WitQSixFactsOverDuckSixtyFour,1.03
+WitQSixFactsOverZonemapSixtyFour,0.97
+WitQSixKeyFactsOverDuckOne,1.11
 WitQSixKeyFactsOverZonemapOne,1.02
-WitQSixKeyFactsOverDuckSixtyFour,1.16
-WitQSixKeyFactsOverZonemapSixtyFour,0.84
+WitQSixKeyFactsOverDuckSixtyFour,1.15
+WitQSixKeyFactsOverZonemapSixtyFour,0.95
 WitQSixKeySkippedPercent,85.7
 WitParquetHeaderSkipRecovery,33.0
 WitParquetHeaderAcceptRecovery,46.4
@@ -302,15 +302,51 @@ WitPagedFactsOverZonemapGeoCiHigh,0.99
 WitPagedFactsOverZonemapGeoRunLow,0.96
 WitPagedFactsOverZonemapGeoRunHigh,0.96
 WitPagedPlainMedianCiLow,0.31
-WitPagedPlainMedianCiHigh,0.35
+WitPagedPlainMedianCiHigh,0.36
 WitPagedPlainMedianRunLow,0.33
 WitPagedPlainMedianRunHigh,0.33
 WitDuckNativeMedianCiLow,0.66
-WitDuckNativeMedianCiHigh,0.74
-WitDuckNativeMedianRunLow,0.69
-WitDuckNativeMedianRunHigh,0.69
-WitScaleSpeedupSixtyFourRunLow,19.1
-WitScaleSpeedupSixtyFourRunHigh,20.5
-WitQSixFactsOverDuckOneRunLow,1.08
-WitQSixFactsOverDuckOneRunHigh,1.12
+WitDuckNativeMedianCiHigh,0.72
+WitDuckNativeMedianRunLow,0.68
+WitDuckNativeMedianRunHigh,0.68
+WitScaleSpeedupSixtyFourRunLow,17.9
+WitScaleSpeedupSixtyFourRunHigh,20.3
+WitQSixFactsOverDuckOneRunLow,0.95
+WitQSixFactsOverDuckOneRunHigh,1.08
 WitRuns,3
+WitIntPairs,364
+WitIntQueries,"1,166"
+WitIntFactsOverZonemapGeo,0.96
+WitIntFactsOverScanGeo,0.89
+WitIntDuckMedian,0.68
+WitIntDuckWins,872
+WitFloatPairs,182
+WitFloatQueries,645
+WitFloatFactsOverZonemapGeo,0.94
+WitFloatFactsOverScanGeo,0.91
+WitFloatDuckMedian,0.27
+WitFloatDuckWins,634
+WitStringPairs,352
+WitStringQueries,"1,313"
+WitStringFactsOverZonemapGeo,0.64
+WitStringFactsOverScanGeo,0.40
+WitStringDuckMedian,0.14
+WitStringDuckWins,"1,313"
+WitTypeRows,"integers & 364 & 1,166 & 0.96 & 0.89 & 0.68 \\
+floats & 182 & 645 & 0.94 & 0.91 & 0.27 \\
+strings & 352 & 1,313 & 0.64 & 0.40 & 0.14 \\"
+WitStringFactsBeatZonemap,827
+WitStringFactsTrailZonemap,54
+WitStringProbesFactsMillions,0.9
+WitStringProbesScanMillions,143
+WitStringProbesRatio,162
+WitStringGroups,4
+WitColdRows,"sorted key, 0.1\% & 177.3 (7,329) & 4.0 (9) & 4.2 (11) & 2.6 (12) \\
+sorted key, 50\% & 254.4 (9,155) & 49.4 (1,835) & 49.6 (1,837) & 259.6 (3,665) \\
+unclustered & 157.4 (7,324) & 156.6 (7,324) & 160.0 (7,324) & 658.8 (10,986) \\"
+WitColdPagesOverScanUnclustered,4.2
+WitColdAuditBoundsMs,428
+WitColdAuditBoundsKib,29
+WitColdAuditZoneMs,181
+WitColdAuditZoneKib,108338
+WitColdRepeats,3

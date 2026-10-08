@@ -20,7 +20,7 @@ These constraints are part of the result.
   The separate paged study compares complete queries across multiple pages;
   its medians summarize the fixed workload rather than a population sample.
 - Access-ready Witness versus the Parquet boundary-search path has source
-  median 0.13x with a 95% bootstrap interval [0.08, 0.14]. The interval sits
+  median 0.14x with a 95% bootstrap interval [0.08, 0.14]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
   (families, then sources within each) gives [0.06, 0.30]. Collapsing each
@@ -68,7 +68,7 @@ These constraints are part of the result.
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.30x a full read; coalescing issued 119 calls and reached 1.00x. This is a
+  1.26x a full read; coalescing issued 119 calls and reached 0.98x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is
@@ -107,9 +107,16 @@ These constraints are part of the result.
 - The calculus covers value, mapping, and access facts over bitpack, FOR,
   signed/unsigned delta, dictionary, RLE, patch, nullable, and framed
   compositions.
-- It does not derive bounded disorder, cross-column dependencies, floating
-  point ordering under NaN semantics, approximate facts, or arbitrary decoder
-  programs.
+- Doubles are queried through order-preserving integer keys
+  (`access_compiler::floats`), with -0.0 folded into 0.0 and NaN stored as
+  null; strings through sorted per-page dictionaries
+  (`access_compiler::strings`), whose order is checked evidence from the
+  writer. Pattern predicates other than prefixes are not planned.
+- It does not derive bounded disorder, cross-column dependencies,
+  approximate facts, or arbitrary decoder programs.
+- The paged cold-read study (`paged_cold_study`) evicts the OS page cache
+  and confirms eviction with `mincore`, but cannot clear the RAID
+  controller's cache, so it too is OS-cold, not device-cold.
 - Structural facts assume checked arithmetic. Checked facts trust the encoder
   and an authenticated descriptor checksum. The checksum detects accidental
   or test tampering; it is not a cryptographic trust system.
