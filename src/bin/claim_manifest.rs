@@ -865,6 +865,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     uncertainty_claims(&mut out)?;
     type_claims(&mut out)?;
     cold_claims(&mut out)?;
+    ablation_claims(&mut out)?;
 
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
@@ -2541,6 +2542,161 @@ fn cold_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
     }
     let freeze = read_csv(&format!("{COLD}/freeze.csv"))?;
     define(out, "WitColdRepeats", &freeze.field(&freeze[0], "repeats")?);
+    Ok(())
+}
+
+/// The planner ablation: where skips and accepts come from (stored
+/// statistics or the encoding) crossed with whether the encoding's shortcuts
+/// (search, code translation, the column certificate) are allowed, each
+/// relative to the plain zone map; for the integer and float studies, with a
+/// bootstrap interval over pairs. Also Q6 under every planner, and which
+/// actions each encoding received.
+fn ablation_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let cells = [
+        ("witness_direct_zonemap", "stored", "no"),
+        ("witness_direct_factbounds", "derived", "no"),
+        ("witness_direct_zonemapplus", "stored", "yes"),
+        ("witness_direct_facts", "derived", "yes"),
+    ];
+    let geometric: Statistic = geometric_mean;
+    let mut table = String::new();
+    for (label, prefix, latency) in [
+        ("integers", "WitInt", paged_latency(PAGED)?),
+        ("floats", "WitFloat", paged_latency(FLOAT)?),
+    ] {
+        let mut row = Vec::new();
+        for (arm, bounds, shortcuts) in cells {
+            let clusters = pair_ratios(&latency, arm, "witness_direct_zonemap");
+            let value = geometric_mean(&clusters.concat());
+            let (low, high) = pair_bootstrap(&clusters, geometric, 2_000);
+            let name = format!(
+                "{prefix}{}{}OverZonemap",
+                if bounds == "derived" {
+                    "Derived"
+                } else {
+                    "Stored"
+                },
+                if shortcuts == "yes" { "Shortcuts" } else { "" }
+            );
+            define(out, &name, &format!("{value:.2}"));
+            define(out, &format!("{name}CiLow"), &format!("{low:.2}"));
+            define(out, &format!("{name}CiHigh"), &format!("{high:.2}"));
+            row.push(format!("{value:.2} [{low:.2}, {high:.2}]"));
+        }
+        writeln!(table, "{label} & {} \\\\", row.join(" & "))?;
+    }
+    define(out, "WitAblationRows", table.trim_end());
+
+    // Q6 and its key-range variant under every planner, 1 and 64 threads.
+    let times = conjunctive_times(CONJUNCTIVE, DUCKDB)?;
+    let get = |query: &str, arm: &str, threads: &str| {
+        times
+            .get(&(query.to_string(), arm.to_string(), threads.to_string()))
+            .copied()
+            .ok_or_else(|| format!("conjunctive study lacks {query} {arm} x{threads}"))
+    };
+    let mut table = String::new();
+    for (query, label) in [("q6", "Q6"), ("q6_orderkey", "Q6, key range")] {
+        for threads in ["1", "64"] {
+            let cells = [
+                "witness_direct_facts",
+                "witness_direct_factbounds",
+                "witness_direct_zonemapplus",
+                "witness_direct_zonemap",
+                "witness_direct_scan",
+                "duckdb",
+            ]
+            .iter()
+            .map(|arm| Ok(format!("{:.1}", get(query, arm, threads)? / 1e6)))
+            .collect::<Result<Vec<_>, String>>()?;
+            writeln!(table, "{label} & {threads} & {} \\\\", cells.join(" & "))?;
+        }
+    }
+    define(out, "WitConjunctiveAblationRows", table.trim_end());
+    define(
+        out,
+        "WitQSixFactsOverFactBoundsOne",
+        &format!(
+            "{:.2}",
+            get("q6", "witness_direct_facts", "1")? / get("q6", "witness_direct_factbounds", "1")?
+        ),
+    );
+    define(
+        out,
+        "WitQSixZonemapPlusOverZonemapOne",
+        &format!(
+            "{:.2}",
+            get("q6", "witness_direct_zonemapplus", "1")?
+                / get("q6", "witness_direct_zonemap", "1")?
+        ),
+    );
+    let freeze = read_csv(&format!("{CONJUNCTIVE}/freeze.csv"))?;
+    define(
+        out,
+        "WitConjunctiveRounds",
+        &freeze.field(&freeze[0], "rounds")?,
+    );
+
+    // Actions the facts planner gave each encoding over all paged queries.
+    let actions = read_csv(&format!("{PAGED}/actions.csv"))?;
+    let mut by_recipe = BTreeMap::<String, BTreeMap<String, f64>>::new();
+    for row in &actions {
+        *by_recipe
+            .entry(actions.field(row, "recipe")?)
+            .or_default()
+            .entry(actions.field(row, "action")?)
+            .or_default() += actions.field(row, "pages")?.parse::<f64>()?;
+    }
+    let shortcut = ["search", "search_piecewise", "translate"];
+    let licensed = by_recipe
+        .values()
+        .filter(|actions| {
+            actions
+                .iter()
+                .any(|(action, pages)| action != "scan" && *pages > 0.0)
+        })
+        .count();
+    let with_shortcuts = by_recipe
+        .values()
+        .filter(|actions| {
+            shortcut
+                .iter()
+                .any(|action| actions.get(*action).is_some_and(|pages| *pages > 0.0))
+        })
+        .count();
+    define(out, "WitEncodingsDistinct", &by_recipe.len().to_string());
+    define(out, "WitEncodingsLicensed", &licensed.to_string());
+    define(
+        out,
+        "WitEncodingsWithShortcuts",
+        &with_shortcuts.to_string(),
+    );
+    let mut ranked = by_recipe
+        .iter()
+        .map(|(recipe, actions)| (actions.values().sum::<f64>(), recipe, actions))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let mut table = String::new();
+    for (total, recipe, actions) in ranked.into_iter().take(6) {
+        let share = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| actions.get(*name).copied().unwrap_or(0.0))
+                .sum::<f64>()
+                * 100.0
+                / total
+        };
+        writeln!(
+            table,
+            "\\texttt{{{}}} & {:.0} & {:.0} & {:.0} & {:.0} \\\\",
+            recipe.replace('_', "\\_"),
+            share(&["skip", "accept"]),
+            share(&["search", "search_piecewise"]),
+            share(&["translate"]),
+            share(&["scan"]),
+        )?;
+    }
+    define(out, "WitEncodingRows", table.trim_end());
     Ok(())
 }
 
