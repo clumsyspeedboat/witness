@@ -29,12 +29,20 @@ if ! have_net; then
   exit 0
 fi
 
-# --- NAB (reuse the cached python downloader; flattened names) ---
-python3 - <<'PY'
-from eval.corpora import try_download
-got = try_download()
-print(f"NAB: {len(got)} files present")
-PY
+# --- NAB: the series the canonical study reads, under flattened names, copied
+# from the pinned and hash-checked checkout that fetch_nab_real.sh made ---
+for series in realKnownCause/nyc_taxi realKnownCause/ambient_temperature_system_failure \
+              realTweets/Twitter_volume_AAPL; do
+  src="$DATA/nab/$series.csv"
+  dst="$DATA/${series%%/*}__${series#*/}.csv"
+  if [ ! -f "$dst" ]; then
+    if [ -f "$src" ]; then
+      cp "$src" "$dst"
+    else
+      echo "missing $src; run experiments/fetch_nab_real.sh first" >&2
+    fi
+  fi
+done
 for f in "$DATA"/realKnownCause__*.csv "$DATA"/realTweets__*.csv "$DATA"/artificialNoAnomaly__*.csv "$DATA"/realAWSCloudwatch__*.csv; do
   [ -f "$f" ] && row "NAB" "$(basename "$f")" "$(sha "$f" | cut -c1-12)" "$(($(wc -l < "$f")-1))" "github.com/numenta/NAB"
 done
