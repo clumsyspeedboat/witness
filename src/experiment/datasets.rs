@@ -110,14 +110,39 @@ pub struct StudyTable {
 /// Only exact columns are kept, and a table keeps the columns sharing its
 /// most common length so that rows stay aligned.
 pub fn paged_study_tables(max_rows: usize) -> Result<Vec<StudyTable>, Box<dyn Error>> {
+    study_tables(max_rows, false)
+}
+
+/// The paged study's tables with their floating-point columns kept as well,
+/// each stored as order-preserving integer keys (`floats::key`) under its
+/// name with an `_f64` suffix; NaN becomes null.
+pub fn float_key_tables(max_rows: usize) -> Result<Vec<StudyTable>, Box<dyn Error>> {
+    study_tables(max_rows, true)
+}
+
+fn study_tables(max_rows: usize, floats: bool) -> Result<Vec<StudyTable>, Box<dyn Error>> {
     let mut grouped = BTreeMap::<(String, String), Vec<Column>>::new();
     let mut add = |column: Column| {
-        if column.exact_i64 {
-            grouped
-                .entry((column.group.clone(), column.source.clone()))
-                .or_default()
-                .push(column);
-        }
+        let column = if column.exact_i64 {
+            column
+        } else if let (true, Some(values)) = (floats, &column.float_values) {
+            Column {
+                name: format!("{}_f64", column.name),
+                values: values
+                    .iter()
+                    .map(|value| value.and_then(crate::access_compiler::floats::key))
+                    .collect(),
+                float_values: None,
+                exact_i64: true,
+                ..column.clone()
+            }
+        } else {
+            return;
+        };
+        grouped
+            .entry((column.group.clone(), column.source.clone()))
+            .or_default()
+            .push(column);
     };
     for (group, directory) in CENSUS_DIRECTORIES {
         dir_columns_prefix(group, directory, Some(max_rows))?

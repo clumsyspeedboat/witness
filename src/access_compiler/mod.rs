@@ -14,6 +14,7 @@ mod invariants;
 mod layout;
 pub mod paged;
 pub mod paged_file;
+pub mod floats;
 mod plan;
 mod runtime;
 mod schedule;

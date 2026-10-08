@@ -180,6 +180,11 @@ path = "src/bin/paged_cold_study.rs"
 required-features = ["experiment"]
 
 [[bin]]
+name = "paged_float_study"
+path = "src/bin/paged_float_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
 name = "claim_manifest"
 path = "src/bin/claim_manifest.rs"
 required-features = ["experiment"]
