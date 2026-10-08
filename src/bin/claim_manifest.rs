@@ -863,6 +863,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     conjunctive_claims(&mut out)?;
     parquet_facts_claims(&mut out)?;
     uncertainty_claims(&mut out)?;
+    type_claims(&mut out)?;
+    cold_claims(&mut out)?;
 
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
@@ -2297,6 +2299,243 @@ fn uncertainty_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         );
     }
     define(out, "WitRuns", &runs.len().to_string());
+    Ok(())
+}
+
+const FLOAT: &str = "experiments/results/paged_float";
+const STRING: &str = "experiments/results/paged_string";
+const COLD: &str = "experiments/results/paged_cold";
+
+/// Median time per (pair, predicate) and arm of a pair study, with DuckDB's
+/// native time from `duckdb_file` as arm `duckdb`.
+fn pair_latency(dir: &str, duckdb_file: &str) -> Result<Latency, Box<dyn Error>> {
+    let mut latency = paged_latency(dir)?;
+    let duck = read_csv(duckdb_file)?;
+    for row in &duck {
+        if duck.field(row, "engine")? != "duckdb_native" {
+            continue;
+        }
+        let pair = duck
+            .field(row, "table")?
+            .strip_prefix("pair_")
+            .ok_or("DuckDB table is not a pair")?
+            .to_string();
+        latency
+            .entry((pair, duck.field(row, "predicate")?))
+            .or_default()
+            .insert("duckdb".into(), duck.field(row, "median_ns")?.parse()?);
+    }
+    Ok(latency)
+}
+
+/// Claims for floating-point and string selectors, and a table row per
+/// data type comparing the planners and DuckDB.
+fn type_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let integers = paged_latency_with_duckdb(PAGED, DUCKDB)?;
+    let floats = pair_latency(FLOAT, &format!("{DUCKDB}/float.csv"))?;
+    let strings = pair_latency(STRING, &format!("{DUCKDB}/string.csv"))?;
+    let mut table = String::new();
+    for (label, prefix, latency, pairs_dir) in [
+        ("integers", "WitInt", &integers, PAGED),
+        ("floats", "WitFloat", &floats, FLOAT),
+        ("strings", "WitString", &strings, STRING),
+    ] {
+        let zonemap = arm_ratios(
+            latency,
+            "witness_direct_facts",
+            "witness_direct_zonemap",
+            None,
+        );
+        let scan = arm_ratios(latency, "witness_direct_facts", "witness_direct_scan", None);
+        let duck = arm_ratios(latency, "witness_direct_facts", "duckdb", None);
+        let pairs = read_csv(&format!("{pairs_dir}/pairs.csv"))?.len();
+        define(
+            out,
+            &format!("{prefix}Pairs"),
+            &group_digits(&pairs.to_string()),
+        );
+        define(
+            out,
+            &format!("{prefix}Queries"),
+            &group_digits(&latency.len().to_string()),
+        );
+        define(
+            out,
+            &format!("{prefix}FactsOverZonemapGeo"),
+            &format!("{:.2}", geometric_mean(&zonemap)),
+        );
+        define(
+            out,
+            &format!("{prefix}FactsOverScanGeo"),
+            &format!("{:.2}", geometric_mean(&scan)),
+        );
+        define(
+            out,
+            &format!("{prefix}DuckMedian"),
+            &format!("{:.2}", median(&duck)),
+        );
+        define(
+            out,
+            &format!("{prefix}DuckWins"),
+            &group_digits(
+                &duck
+                    .iter()
+                    .filter(|ratio| **ratio < 1.0)
+                    .count()
+                    .to_string(),
+            ),
+        );
+        writeln!(
+            table,
+            "{label} & {} & {} & {:.2} & {:.2} & {:.2} \\\\",
+            group_digits(&pairs.to_string()),
+            group_digits(&latency.len().to_string()),
+            geometric_mean(&zonemap),
+            geometric_mean(&scan),
+            median(&duck),
+        )?;
+    }
+    define(out, "WitTypeRows", table.trim_end());
+    let zonemap = arm_ratios(
+        &strings,
+        "witness_direct_facts",
+        "witness_direct_zonemap",
+        None,
+    );
+    for (name, keep) in [
+        (
+            "WitStringFactsBeatZonemap",
+            (|ratio: f64| ratio < 0.95) as fn(f64) -> bool,
+        ),
+        ("WitStringFactsTrailZonemap", |ratio: f64| ratio > 1.05),
+    ] {
+        let count = zonemap.iter().filter(|ratio| keep(**ratio)).count();
+        define(out, name, &group_digits(&count.to_string()));
+    }
+    // Dictionary entries each planner reads over all string queries.
+    let queries = read_csv(&format!("{STRING}/queries.csv"))?;
+    let mut probes = BTreeMap::<String, f64>::new();
+    for row in &queries {
+        *probes.entry(queries.field(row, "arm")?).or_default() +=
+            queries.field(row, "probes")?.parse::<f64>()?;
+    }
+    let get = |arm: &str| probes.get(arm).copied().ok_or("string study lacks an arm");
+    define(
+        out,
+        "WitStringProbesFactsMillions",
+        &format!("{:.1}", get("witness_direct_facts")? / 1e6),
+    );
+    define(
+        out,
+        "WitStringProbesScanMillions",
+        &format!("{:.0}", get("witness_direct_scan")? / 1e6),
+    );
+    define(
+        out,
+        "WitStringProbesRatio",
+        &format!(
+            "{:.0}",
+            get("witness_direct_scan")? / get("witness_direct_facts")?
+        ),
+    );
+    let groups = read_csv(&format!("{STRING}/pairs.csv"))?
+        .iter()
+        .map(|row| row[1].clone())
+        .collect::<BTreeSet<_>>();
+    define(out, "WitStringGroups", &groups.len().to_string());
+    Ok(())
+}
+
+/// Claims from the cold-read study: each planner's median time and reads,
+/// for the sorted key and for unclustered columns, and what auditing each
+/// footer costs.
+fn cold_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let queries = read_csv(&format!("{COLD}/queries.csv"))?;
+    // Median over repeats per (selector, predicate, arm).
+    let mut runs = BTreeMap::<(String, String, String), Vec<(f64, f64)>>::new();
+    for row in &queries {
+        runs.entry((
+            queries.field(row, "selector")?,
+            queries.field(row, "predicate")?,
+            queries.field(row, "arm")?,
+        ))
+        .or_default()
+        .push((
+            queries.field(row, "ns")?.parse::<f64>()?,
+            queries.field(row, "io_operations")?.parse::<f64>()?,
+        ));
+    }
+    let cell = |selector_is_key: bool, predicate: Option<&str>, arm: &str| {
+        let times = runs
+            .iter()
+            .filter(|((selector, label, kind), _)| {
+                kind == arm
+                    && selector.contains("orderkey") == selector_is_key
+                    && predicate.is_none_or(|predicate| label.split('+').next() == Some(predicate))
+            })
+            .map(|(_, values)| median(&values.iter().map(|value| value.0).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let reads = runs
+            .iter()
+            .filter(|((selector, label, kind), _)| {
+                kind == arm
+                    && selector.contains("orderkey") == selector_is_key
+                    && predicate.is_none_or(|predicate| label.split('+').next() == Some(predicate))
+            })
+            .map(|(_, values)| values[0].1)
+            .collect::<Vec<_>>();
+        (median(&times) / 1e6, median(&reads))
+    };
+    let arms = ["scan", "zonemap_footer", "facts_footer", "facts_pages"];
+    let mut table = String::new();
+    for (label, key, predicate) in [
+        ("sorted key, 0.1\\%", true, Some("0.1pct")),
+        ("sorted key, 50\\%", true, Some("50pct")),
+        ("unclustered", false, None),
+    ] {
+        let cells = arms
+            .iter()
+            .map(|arm| {
+                let (ms, reads) = cell(key, predicate, arm);
+                format!("{ms:.1} ({})", group_digits(&format!("{reads:.0}")))
+            })
+            .collect::<Vec<_>>();
+        writeln!(table, "{label} & {} \\\\", cells.join(" & "))?;
+    }
+    define(out, "WitColdRows", table.trim_end());
+    let (scan, _) = cell(false, None, "scan");
+    let (pages, _) = cell(false, None, "facts_pages");
+    define(
+        out,
+        "WitColdPagesOverScanUnclustered",
+        &format!("{:.1}", pages / scan),
+    );
+    let audits = read_csv(&format!("{COLD}/audit.csv"))?;
+    for (summary, prefix) in [
+        ("derived_bounds", "WitColdAuditBounds"),
+        ("zone_map", "WitColdAuditZone"),
+    ] {
+        let mut times = Vec::new();
+        let mut bytes = Vec::new();
+        for row in &audits {
+            if audits.field(row, "summary")? == summary {
+                times.push(audits.field(row, "ns")?.parse::<f64>()? / 1e6);
+                bytes.push(audits.field(row, "io_bytes")?.parse::<f64>()?);
+            }
+        }
+        define(
+            out,
+            &format!("{prefix}Ms"),
+            &format!("{:.0}", median(&times)),
+        );
+        define(
+            out,
+            &format!("{prefix}Kib"),
+            &format!("{:.0}", median(&bytes) / 1024.0),
+        );
+    }
+    let freeze = read_csv(&format!("{COLD}/freeze.csv"))?;
+    define(out, "WitColdRepeats", &freeze.field(&freeze[0], "repeats")?);
     Ok(())
 }
 
