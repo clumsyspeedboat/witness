@@ -860,6 +860,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     paged_claims(&mut out)?;
     separation_claims(&mut out)?;
+    conjunctive_claims(&mut out)?;
+    parquet_facts_claims(&mut out)?;
+    uncertainty_claims(&mut out)?;
 
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
@@ -1947,6 +1950,353 @@ fn separation_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         .field(&version[0], "client_floor_ns")?
         .parse::<f64>()?;
     define(out, "WitDuckClientFloorUs", &format!("{:.0}", floor / 1e3));
+    Ok(())
+}
+
+const CONJUNCTIVE: &str = "experiments/results/paged_conjunctive";
+
+/// A summary of a sample of ratios.
+type Statistic = fn(&[f64]) -> f64;
+
+/// Median time per (query, arm, threads).
+type QueryTimes = BTreeMap<(String, String, String), f64>;
+const PARQUET_FACTS: &str = "experiments/results/parquet_facts";
+/// Repeated runs of the timed paged studies, beside the canonical one.
+const REPEATS: [&str; 2] = [
+    "experiments/results/repeats/run2",
+    "experiments/results/repeats/run3",
+];
+
+/// Median query time per (query, arm, threads) of the conjunctive study,
+/// with DuckDB's native engine as arm `duckdb`.
+fn conjunctive_times(dir: &str, duckdb: &str) -> Result<QueryTimes, Box<dyn Error>> {
+    let queries = read_csv(&format!("{dir}/queries.csv"))?;
+    let mut times = BTreeMap::new();
+    for row in &queries {
+        times.insert(
+            (
+                queries.field(row, "query")?,
+                queries.field(row, "arm")?,
+                queries.field(row, "threads")?,
+            ),
+            queries.field(row, "median_ns")?.parse::<f64>()?,
+        );
+    }
+    let duck = read_csv(&format!("{duckdb}/conjunctive.csv"))?;
+    for row in &duck {
+        if duck.field(row, "engine")? == "duckdb_native" {
+            times.insert(
+                (
+                    duck.field(row, "predicate")?,
+                    "duckdb".to_string(),
+                    duck.field(row, "threads")?,
+                ),
+                duck.field(row, "median_ns")?.parse::<f64>()?,
+            );
+        }
+    }
+    Ok(times)
+}
+
+/// Claims from the conjunctive study: TPC-H Q6 on SF10 lineitem and the
+/// same query on a range of the sorted order key, under each planner and on
+/// DuckDB, on 1 and 64 threads.
+fn conjunctive_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let times = conjunctive_times(CONJUNCTIVE, DUCKDB)?;
+    let get = |query: &str, arm: &str, threads: &str| {
+        times
+            .get(&(query.to_string(), arm.to_string(), threads.to_string()))
+            .copied()
+            .ok_or_else(|| format!("conjunctive study lacks {query} {arm} x{threads}"))
+    };
+    let mut table = String::new();
+    for (query, label) in [("q6", "Q6"), ("q6_orderkey", "Q6, key range")] {
+        for threads in ["1", "64"] {
+            let cells = [
+                "witness_direct_facts",
+                "witness_direct_zonemap",
+                "witness_direct_scan",
+                "duckdb",
+            ]
+            .iter()
+            .map(|arm| Ok(format!("{:.1}", get(query, arm, threads)? / 1e6)))
+            .collect::<Result<Vec<_>, String>>()?;
+            writeln!(table, "{label} & {threads} & {} \\\\", cells.join(" & "))?;
+        }
+    }
+    define(out, "WitConjunctiveRows", table.trim_end());
+    for (query, prefix) in [("q6", "WitQSix"), ("q6_orderkey", "WitQSixKey")] {
+        for (threads, suffix) in [("1", "One"), ("64", "SixtyFour")] {
+            define(
+                out,
+                &format!("{prefix}FactsOverDuck{suffix}"),
+                &format!(
+                    "{:.2}",
+                    get(query, "witness_direct_facts", threads)? / get(query, "duckdb", threads)?
+                ),
+            );
+            define(
+                out,
+                &format!("{prefix}FactsOverZonemap{suffix}"),
+                &format!(
+                    "{:.2}",
+                    get(query, "witness_direct_facts", threads)?
+                        / get(query, "witness_direct_zonemap", threads)?
+                ),
+            );
+        }
+    }
+    let queries = read_csv(&format!("{CONJUNCTIVE}/queries.csv"))?;
+    for row in &queries {
+        if queries.field(row, "query")? == "q6_orderkey"
+            && queries.field(row, "arm")? == "witness_direct_facts"
+            && queries.field(row, "threads")? == "1"
+        {
+            let skipped = queries.field(row, "skipped")?.parse::<f64>()?;
+            let pages = queries.field(row, "pages")?.parse::<f64>()?;
+            define(
+                out,
+                "WitQSixKeySkippedPercent",
+                &format!("{:.1}", skipped * 100.0 / pages),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Claims from reading Parquet's delta encoding headers as facts.
+fn parquet_facts_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let queries = read_csv(&format!("{PARQUET_FACTS}/queries.csv"))?;
+    let mut sums = [0_usize; 4];
+    for row in &queries {
+        for (slot, name) in [
+            "exact_skipped",
+            "exact_accepted",
+            "header_skipped",
+            "header_accepted",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sums[slot] += queries.field(row, name)?.parse::<usize>()?;
+        }
+    }
+    let percent =
+        |part: usize, whole: usize| format!("{:.1}", part as f64 * 100.0 / whole.max(1) as f64);
+    define(
+        out,
+        "WitParquetHeaderSkipRecovery",
+        &percent(sums[2], sums[0]),
+    );
+    define(
+        out,
+        "WitParquetHeaderAcceptRecovery",
+        &percent(sums[3], sums[1]),
+    );
+    let pages = read_csv(&format!("{PARQUET_FACTS}/pages.csv"))?;
+    let (mut valued, mut ordered, mut exact, mut header_bytes, mut value_bytes) = (0, 0, 0, 0, 0);
+    for row in &pages {
+        if pages.field(row, "stat_low")?.is_empty() {
+            continue;
+        }
+        valued += 1;
+        ordered += usize::from(pages.field(row, "non_decreasing")? == "true");
+        exact += usize::from(
+            pages.field(row, "header_low")? == pages.field(row, "stat_low")?
+                && pages.field(row, "header_high")? == pages.field(row, "stat_high")?,
+        );
+        header_bytes += pages.field(row, "header_bytes")?.parse::<usize>()?;
+        value_bytes += pages.field(row, "value_bytes")?.parse::<usize>()?;
+    }
+    define(out, "WitParquetPages", &group_digits(&valued.to_string()));
+    define(
+        out,
+        "WitParquetNonDecreasingPercent",
+        &percent(ordered, valued),
+    );
+    define(out, "WitParquetExactBoundsPercent", &percent(exact, valued));
+    define(
+        out,
+        "WitParquetHeaderBytesPercent",
+        &format!("{:.2}", header_bytes as f64 * 100.0 / value_bytes as f64),
+    );
+    Ok(())
+}
+
+/// Bootstrap over pairs: resample whole pairs with replacement, since the
+/// queries of one pair share columns and are not independent.
+fn pair_bootstrap(clusters: &[Vec<f64>], statistic: Statistic, repetitions: usize) -> (f64, f64) {
+    assert!(!clusters.is_empty());
+    let mut state = 0x6a09_e667_f3bc_c909_u64;
+    let mut estimates = Vec::with_capacity(repetitions);
+    let mut sample = Vec::new();
+    for _ in 0..repetitions {
+        sample.clear();
+        for _ in 0..clusters.len() {
+            sample.extend_from_slice(&clusters[xorshift64(&mut state) as usize % clusters.len()]);
+        }
+        estimates.push(statistic(&sample));
+    }
+    estimates.sort_by(f64::total_cmp);
+    (
+        estimates[(repetitions * 25 / 1_000).min(repetitions - 1)],
+        estimates[(repetitions * 975 / 1_000).min(repetitions - 1)],
+    )
+}
+
+/// `numerator / denominator` per pair, for every query that measured both.
+fn pair_ratios(latency: &Latency, numerator: &str, denominator: &str) -> Vec<Vec<f64>> {
+    let mut clusters = BTreeMap::<&str, Vec<f64>>::new();
+    for ((pair, _), arms) in latency {
+        if let (Some(top), Some(bottom)) = (arms.get(numerator), arms.get(denominator)) {
+            clusters.entry(pair).or_default().push(top / bottom);
+        }
+    }
+    clusters.into_values().collect()
+}
+
+/// Paged-study latency with DuckDB's native time as arm `duckdb`.
+fn paged_latency_with_duckdb(dir: &str, duckdb: &str) -> Result<Latency, Box<dyn Error>> {
+    let mut latency = paged_latency(dir)?;
+    let duck = read_csv(&format!("{duckdb}/paged.csv"))?;
+    for row in &duck {
+        if duck.field(row, "engine")? != "duckdb_native" {
+            continue;
+        }
+        let pair = duck
+            .field(row, "table")?
+            .strip_prefix("pair_")
+            .ok_or("DuckDB paged table is not a pair")?
+            .to_string();
+        latency
+            .entry((pair, duck.field(row, "predicate")?))
+            .or_default()
+            .insert("duckdb".into(), duck.field(row, "median_ns")?.parse()?);
+    }
+    Ok(latency)
+}
+
+/// Median speedup on 64 threads over one in the scale study.
+fn scale_speedup(dir: &str) -> Result<f64, Box<dyn Error>> {
+    let scale = read_csv(&format!("{dir}/scaling.csv"))?;
+    let mut times = BTreeMap::<(String, String, String), f64>::new();
+    for row in &scale {
+        if scale.field(row, "arm")? == "witness_direct_facts" {
+            times.insert(
+                (
+                    scale.field(row, "selector")?,
+                    scale.field(row, "predicate")?,
+                    scale.field(row, "threads")?,
+                ),
+                scale.field(row, "median_ns")?.parse()?,
+            );
+        }
+    }
+    let speedups = times
+        .iter()
+        .filter(|((_, _, threads), _)| threads == "1")
+        .filter_map(|((selector, predicate, _), one)| {
+            Some(one / times.get(&(selector.clone(), predicate.clone(), "64".to_string()))?)
+        })
+        .collect::<Vec<_>>();
+    Ok(median(&speedups))
+}
+
+/// How much the headline numbers move: a 95% bootstrap interval over pairs
+/// within the canonical run, and the range over the canonical run and its
+/// repeats.
+fn uncertainty_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let geometric: Statistic = geometric_mean;
+    let middle: Statistic = median;
+    let headlines: [(&str, &str, &str, Statistic); 3] = [
+        (
+            "WitPagedFactsOverZonemapGeo",
+            "witness_direct_facts",
+            "witness_direct_zonemap",
+            geometric,
+        ),
+        (
+            "WitPagedPlainMedian",
+            "witness_direct_facts",
+            "parquet_plain_indexed",
+            middle,
+        ),
+        (
+            "WitDuckNativeMedian",
+            "witness_direct_facts",
+            "duckdb",
+            middle,
+        ),
+    ];
+    let runs = std::iter::once((
+        PAGED.to_string(),
+        PAGED_SCALE.to_string(),
+        CONJUNCTIVE.to_string(),
+        DUCKDB.to_string(),
+    ))
+    .chain(REPEATS.iter().map(|dir| {
+        (
+            format!("{dir}/paged_study"),
+            format!("{dir}/paged_scale"),
+            format!("{dir}/paged_conjunctive"),
+            format!("{dir}/duckdb"),
+        )
+    }))
+    .collect::<Vec<_>>();
+    let canonical = paged_latency_with_duckdb(PAGED, DUCKDB)?;
+    for (name, numerator, denominator, statistic) in headlines {
+        let clusters = pair_ratios(&canonical, numerator, denominator);
+        let (low, high) = pair_bootstrap(&clusters, statistic, 2_000);
+        define(out, &format!("{name}CiLow"), &format!("{low:.2}"));
+        define(out, &format!("{name}CiHigh"), &format!("{high:.2}"));
+        let mut values = Vec::new();
+        for (paged, _, _, duckdb) in &runs {
+            let latency = paged_latency_with_duckdb(paged, duckdb)?;
+            let ratios = pair_ratios(&latency, numerator, denominator).concat();
+            values.push(statistic(&ratios));
+        }
+        values.sort_by(f64::total_cmp);
+        define(out, &format!("{name}RunLow"), &format!("{:.2}", values[0]));
+        define(
+            out,
+            &format!("{name}RunHigh"),
+            &format!("{:.2}", values[values.len() - 1]),
+        );
+    }
+    let mut speedups = Vec::new();
+    let mut q6 = Vec::new();
+    for (_, scale, conjunctive, duckdb) in &runs {
+        speedups.push(scale_speedup(scale)?);
+        let times = conjunctive_times(conjunctive, duckdb)?;
+        let key =
+            |arm: &str, threads: &str| ("q6".to_string(), arm.to_string(), threads.to_string());
+        q6.push(
+            times
+                .get(&key("witness_direct_facts", "1"))
+                .ok_or("Q6 run lacks facts")?
+                / times
+                    .get(&key("duckdb", "1"))
+                    .ok_or("Q6 run lacks DuckDB")?,
+        );
+    }
+    for (name, mut values) in [
+        ("WitScaleSpeedupSixtyFour", speedups),
+        ("WitQSixFactsOverDuckOne", q6),
+    ] {
+        values.sort_by(f64::total_cmp);
+        let digits = if name.starts_with("WitScale") { 1 } else { 2 };
+        define(
+            out,
+            &format!("{name}RunLow"),
+            &format!("{:.*}", digits, values[0]),
+        );
+        define(
+            out,
+            &format!("{name}RunHigh"),
+            &format!("{:.*}", digits, values[values.len() - 1]),
+        );
+    }
+    define(out, "WitRuns", &runs.len().to_string());
     Ok(())
 }
 
