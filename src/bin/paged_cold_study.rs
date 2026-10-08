@@ -7,7 +7,8 @@
 //! - `zonemap_footer`: read the footer's exact per-page minima and maxima in
 //!   one read, then plan from them;
 //! - `facts_footer`: read the footer's derived bounds in one read, then plan
-//!   from them as from a zone map;
+//!   from them as from a zone map, re-deriving the bound of every page the
+//!   query reads from the bytes it read, so only unread pages rely on it;
 //! - `facts_pages`: plan every page from the facts its own fields prove, which
 //!   reads those fields from each page.
 //!
@@ -229,7 +230,14 @@ fn cold_query(
             }) {
                 return Err("footer disagrees with the column it was written from".into());
             }
-            (column, Planning::StoredStatistics)
+            // A footer of derived bounds is checked against every page the
+            // query reads; a zone map can only be trusted.
+            let planning = if matches!(arm, Arm::ZoneMapFooter) {
+                Planning::StoredStatistics
+            } else {
+                Planning::DerivedFooter
+            };
+            (column, planning)
         }
     };
     let selector_store = file_store(&selector_file, &selector_layout);

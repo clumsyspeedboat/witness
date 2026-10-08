@@ -95,11 +95,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Planning::ScanOnly,
                 Planning::StoredStatistics,
             ] {
-                let arm = match planning {
-                    Planning::Facts => "witness_direct_facts",
-                    Planning::ScanOnly => "witness_direct_scan",
-                    Planning::StoredStatistics => "witness_direct_zonemap",
-                };
+                let arm = format!("witness_direct_{}", planning.label());
+                let arm = arm.as_str();
                 for threads in THREADS {
                     let run = || {
                         paged::sum_where(

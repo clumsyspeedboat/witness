@@ -54,25 +54,49 @@ pub fn compact_menu() -> Vec<Recipe> {
 
 /// p25, median, and p75 of five calibrated repetitions, each long enough to
 /// take at least `TARGET_NS`.
-pub fn benchmark<T, F>(mut run: F) -> Result<(f64, f64, f64), String>
+pub fn benchmark<T, F>(run: F) -> Result<(f64, f64, f64), String>
 where
     F: FnMut() -> Result<T, String>,
 {
-    black_box(run()?);
-    let started = Instant::now();
-    black_box(run()?);
-    let probe = started.elapsed().as_nanos().max(1);
-    let iterations = usize::try_from((TARGET_NS / probe).clamp(1, 1_000)).unwrap();
-    let mut samples = Vec::with_capacity(REPEATS);
-    for _ in 0..REPEATS {
+    let mut runs = [run];
+    let [quartiles] = interleaved(&mut runs, REPEATS)?;
+    Ok(quartiles)
+}
+
+/// p25, median, and p75 of each of `runs` over `rounds` rounds; every round
+/// times each run once, in turn, so slow drift in the machine falls on all
+/// runs alike. Each timing repeats its run until it takes at least
+/// `TARGET_NS`.
+pub fn interleaved<T, F, const N: usize>(
+    runs: &mut [F; N],
+    rounds: usize,
+) -> Result<[(f64, f64, f64); N], String>
+where
+    F: FnMut() -> Result<T, String>,
+{
+    let mut iterations = [1_usize; N];
+    for (run, count) in runs.iter_mut().zip(&mut iterations) {
+        black_box(run()?);
         let started = Instant::now();
-        for _ in 0..iterations {
-            black_box(run()?);
-        }
-        samples.push(started.elapsed().as_nanos() as f64 / iterations as f64);
+        black_box(run()?);
+        let probe = started.elapsed().as_nanos().max(1);
+        *count = usize::try_from((TARGET_NS / probe).clamp(1, 1_000)).unwrap();
     }
-    samples.sort_by(f64::total_cmp);
-    Ok((samples[1], samples[2], samples[3]))
+    let mut samples = [(); N].map(|_| Vec::with_capacity(rounds));
+    for _ in 0..rounds {
+        for ((run, count), samples) in runs.iter_mut().zip(&iterations).zip(&mut samples) {
+            let started = Instant::now();
+            for _ in 0..*count {
+                black_box(run()?);
+            }
+            samples.push(started.elapsed().as_nanos() as f64 / *count as f64);
+        }
+    }
+    Ok(samples.map(|mut samples| {
+        samples.sort_by(f64::total_cmp);
+        let at = |fraction: usize| samples[(samples.len() - 1) * fraction / 4];
+        (at(1), at(2), at(3))
+    }))
 }
 
 /// The page size of this run: `WITNESS_PAGE_ROWS`, or `PAGE_ROWS`.

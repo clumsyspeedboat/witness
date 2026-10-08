@@ -21,10 +21,19 @@ use witness::access_compiler::paged::{
 };
 use witness::experiment::datasets::scale_columns;
 
-use common::{PAGE_ROWS, benchmark, csv, direct_menu};
+use common::{PAGE_ROWS, csv, direct_menu, interleaved};
 
 const DEFAULT_RESULT_DIR: &str = "experiments/results/paged_conjunctive";
 const THREADS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+/// Every planner, timed in interleaved rounds so drift falls on all alike.
+const PLANNERS: [Planning; 5] = [
+    Planning::Facts,
+    Planning::StoredStatistics,
+    Planning::ScanOnly,
+    Planning::FactBounds,
+    Planning::StoredStatisticsPlus,
+];
+const ROUNDS: usize = 21;
 
 /// Columns the queries read, by a fragment of their corpus name, and the
 /// name the exported table gives them.
@@ -125,23 +134,33 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
             .collect::<Vec<_>>();
         let aggregate = Aggregate::SumProduct(&layouts[PRICE], &layouts[DISCOUNT]);
-        for (planning, arm) in [
-            (Planning::Facts, "witness_direct_facts"),
-            (Planning::StoredStatistics, "witness_direct_zonemap"),
-            (Planning::ScanOnly, "witness_direct_scan"),
-        ] {
-            for threads in THREADS {
-                let run = || paged::aggregate_where(&conjuncts, aggregate, planning, threads);
-                let (sum, matched, counts) = run()?;
+        for threads in THREADS {
+            let conjuncts = &conjuncts;
+            let make = |planning| {
+                move || {
+                    paged::aggregate_where(conjuncts, aggregate, planning, threads)
+                        .map(|(sum, _, _)| sum)
+                }
+            };
+            let mut counts = Vec::with_capacity(PLANNERS.len());
+            for planning in PLANNERS {
+                let (sum, matched, page_counts) =
+                    paged::aggregate_where(conjuncts, aggregate, planning, threads)?;
                 if (sum, matched) != expected {
                     return Err(format!(
-                        "{arm} x{threads} returned {:?} for {}, expected {expected:?}",
+                        "{} x{threads} returned {:?} for {}, expected {expected:?}",
+                        planning.label(),
                         (sum, matched),
                         query.name
                     )
                     .into());
                 }
-                let (p25, median, p75) = benchmark(|| run().map(|(sum, _, _)| sum))?;
+                counts.push(page_counts);
+            }
+            let mut runs = PLANNERS.map(make);
+            let timings = interleaved(&mut runs, ROUNDS)?;
+            for ((planning, counts), (p25, median, p75)) in PLANNERS.iter().zip(counts).zip(timings)
+            {
                 let PageCounts {
                     skipped,
                     accepted,
@@ -152,10 +171,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } = counts;
                 writeln!(
                     output,
-                    "{},{arm},{threads},{},{},{p25:.1},{median:.1},{p75:.1},{matched},{skipped},{accepted},{searched},{translated},{scanned}",
+                    "{},witness_direct_{},{threads},{},{},{p25:.1},{median:.1},{p75:.1},{},{skipped},{accepted},{searched},{translated},{scanned}",
                     query.name,
+                    planning.label(),
                     values[0].len(),
                     layouts[0].pages().len(),
+                    expected.1,
                 )?;
             }
         }
@@ -164,6 +185,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     spec.flush()?;
     output.flush()?;
     export(&format!("{result_dir}/parquet"), &values)?;
+    fs::write(
+        format!("{result_dir}/freeze.csv"),
+        format!(
+            "rule_fingerprint,page_rows,rounds\n{:#018x},{PAGE_ROWS},{ROUNDS}\n",
+            witness::access_compiler::primitive_rule_fingerprint()
+        ),
+    )?;
     Ok(())
 }
 

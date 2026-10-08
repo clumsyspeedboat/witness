@@ -68,6 +68,20 @@ impl Outcome {
 
 type Tally = BTreeMap<(Family, bool, Outcome), usize>;
 
+/// Pages per (encoding, action) under the facts planner.
+type Actions = BTreeMap<(String, &'static str), usize>;
+
+fn action_name(action: &PageAction) -> &'static str {
+    match action {
+        PageAction::Skip(_) => "skip",
+        PageAction::Accept(_) => "accept",
+        PageAction::Search { .. } => "search",
+        PageAction::SearchPiecewise { .. } => "search_piecewise",
+        PageAction::Translate(_) => "translate",
+        PageAction::Scan => "scan",
+    }
+}
+
 pub fn run(
     result_dir: &str,
     columns: &[Column],
@@ -82,11 +96,23 @@ pub fn run(
         )
     })?;
     let mut total = Tally::new();
-    for tally in tallies {
+    let mut actions = Actions::new();
+    for (tally, pair_actions) in tallies {
         for (key, count) in tally {
             *total.entry(key).or_default() += count;
         }
+        for (key, count) in pair_actions {
+            *actions.entry(key).or_default() += count;
+        }
     }
+    // Which action each encoding received: shortcuts that follow from the
+    // derivation rules, with no planner code specific to any composition.
+    let mut by_encoding = csv(format!("{result_dir}/actions.csv"))?;
+    writeln!(by_encoding, "recipe,action,pages")?;
+    for ((recipe, action), pages) in &actions {
+        writeln!(by_encoding, "\"{recipe}\",{action},{pages}")?;
+    }
+    by_encoding.flush()?;
     let mut output = csv(format!("{result_dir}/checker.csv"))?;
     writeln!(output, "family,checker,outcome,mutants")?;
     for ((family, accepted, outcome), count) in &total {
@@ -110,7 +136,7 @@ pub fn run(
     Ok(())
 }
 
-fn mutate_pair(pages: &[Page], selector: &Column) -> Result<Tally, String> {
+fn mutate_pair(pages: &[Page], selector: &Column) -> Result<(Tally, Actions), String> {
     let predicates = predicates(&selector.values).map_err(|error| error.to_string())?;
     // plans[predicate][page]: the checked fact plan.
     let mut plans = Vec::with_capacity(predicates.len());
@@ -127,6 +153,14 @@ fn mutate_pair(pages: &[Page], selector: &Column) -> Result<Tally, String> {
             )?);
         }
         plans.push(row);
+    }
+    let mut actions = Actions::new();
+    for row in &plans {
+        for (page, action) in pages.iter().zip(row) {
+            *actions
+                .entry((page.column.recipe.name(), action_name(action)))
+                .or_default() += 1;
+        }
     }
     let mut tally = Tally::new();
     for (query, predicate) in predicates.iter().enumerate() {
@@ -197,7 +231,7 @@ fn mutate_pair(pages: &[Page], selector: &Column) -> Result<Tally, String> {
             }
         }
     }
-    Ok(tally)
+    Ok((tally, actions))
 }
 
 fn licence_of(action: &PageAction) -> Option<&Licence> {

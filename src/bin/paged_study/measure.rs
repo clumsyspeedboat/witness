@@ -42,7 +42,7 @@ enum Arm {
     ParquetFull { compressed: bool },
 }
 
-const ARMS: [Arm; 8] = [
+const ARMS: [Arm; 10] = [
     Arm::Witness {
         compact: false,
         planning: Planning::Facts,
@@ -56,6 +56,14 @@ const ARMS: [Arm; 8] = [
         planning: Planning::StoredStatistics,
     },
     Arm::Witness {
+        compact: false,
+        planning: Planning::FactBounds,
+    },
+    Arm::Witness {
+        compact: false,
+        planning: Planning::StoredStatisticsPlus,
+    },
+    Arm::Witness {
         compact: true,
         planning: Planning::Facts,
     },
@@ -66,36 +74,17 @@ const ARMS: [Arm; 8] = [
 ];
 
 impl Arm {
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Witness {
-                compact: false,
-                planning: Planning::Facts,
-            } => "witness_direct_facts",
-            Self::Witness {
-                compact: false,
-                planning: Planning::ScanOnly,
-            } => "witness_direct_scan",
-            Self::Witness {
-                compact: true,
-                planning: Planning::Facts,
-            } => "witness_compact_facts",
-            Self::Witness {
-                compact: true,
-                planning: Planning::ScanOnly,
-            } => "witness_compact_scan",
-            Self::Witness {
-                compact: false,
-                planning: Planning::StoredStatistics,
-            } => "witness_direct_zonemap",
-            Self::Witness {
-                compact: true,
-                planning: Planning::StoredStatistics,
-            } => "witness_compact_zonemap",
-            Self::ParquetIndexed { compressed: false } => "parquet_plain_indexed",
-            Self::ParquetIndexed { compressed: true } => "parquet_zstd_indexed",
-            Self::ParquetFull { compressed: false } => "parquet_plain_full",
-            Self::ParquetFull { compressed: true } => "parquet_zstd_full",
+            Self::Witness { compact, planning } => format!(
+                "witness_{}_{}",
+                if compact { "compact" } else { "direct" },
+                planning.label()
+            ),
+            Self::ParquetIndexed { compressed: false } => "parquet_plain_indexed".into(),
+            Self::ParquetIndexed { compressed: true } => "parquet_zstd_indexed".into(),
+            Self::ParquetFull { compressed: false } => "parquet_plain_full".into(),
+            Self::ParquetFull { compressed: true } => "parquet_zstd_full".into(),
         }
     }
 }

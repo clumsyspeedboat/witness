@@ -107,11 +107,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     floats::from_key(predicate.low),
                     floats::from_key(predicate.high),
                 );
-                for (planning, arm) in [
-                    (Planning::Facts, "witness_direct_facts"),
-                    (Planning::StoredStatistics, "witness_direct_zonemap"),
-                    (Planning::ScanOnly, "witness_direct_scan"),
+                for planning in [
+                    Planning::Facts,
+                    Planning::StoredStatistics,
+                    Planning::ScanOnly,
+                    Planning::FactBounds,
+                    Planning::StoredStatisticsPlus,
                 ] {
+                    let arm = format!("witness_direct_{}", planning.label());
                     let run = || {
                         paged::sum_where(
                             &selector_column,
