@@ -1,3 +1,3 @@
 non_decreasing,sources,pairs,predicate_cells,source_median_gen_over_parquet_filter,source_median_gen_over_parquet_boundary,source_median_gen_over_equal_page_parquet_boundary,source_median_direct_gen_over_parquet_boundary,source_median_direct_gen_over_equal_page_parquet_boundary,source_median_gen_delivered_over_parquet_boundary,sources_beating_parquet_boundary,direct_sources_beating_parquet_boundary,direct_sources_beating_equal_page_parquet_boundary
-false,6,12,40,0.8861,0.8627,1.0228,0.3356,0.3993,0.6234,4,5,5
-true,26,28,112,0.6696,1.6050,0.6482,0.0969,0.0430,1.9331,1,26,26
+false,6,12,40,0.8853,0.8697,1.0380,0.3396,0.4052,0.6234,4,5,5
+true,26,28,112,0.6682,1.6358,0.6527,0.0990,0.0423,1.9331,1,26,26
