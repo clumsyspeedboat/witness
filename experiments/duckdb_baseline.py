@@ -2,8 +2,8 @@
 """DuckDB on the paged queries.
 
 Runs the same SELECT SUM(value), COUNT(*) ... WHERE selector BETWEEN low AND
-high over the same rows that the paged study and the scale study measure,
-in two ways: loaded into DuckDB's own compressed storage, whose row groups
+high over the same rows that the paged study and the scale study measure, and
+the conjunctive TPC-H Q6 queries of the conjunctive study, in two ways: loaded into DuckDB's own compressed storage, whose row groups
 carry min/max zone maps, and read straight from the Parquet files the
 studies export. Every answer is checked against the study's exact result.
 
@@ -13,7 +13,7 @@ time, measured at the Python client. The client round trip of a query that
 reads nothing is recorded once as a floor. One profiled run records the
 rows DuckDB's scans read, which shows how much its zone maps pruned.
 
-Usage: experiments/duckdb_baseline.py [paged|scale ...]
+Usage: experiments/duckdb_baseline.py [paged|scale|conjunctive ...]
 """
 
 import csv
@@ -28,10 +28,13 @@ import duckdb
 
 PAGED = os.environ.get("WITNESS_PAGED_RESULT_DIR", "experiments/results/paged_study")
 SCALE = os.environ.get("WITNESS_PAGED_SCALE_RESULT_DIR", "experiments/results/paged_scale")
+CONJUNCTIVE = os.environ.get(
+    "WITNESS_PAGED_CONJUNCTIVE_RESULT_DIR", "experiments/results/paged_conjunctive"
+)
 OUTPUT = os.environ.get("WITNESS_DUCKDB_RESULT_DIR", "experiments/results/duckdb")
 REPEATS = 5
 TARGET_NS = 2_000_000
-THREADS = {"paged": [1], "scale": [1, 64]}
+THREADS = {"paged": [1], "scale": [1, 64], "conjunctive": [1, 64]}
 HEADER = [
     "study",
     "table",
@@ -47,8 +50,12 @@ HEADER = [
 ]
 
 
+def between(low, high, column="timestamp"):
+    return f"{column} BETWEEN {low} AND {high}"
+
+
 def paged_queries():
-    """(table, parquet file, [(label, low, high, matched, sum)]) per pair."""
+    """(table, parquet file, [(label, where, aggregate, matched, sum)]) per pair."""
     tables = {}
     with open(f"{PAGED}/queries.csv", newline="") as source:
         for row in csv.DictReader(source):
@@ -57,8 +64,8 @@ def paged_queries():
             tables.setdefault(row["pair"], []).append(
                 (
                     row["predicate"],
-                    int(row["low"]),
-                    int(row["high"]),
+                    between(row["low"], row["high"]),
+                    "SUM(value)",
                     int(row["matched_rows"]),
                     int(row["expected_sum"]),
                 )
@@ -78,8 +85,8 @@ def scale_queries():
             tables.setdefault(row["selector"], []).append(
                 (
                     row["predicate"],
-                    int(row["low"]),
-                    int(row["high"]),
+                    between(row["low"], row["high"]),
+                    "SUM(value)",
                     int(row["matched_rows"]),
                     int(row["expected_sum"]),
                 )
@@ -88,6 +95,31 @@ def scale_queries():
         (selector, f"{SCALE}/parquet/{selector}.parquet", queries)
         for selector, queries in sorted(tables.items())
     ]
+
+
+def conjunctive_queries():
+    """The conjunctive study's queries over its one exported table."""
+    queries = {}
+    with open(f"{CONJUNCTIVE}/spec.csv", newline="") as source:
+        for row in csv.DictReader(source):
+            query = queries.setdefault(
+                row["query"],
+                ([], int(row["matched_rows"]), int(row["expected_sum"])),
+            )
+            query[0].append(between(row["low"], row["high"], row["column"]))
+    return [
+        (
+            "lineitem",
+            f"{CONJUNCTIVE}/parquet/lineitem.parquet",
+            [
+                (name, " AND ".join(where), "SUM(extendedprice * discount)", matched, expected)
+                for name, (where, matched, expected) in queries.items()
+            ],
+        )
+    ]
+
+
+QUERIES = {"paged": paged_queries, "scale": scale_queries, "conjunctive": conjunctive_queries}
 
 
 def answer(con, sql):
@@ -135,12 +167,9 @@ def measure(study, tables, writer, scratch):
         }
         for threads in THREADS[study]:
             con.execute(f"SET threads = {threads}")
-            for label, low, high, matched, expected in queries:
+            for label, where, aggregate, matched, expected in queries:
                 for engine, source in sources.items():
-                    sql = (
-                        f"SELECT SUM(value)::HUGEINT, COUNT(*) FROM {source} "
-                        f"WHERE timestamp BETWEEN {low} AND {high}"
-                    )
+                    sql = f"SELECT ({aggregate})::HUGEINT, COUNT(*) FROM {source} WHERE {where}"
                     got = answer(con, sql)
                     if got != (expected, matched):
                         sys.exit(
@@ -170,12 +199,12 @@ def measure(study, tables, writer, scratch):
 
 
 def main():
-    studies = sys.argv[1:] or ["paged", "scale"]
+    studies = sys.argv[1:] or ["paged", "scale", "conjunctive"]
     os.makedirs(OUTPUT, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="witness-duckdb-")
     try:
         for study in studies:
-            tables = paged_queries() if study == "paged" else scale_queries()
+            tables = QUERIES[study]()
             with open(f"{OUTPUT}/{study}.csv", "w", newline="") as output:
                 writer = csv.writer(output)
                 writer.writerow(HEADER)

@@ -160,6 +160,16 @@ path = "src/bin/paged_scale_study.rs"
 required-features = ["experiment"]
 
 [[bin]]
+name = "paged_conjunctive_study"
+path = "src/bin/paged_conjunctive_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "parquet_facts_study"
+path = "src/bin/parquet_facts_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
 name = "claim_manifest"
 path = "src/bin/claim_manifest.rs"
 required-features = ["experiment"]
