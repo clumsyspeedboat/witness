@@ -26,6 +26,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::Instant;
 
@@ -245,8 +246,9 @@ fn cold_query(
 }
 
 /// What it costs any reader to audit a footer section against the pages,
-/// cold. A derived bound is re-derived from the few fields it comes from; an
-/// exact minimum and maximum can only be recomputed by decoding the page.
+/// cold. A derived bound is re-derived from the few fields it comes from,
+/// read where they lie; an exact minimum and maximum can only be recomputed
+/// by reading the page, in one read, and decoding it.
 fn audit(
     out: &mut impl Write,
     name: &str,
@@ -272,8 +274,27 @@ fn audit(
                     )
                 }
                 Summary::ZoneMap => {
-                    let mut session = store.session(page, index, paged::Access::Execute)?;
-                    (exact_range(page, &mut session)?, session.metrics())
+                    // One read fetches the page; the bytes read are decoded.
+                    let stored = page.column.page.bytes();
+                    let mut bytes = vec![0_u8; stored.len()];
+                    file.read_exact_at(&mut bytes, layout.offsets[index])?;
+                    if bytes != stored {
+                        return Err(format!("{name} page {index}: file bytes differ").into());
+                    }
+                    let mut session = witness::access_compiler::ReadSession::new_untracked(
+                        &page.column.page,
+                        witness::access_compiler::ClosureMode::Selective,
+                    );
+                    let range = exact_range(page, &mut session)?;
+                    counts.io_operations += 1;
+                    counts.io_bytes += bytes.len();
+                    if range != entry.interval {
+                        return Err(
+                            format!("{name} page {index}: footer entry fails its audit").into()
+                        );
+                    }
+                    bounded += usize::from(range.is_some());
+                    continue;
                 }
             };
             if interval != entry.interval {
