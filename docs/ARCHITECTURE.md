@@ -196,6 +196,20 @@ scanned or translated selector page over a value lane is answered by one
 fused, branch-free pass that compares, masks, and adds, without building a
 selection.
 
+Every session a paged query opens comes from a `PageStore`: `InMemory`, or a
+`FileStore` that reads one column's pages from a file at known offsets. A
+session opened to plan reads only the fields it needs; one opened to execute
+fetches its page with its first read. `paged_file.rs` writes a column as its
+pages followed by two footer sections, a zone map and the derived bounds,
+each readable with one positioned read.
+
+Two modules carry the calculus beyond integers. `floats.rs` maps every
+non-NaN double to an `i64` key that sorts like the double, so all integer
+codecs, facts, and planners apply to keys. `strings.rs` stores a string page
+as a sorted dictionary and integer ids; a range or prefix predicate becomes a
+skip, an acceptance, or an id range found by two binary searches, and the
+checker re-reads the entries beside the id range's boundaries.
+
 ## Plan IR
 
 `compiler.rs` emits `PlanIr` nodes containing:
