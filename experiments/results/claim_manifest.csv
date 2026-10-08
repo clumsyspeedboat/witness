@@ -347,6 +347,8 @@ unclustered & 157.4 (7,324) & 156.6 (7,324) & 160.0 (7,324) & 658.8 (10,986) \\"
 WitColdPagesOverScanUnclustered,4.2
 WitColdAuditBoundsMs,428
 WitColdAuditBoundsKib,29
+WitColdAuditBoundsMib,0
 WitColdAuditZoneMs,181
 WitColdAuditZoneKib,108338
+WitColdAuditZoneMib,106
 WitColdRepeats,3

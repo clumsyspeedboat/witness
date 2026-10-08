@@ -2533,6 +2533,11 @@ fn cold_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             &format!("{prefix}Kib"),
             &format!("{:.0}", median(&bytes) / 1024.0),
         );
+        define(
+            out,
+            &format!("{prefix}Mib"),
+            &format!("{:.0}", median(&bytes) / (1024.0 * 1024.0)),
+        );
     }
     let freeze = read_csv(&format!("{COLD}/freeze.csv"))?;
     define(out, "WitColdRepeats", &freeze.field(&freeze[0], "repeats")?);
