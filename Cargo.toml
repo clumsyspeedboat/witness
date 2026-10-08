@@ -111,6 +111,11 @@ name = "paged_file"
 path = "tests/paged_file.rs"
 required-features = ["experiment"]
 
+[[test]]
+name = "strings"
+path = "tests/strings.rs"
+required-features = ["experiment"]
+
 [[bin]]
 name = "generate_access_compiler"
 path = "src/bin/generate_access_compiler.rs"
@@ -182,6 +187,11 @@ required-features = ["experiment"]
 [[bin]]
 name = "paged_float_study"
 path = "src/bin/paged_float_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "paged_string_study"
+path = "src/bin/paged_string_study.rs"
 required-features = ["experiment"]
 
 [[bin]]

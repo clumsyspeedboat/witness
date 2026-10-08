@@ -845,6 +845,107 @@ fn yellow_taxi_study_source(max_rows: usize) -> Result<Option<StudySource>, Box<
     )?))
 }
 
+/// A table of the string corpus: its string columns, as bytes, and the
+/// integer `measure` column of the same rows (null where the table has none).
+#[derive(Clone, Debug)]
+pub struct StringTable {
+    pub group: String,
+    pub source: String,
+    pub columns: Vec<(String, Vec<Option<Vec<u8>>>)>,
+    pub measure: Vec<Option<i64>>,
+}
+
+const STRING_GROUPS: [&str; 4] = ["clickbench", "publicbi", "tpcds", "tpch"];
+
+/// The string corpus exported by `scripts/fetch_string_corpora.py`: one
+/// Parquet file per table under `eval/data/strings/<group>/`, each column
+/// capped at `max_rows`.
+pub fn string_study_tables(max_rows: usize) -> Result<Vec<StringTable>, Box<dyn Error>> {
+    use arrow_array::{BinaryArray, LargeBinaryArray};
+    let mut tables = Vec::new();
+    for group in STRING_GROUPS {
+        let directory = study_data_path(&format!("eval/data/strings/{group}"));
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|suffix| suffix == "parquet"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&path)?)?;
+            let names = builder
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>();
+            let reader = builder.with_batch_size(65_536).build()?;
+            let mut columns = names
+                .iter()
+                .filter(|name| *name != "measure")
+                .map(|name| (name.clone(), Vec::new()))
+                .collect::<Vec<(String, Vec<Option<Vec<u8>>>)>>();
+            let mut measure = Vec::new();
+            for batch in reader {
+                let batch = batch?;
+                let rows = (max_rows - measure.len().min(max_rows)).min(batch.num_rows());
+                if rows == 0 {
+                    break;
+                }
+                for (index, name) in names.iter().enumerate() {
+                    let array = batch.column(index);
+                    if name == "measure" {
+                        let values = array
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or("string corpus measure is not BIGINT")?;
+                        measure.extend(
+                            (0..rows).map(|row| values.is_valid(row).then(|| values.value(row))),
+                        );
+                        continue;
+                    }
+                    let column = &mut columns
+                        .iter_mut()
+                        .find(|(column, _)| column == name)
+                        .ok_or("string corpus column vanished")?
+                        .1;
+                    if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
+                        column.extend(
+                            (0..rows).map(|row| {
+                                values.is_valid(row).then(|| values.value(row).to_vec())
+                            }),
+                        );
+                    } else if let Some(values) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+                        column.extend(
+                            (0..rows).map(|row| {
+                                values.is_valid(row).then(|| values.value(row).to_vec())
+                            }),
+                        );
+                    } else {
+                        return Err(
+                            format!("{}: column {name} is not binary", path.display()).into()
+                        );
+                    }
+                }
+            }
+            tables.push(StringTable {
+                group: group.to_string(),
+                source: path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                columns,
+                measure,
+            });
+        }
+    }
+    Ok(tables)
+}
+
 fn study_data_path(path: &str) -> PathBuf {
     let direct = PathBuf::from(path);
     if direct.exists() {
