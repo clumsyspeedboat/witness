@@ -68,7 +68,7 @@ These constraints are part of the result.
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.26x a full read; coalescing issued 119 calls and reached 0.98x. This is a
+  1.27x a full read; coalescing issued 119 calls and reached 1.00x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is
