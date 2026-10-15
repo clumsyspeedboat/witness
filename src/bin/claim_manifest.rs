@@ -3138,6 +3138,60 @@ fn paged_tables(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         )?;
     }
     define(out, "WitCensusGroupIncidenceRows", table.trim_end());
+
+    // The same rows with one more column: of the 1,024-row pages that hold
+    // more than one value, the share whose facts license an action a zone map
+    // cannot, from the census's per-page facts.
+    let facts = read_csv(&format!("{CENSUS}/page_facts.csv"))?;
+    let mut beyond = BTreeMap::<String, [usize; 2]>::new();
+    for row in &facts {
+        if facts.field(row, "page_size")? != "1024" || facts.field(row, "state")? != "values" {
+            continue;
+        }
+        let group = column_group
+            .get(&facts.field(row, "column")?)
+            .ok_or("page fact names an unknown column")?;
+        let licensed = ["search", "piecewise", "translate"]
+            .iter()
+            .map(|name| facts.field(row, name))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|value| value == "true");
+        let entry = beyond.entry(group.clone()).or_default();
+        entry[0] += 1;
+        entry[1] += usize::from(licensed);
+    }
+    let mut table = String::new();
+    for (group, label) in GROUPS {
+        let Some(
+            &[
+                columns,
+                monotone,
+                page_count,
+                all_null,
+                constant,
+                monotone_pages,
+            ],
+        ) = census.get(group)
+        else {
+            continue;
+        };
+        let [values, licensed] = beyond.get(group).copied().unwrap_or_default();
+        writeln!(
+            table,
+            "{label} & {columns} & {} & {} & {} & {} & {} \\\\",
+            share(monotone, columns),
+            share(all_null, page_count),
+            share(constant, page_count),
+            share(monotone_pages, page_count),
+            if values == 0 {
+                "--".to_string()
+            } else {
+                share(licensed, values)
+            }
+        )?;
+    }
+    define(out, "WitCensusFactRows", table.trim_end());
     Ok(())
 }
 
