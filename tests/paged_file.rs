@@ -168,3 +168,29 @@ fn a_damaged_trailer_is_rejected_and_an_audit_rereads_the_bounds() {
     assert!(paged_file::open(&File::open(&path).unwrap()).is_err());
     fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn an_altered_footer_section_fails_its_checksum() {
+    let (selector, _) = columns();
+    let column = PagedColumn::from_values(&selector, PAGE, &policy()).unwrap();
+    let path = scratch("checksum.wpf");
+    paged_file::write(&column, &path).unwrap();
+    let file = File::open(&path).unwrap();
+    let layout = paged_file::open(&file).unwrap();
+    for summary in [Summary::ZoneMap, Summary::DerivedBounds] {
+        assert!(paged_file::read_summary(&file, &layout, summary).is_ok());
+    }
+    // Move one bound in the derived-bounds section, which precedes the
+    // trailer: the section still parses, but no longer matches its checksum.
+    let mut bytes = fs::read(&path).unwrap();
+    let trailer = (column.pages().len() + 6 + 3) * 8;
+    let entry = bytes.len() - trailer - 37 * 2 + 1;
+    bytes[entry] ^= 1;
+    let altered = scratch("checksum-altered.wpf");
+    fs::write(&altered, &bytes).unwrap();
+    let file = File::open(&altered).unwrap();
+    let layout = paged_file::open(&file).unwrap();
+    assert!(paged_file::read_summary(&file, &layout, Summary::ZoneMap).is_ok());
+    let error = paged_file::read_summary(&file, &layout, Summary::DerivedBounds).unwrap_err();
+    assert!(error.contains("checksum"), "{error}");
+}

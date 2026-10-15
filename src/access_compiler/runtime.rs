@@ -387,6 +387,74 @@ impl<'a> ReadSession<'a> {
         Ok(())
     }
 
+    /// Selective form of `unpack_bits_into`: replaces `out` with the codes at
+    /// stream positions `span.start + index` for each of `indices`, read from
+    /// the one byte range that covers `span`, which is delivered and accounted
+    /// as `unpack_bits_into` over `span` would deliver it. Only the values it
+    /// returns count as decoded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unpack_bits_at(
+        &mut self,
+        field: FieldId,
+        span: Span,
+        indices: &[u32],
+        width: u8,
+        miniblock_rows: usize,
+        miniblock_bytes: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<(), String> {
+        out.clear();
+        self.record_primitive_values(indices.len());
+        if indices.is_empty() {
+            return Ok(());
+        }
+        if width == 0 {
+            out.resize(indices.len(), 0);
+            return Ok(());
+        }
+        if width > 64 || miniblock_rows == 0 || miniblock_bytes == 0 {
+            return Err("invalid bit-unpack parameters".into());
+        }
+        if span.start >= span.end {
+            return Err("selective unpack has an empty span".into());
+        }
+        let first_byte = packed_byte_offset(span.start, width, miniblock_rows, miniblock_bytes)?;
+        let last_row = span.end - 1;
+        let last_byte = packed_byte_offset(last_row, width, miniblock_rows, miniblock_bytes)?;
+        let last_bit = (last_row % miniblock_rows) * width as usize % 8;
+        let byte_end = last_byte + (last_bit + width as usize).div_ceil(8);
+        let bytes = self.read_range(field, Span::new(first_byte, byte_end)?)?;
+        let width_bits = width as usize;
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            (1_u64 << width) - 1
+        };
+        out.reserve(indices.len());
+        for &index in indices {
+            let row = span.start + index as usize;
+            if row >= span.end {
+                return Err("selective unpack position is outside its span".into());
+            }
+            let bit_offset = (row % miniblock_rows) * width_bits;
+            let offset = (row / miniblock_rows) * miniblock_bytes + bit_offset / 8 - first_byte;
+            let bit = bit_offset % 8;
+            let value = if width_bits <= 57 && offset + 8 <= bytes.len() {
+                let word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                (word >> bit) & mask
+            } else {
+                let count = (bit + width_bits).div_ceil(8);
+                let mut word = 0_u128;
+                for (at, byte) in bytes[offset..offset + count].iter().copied().enumerate() {
+                    word |= u128::from(byte) << (at * 8);
+                }
+                ((word >> bit) as u64) & mask
+            };
+            out.push(value);
+        }
+        Ok(())
+    }
+
     /// Batch dictionary lookup: replaces every id in `values` with entry `id`
     /// of an i64 table field. A tracked or storage-backed session reads entry
     /// by entry, exactly as per-value `read_i64` would; an untracked in-memory

@@ -446,21 +446,55 @@ pub fn fused_conjunction(
         .collect::<Vec<_>>();
     let mut gathered = vec![Vec::new(); values.len()];
     let mut positions = Vec::with_capacity(BATCH_ROWS);
+    let mut words = Vec::with_capacity(BATCH_WORDS);
+    let mut scratch = Selective::default();
+    // Batches start at multiples of 8 when the rows do, as they must for a
+    // lane to be read at chosen rows.
+    let aligned = rows.start.is_multiple_of(8);
     let (mut total, mut matched) = (0_i128, 0_usize);
     let mut row = rows.start;
     while row < rows.end {
         let end = (row + BATCH_ROWS).min(rows.end);
         let span = Span::new(row, end)?;
         positions.clear();
-        positions.extend(0..span.len() as u32);
         // With no conjunct, every row is alive.
-        let mut alive = if order.is_empty() { span.len() } else { 0 };
+        let mut alive = 0;
+        if order.is_empty() {
+            positions.extend(0..span.len() as u32);
+            alive = span.len();
+        }
         for (rank, &slot) in order.iter().enumerate() {
             let test = &mut tests[slot];
             let session = &mut conjuncts[slot].session;
-            // Lanes advance batch by batch; one whose rows are no longer
-            // needed is still filled, to keep its cursor in step and to
-            // check dictionary ids as a decode would.
+            // Once few rows survive, a later conjunct is read only at them.
+            if rank > 0 && aligned && alive * SELECTIVE_SHARE <= span.len() {
+                test.lane.read_at(
+                    session,
+                    &mut test.cursor,
+                    span,
+                    &positions[..alive],
+                    &mut scratch,
+                )?;
+                if let Some(entries) = test.entries
+                    && scratch
+                        .codes
+                        .iter()
+                        .zip(&scratch.valid)
+                        .any(|(&id, &valid)| valid != 0 && id >= entries)
+                {
+                    return Err("dictionary id is outside table".into());
+                }
+                let mut kept = 0;
+                for cursor in 0..alive {
+                    positions[kept] = positions[cursor];
+                    kept +=
+                        (test.matcher.hit(scratch.codes[cursor]) & scratch.valid[cursor]) as usize;
+                }
+                alive = kept;
+                continue;
+            }
+            // Otherwise the lane fills the batch, which keeps its cursor in
+            // step and checks every dictionary id as a decode would.
             test.lane
                 .fill(session, &mut test.cursor, span, &mut batch)?;
             if let Some(entries) = test.entries
@@ -472,11 +506,11 @@ pub fn fused_conjunction(
             let hit = |code: u64| matcher.hit(code) as usize;
             let dense = batch.dense();
             if rank == 0 {
-                for index in 0..span.len() {
-                    let valid = dense || batch.valid[index] != 0;
-                    positions[alive] = index as u32;
-                    alive += hit(batch.codes[index]) & usize::from(valid);
-                }
+                // The first conjunct marks its rows 64 at a time; only the
+                // rows it keeps become positions.
+                hit_words(matcher, &batch, &mut words);
+                word_positions(&words, &mut positions);
+                alive = positions.len();
             } else {
                 let mut kept = 0;
                 for cursor in 0..alive {
@@ -496,8 +530,13 @@ pub fn fused_conjunction(
                     .zip(value_batches.iter_mut().zip(gathered.iter_mut())),
             )
         {
-            lane.fill(session, cursor, span, values_batch)?;
-            lane.gather_at(values_batch, &positions[..alive], values_out)?;
+            if aligned && alive * SELECTIVE_SHARE <= span.len() {
+                lane.read_at(session, cursor, span, &positions[..alive], &mut scratch)?;
+                lane.values_read(&scratch, values_out)?;
+            } else {
+                lane.fill(session, cursor, span, values_batch)?;
+                lane.gather_at(values_batch, &positions[..alive], values_out)?;
+            }
         }
         if alive > 0 {
             total = match gathered.as_slice() {
@@ -697,7 +736,7 @@ pub fn fused_sum_between(
         lane: codes,
         matcher,
         entries,
-        ..
+        domain,
     }) = selector_lane(selector, selector_session, low, high, compare)?
     else {
         return Ok(None);
@@ -715,6 +754,14 @@ pub fn fused_sum_between(
     let mut outside = 0_u64;
     let mut selector_cursor = codes.cursor(selector_session, rows.start)?;
     let mut selector_batch = LaneBatch::default();
+    // A batch whose selector keeps few rows reads the value page only at
+    // those rows; one that keeps many unpacks the value batch and masks it.
+    // Each batch follows the share the one before it kept, and the first the
+    // share of codes the predicate covers.
+    let mut selective =
+        rows.start.is_multiple_of(8) && matcher.selectivity(domain) * SELECTIVE_SHARE as f64 <= 1.0;
+    let (mut words, mut positions) = (Vec::with_capacity(BATCH_WORDS), Vec::new());
+    let mut scratch = Selective::default();
     let mut row = rows.start;
     while row < rows.end {
         let end = (row + BATCH_ROWS).min(rows.end);
@@ -728,13 +775,43 @@ pub fn fused_sum_between(
         if let Some(entries) = entries {
             outside |= selector_batch.outside(entries);
         }
-        if !matches!(matcher, Matcher::Nothing) {
-            matcher.test_into(&selector_batch, &mut selected);
-            sums.fill(value_session, &mut value_cursor, batch, &mut value_batch)?;
-            let sum = sums.sum_taken(&value_batch, &selected)?;
-            total = total.checked_add(sum).ok_or("vector SUM overflow")?;
-            matched += selected.iter().sum::<u64>() as usize;
+        if matches!(matcher, Matcher::Nothing) {
+            row = end;
+            continue;
         }
+        if selective {
+            hit_words(&matcher, &selector_batch, &mut words);
+            let hits = words
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>();
+            if hits * SELECTIVE_SHARE <= batch.len() {
+                word_positions(&words, &mut positions);
+                sums.read_at(
+                    value_session,
+                    &mut value_cursor,
+                    batch,
+                    &positions,
+                    &mut scratch,
+                )?;
+                total = total
+                    .checked_add(sums.sum_read(&scratch)?)
+                    .ok_or("vector SUM overflow")?;
+                matched += hits;
+                row = end;
+                continue;
+            }
+            selected.clear();
+            selected.extend((0..batch.len()).map(|at| words[at / 64] >> (at % 64) & 1));
+        } else {
+            matcher.test_into(&selector_batch, &mut selected);
+        }
+        sums.fill(value_session, &mut value_cursor, batch, &mut value_batch)?;
+        let sum = sums.sum_taken(&value_batch, &selected)?;
+        total = total.checked_add(sum).ok_or("vector SUM overflow")?;
+        let kept = selected.iter().sum::<u64>() as usize;
+        matched += kept;
+        selective = rows.start.is_multiple_of(8) && kept * SELECTIVE_SHARE <= batch.len();
         row = end;
     }
     if outside != 0 {
@@ -986,6 +1063,71 @@ impl LaneBatch {
     }
 }
 
+/// Words of 64 rows that cover one batch.
+const BATCH_WORDS: usize = BATCH_ROWS.div_ceil(64);
+
+/// A batch is read only at the rows it keeps while it keeps at most one in
+/// this many of them; past that, unpacking the whole batch costs less.
+const SELECTIVE_SHARE: usize = 8;
+
+/// Buffers a selective read reuses from batch to batch.
+#[derive(Default)]
+struct Selective {
+    /// Per requested position: 1 if the row holds a value, 0 if it is null.
+    valid: Vec<u64>,
+    /// Per requested position: its code, 0 at a null row.
+    codes: Vec<u64>,
+    /// Stored index, from the batch's first stored code, of each non-null
+    /// requested row.
+    stored: Vec<u32>,
+    /// The codes read at `stored`.
+    read: Vec<u64>,
+    words: [u64; BATCH_WORDS],
+}
+
+/// The rows of `batch` that `matcher` keeps, as words of 64 rows; a null row
+/// is never kept.
+fn hit_words(matcher: &Matcher, batch: &LaneBatch, words: &mut Vec<u64>) {
+    fn pack(batch: &LaneBatch, words: &mut Vec<u64>, test: impl Fn(u64) -> u64) {
+        let dense = batch.dense();
+        for (index, block) in batch.codes.chunks(64).enumerate() {
+            let mut word = block
+                .iter()
+                .enumerate()
+                .fold(0_u64, |word, (at, &code)| word | (test(code) << at));
+            if !dense {
+                word &= batch.valid[index * 64..index * 64 + block.len()]
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |word, (at, &bit)| word | (bit << at));
+            }
+            words.push(word);
+        }
+    }
+    words.clear();
+    match matcher {
+        Matcher::Range { first, spread } => pack(batch, words, |code| {
+            u64::from(code.wrapping_sub(*first) <= *spread)
+        }),
+        Matcher::Entries(hits) => pack(batch, words, |code| {
+            hits.get(code as usize).copied().unwrap_or(0)
+        }),
+        Matcher::Nothing => words.resize(batch.codes.len().div_ceil(64), 0),
+    }
+}
+
+/// The positions of the set bits of `words`, in order.
+fn word_positions(words: &[u64], positions: &mut Vec<u32>) {
+    positions.clear();
+    for (index, &word) in words.iter().enumerate() {
+        let mut word = word;
+        while word != 0 {
+            positions.push((index * 64) as u32 + word.trailing_zeros());
+            word &= word - 1;
+        }
+    }
+}
+
 /// A lane's position: the next row's index among the stored codes.
 struct LaneCursor {
     compact: usize,
@@ -1190,6 +1332,242 @@ impl Lane {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The stored codes that hold the non-null rows of each of `ranges`: the
+    /// ranges themselves on a dense lane, and on a nullable one each range's
+    /// rank span, from the rank index. `rows` is the page's row count, whose
+    /// rank is the number of stored codes.
+    fn stored_spans(
+        &self,
+        session: &mut ReadSession<'_>,
+        rows: usize,
+        ranges: &[Span],
+    ) -> Result<Vec<Span>, String> {
+        let Some(validity) = self.validity else {
+            return Ok(ranges.to_vec());
+        };
+        let mut stored = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let mut rank = |row| {
+                if row == rows {
+                    Ok(self.packed.len)
+                } else {
+                    nullable_prefix_rank(
+                        session,
+                        validity.bits,
+                        validity.rank_index,
+                        row,
+                        validity.rank_interval,
+                    )
+                }
+            };
+            let (start, end) = (rank(range.start)?, rank(range.end)?);
+            stored.push(Span::new(start, end)?);
+        }
+        Ok(stored)
+    }
+
+    /// SUM of the table entries indexed by the stored ids in `stored`, for a
+    /// lane of dictionary ids. An id outside the table fails the query.
+    fn sum_entries(&self, session: &mut ReadSession<'_>, stored: &[Span]) -> Result<i128, String> {
+        let entries = &self.entries;
+        let mut total = 0_i128;
+        for range in stored {
+            self.packed.scan(session, *range, |_, ids| {
+                let Some(last) = entries.len().checked_sub(1) else {
+                    return Err("dictionary id is outside table".into());
+                };
+                let outside = ids
+                    .iter()
+                    .fold(0_u64, |bad, &id| bad | u64::from(id > last as u64));
+                if outside != 0 {
+                    return Err("dictionary id is outside table".into());
+                }
+                // Entries below 2^52 in magnitude sum over a batch in an i64.
+                let sum = if self.narrow {
+                    i128::from(ids.iter().map(|&id| entries[id as usize]).sum::<i64>())
+                } else {
+                    ids.iter()
+                        .map(|&id| i128::from(entries[id as usize]))
+                        .sum::<i128>()
+                };
+                total = total.checked_add(sum).ok_or("vector SUM overflow")?;
+                Ok(())
+            })?;
+        }
+        Ok(total)
+    }
+
+    /// The validity of the batch `rows` as words of 64 rows, and how many of
+    /// its rows hold a value. `rows` spans at most one batch and starts at a
+    /// multiple of 8; on a dense lane every row is valid.
+    fn validity_words(
+        &self,
+        session: &mut ReadSession<'_>,
+        rows: Span,
+        words: &mut [u64; BATCH_WORDS],
+    ) -> Result<usize, String> {
+        if rows.len() > BATCH_ROWS || !rows.start.is_multiple_of(8) {
+            return Err("validity words need an aligned batch".into());
+        }
+        words.fill(0);
+        let count = rows.len().div_ceil(64);
+        let tail = |index: usize| (rows.len() - index * 64).min(64);
+        let Some(validity) = self.validity else {
+            for (index, word) in words.iter_mut().take(count).enumerate() {
+                *word = if tail(index) == 64 {
+                    u64::MAX
+                } else {
+                    (1_u64 << tail(index)) - 1
+                };
+            }
+            return Ok(rows.len());
+        };
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let first_byte = rows.start / 8;
+        let bytes = session.read_range(
+            validity.bits,
+            Span::new(first_byte, (rows.end - 1) / 8 + 1)?,
+        )?;
+        let mut present = 0;
+        for (index, word) in words.iter_mut().take(count).enumerate() {
+            let mut value = 0_u64;
+            for (at, byte) in bytes[index * 8..].iter().take(8).enumerate() {
+                value |= u64::from(*byte) << (at * 8);
+            }
+            if tail(index) < 64 {
+                value &= (1_u64 << tail(index)) - 1;
+            }
+            *word = value;
+            present += value.count_ones() as usize;
+        }
+        Ok(present)
+    }
+
+    /// Reads the codes at `positions` of the batch `rows` where they lie,
+    /// instead of unpacking the batch: into `scratch.codes`, with 1 in
+    /// `scratch.valid` where the row holds a value and 0 (and code 0) where
+    /// it is null. Positions are ascending and inside the batch, which starts
+    /// at a multiple of 8. Advances the cursor past the batch, as `fill`
+    /// would.
+    fn read_at(
+        &self,
+        session: &mut ReadSession<'_>,
+        cursor: &mut LaneCursor,
+        rows: Span,
+        positions: &[u32],
+        scratch: &mut Selective,
+    ) -> Result<(), String> {
+        let Selective {
+            valid,
+            codes,
+            stored,
+            read,
+            words,
+        } = scratch;
+        valid.clear();
+        codes.clear();
+        stored.clear();
+        let compact = match self.validity {
+            None => {
+                stored.extend_from_slice(positions);
+                valid.resize(positions.len(), 1);
+                rows
+            }
+            Some(_) => {
+                let present = self.validity_words(session, rows, words)?;
+                let mut prefix = [0_u32; BATCH_WORDS + 1];
+                for index in 0..BATCH_WORDS {
+                    prefix[index + 1] = prefix[index] + words[index].count_ones();
+                }
+                for &position in positions {
+                    let (word, bit) = (position as usize / 64, position % 64);
+                    let holds = words[word] >> bit & 1;
+                    valid.push(holds);
+                    if holds != 0 {
+                        stored
+                            .push(prefix[word] + (words[word] & ((1_u64 << bit) - 1)).count_ones());
+                    }
+                }
+                Span::new(cursor.compact, cursor.compact + present)?
+            }
+        };
+        if compact.end > self.packed.len {
+            return Err("lane reads past its stored codes".into());
+        }
+        if stored.is_empty() {
+            read.clear();
+        } else {
+            session.unpack_bits_at(
+                self.packed.stream,
+                compact,
+                stored,
+                self.packed.width,
+                self.packed.miniblock_rows,
+                self.packed.miniblock_bytes,
+                read,
+            )?;
+        }
+        let mut next = 0;
+        for &holds in valid.iter() {
+            if holds != 0 {
+                codes.push(read[next]);
+                next += 1;
+            } else {
+                codes.push(0);
+            }
+        }
+        cursor.compact = compact.end;
+        Ok(())
+    }
+
+    /// SUM of the values `read_at` read: offset codes plus the base, or the
+    /// table entries the ids index. Null rows add nothing.
+    fn sum_read(&self, scratch: &Selective) -> Result<i128, String> {
+        if self.dictionary.is_none() {
+            let (mut sum, mut count) = (0_u64, 0_u64);
+            for (&code, &valid) in scratch.codes.iter().zip(&scratch.valid) {
+                sum += code & valid.wrapping_neg();
+                count += valid;
+            }
+            return self.packed.add(0, count as usize, sum);
+        }
+        let mut total = 0_i128;
+        for (&id, &valid) in scratch.codes.iter().zip(&scratch.valid) {
+            if valid != 0 {
+                total += i128::from(
+                    *self
+                        .entries
+                        .get(id as usize)
+                        .ok_or("dictionary id is outside table")?,
+                );
+            }
+        }
+        Ok(total)
+    }
+
+    /// The values `read_at` read, `None` at null rows.
+    fn values_read(&self, scratch: &Selective, out: &mut Vec<Option<i128>>) -> Result<(), String> {
+        out.clear();
+        for (&code, &valid) in scratch.codes.iter().zip(&scratch.valid) {
+            if valid == 0 {
+                out.push(None);
+                continue;
+            }
+            out.push(Some(match self.dictionary {
+                None => self.packed.base + i128::from(code),
+                Some(_) => i128::from(
+                    *self
+                        .entries
+                        .get(code as usize)
+                        .ok_or("dictionary id is outside table")?,
+                ),
+            }));
         }
         Ok(())
     }
@@ -1502,32 +1880,17 @@ pub fn sum_ranges(
         return packed.sum_ranges(session, ranges);
     }
     // Nulls add nothing, so a nullable page of codes sums the stored codes
-    // of each range's non-null rows: a contiguous run of them.
+    // of each range's non-null rows: a contiguous run of them. A dictionary
+    // page, dense or nullable, sums the entries its stored ids index.
     if let Some(lane) = Lane::at_root(decoder, session, Codes::Offset)?
-        && let Some(validity) = lane.validity
+        && lane.validity.is_some()
     {
-        let rows = decoder.len()?;
-        let mut stored = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            // Every row's rank comes from the rank index, except the end
-            // of the column, which ranks after every stored code.
-            let mut rank = |row| {
-                if row == rows {
-                    Ok(lane.packed.len)
-                } else {
-                    nullable_prefix_rank(
-                        session,
-                        validity.bits,
-                        validity.rank_index,
-                        row,
-                        validity.rank_interval,
-                    )
-                }
-            };
-            let (start, end) = (rank(range.start)?, rank(range.end)?);
-            stored.push(Span::new(start, end)?);
-        }
+        let stored = lane.stored_spans(session, decoder.len()?, ranges)?;
         return lane.packed.sum_ranges(session, &stored);
+    }
+    if let Some(lane) = Lane::at_root(decoder, session, Codes::DictionaryValues)? {
+        let stored = lane.stored_spans(session, decoder.len()?, ranges)?;
+        return lane.sum_entries(session, &stored);
     }
     let mut total = 0_i128;
     for range in ranges {
@@ -1849,7 +2212,9 @@ fn scan_node<'p>(
                                 let delta = delta_value(*slot, coding)?;
                                 let (next, carried) = value.overflowing_add(delta);
                                 value = next;
-                                overflow |= carried;
+                                // A value must also fit the i64 it encodes, as
+                                // the row-at-a-time decoders require.
+                                overflow |= carried | (value != i128::from(value as i64));
                                 *slot = value;
                             }
                             if overflow {
@@ -2201,6 +2566,9 @@ fn get_node(
                         Ok(())
                     },
                 )?;
+            }
+            if value != i128::from(value as i64) {
+                return Err("delta result does not fit i64".into());
             }
             Ok(Some(value))
         }

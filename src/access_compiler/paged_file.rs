@@ -8,16 +8,19 @@
 //!   any reader can audit an entry against its page by reading the few bytes
 //!   the bound comes from, without decoding a value.
 //!
-//! A trailer at the end of the file locates the sections. All integers are
-//! little-endian.
+//! A trailer at the end of the file locates the sections and holds a checksum
+//! of each, computed over the section's bytes and every page's offset, so a
+//! section that was altered, or that belongs to another version of the file,
+//! fails to read. All integers are little-endian.
 //!
 //! ```text
 //! page 0 bytes | page 1 bytes | ... | zone map | derived bounds | trailer
 //! section entry: flags u8 (bit 0: interval present), low i128, high i128,
 //!                non_null u32                                    (37 bytes)
 //! trailer:       each page's offset u64, the zone map's offset and length,
-//!                the bounds' offset and length, the page count, the trailer's
-//!                own length, and the magic, all u64
+//!                the bounds' offset and length, the two sections' checksums,
+//!                the page count, the trailer's own length, and the magic,
+//!                all u64
 //! ```
 
 use std::fs::File;
@@ -27,7 +30,7 @@ use std::path::Path;
 
 use super::paged::{self, PagedColumn};
 
-const MAGIC: u64 = 0x5749_544e_5047_4631; // "WITNPGF1"
+const MAGIC: u64 = 0x5749_544e_5047_4632; // "WITNPGF2"
 const ENTRY_BYTES: usize = 1 + 16 + 16 + 4;
 
 /// Which per-page summary a planner reads from the footer.
@@ -44,6 +47,8 @@ pub struct PagedFileLayout {
     pub offsets: Vec<u64>,
     zone_map: (u64, u64),
     bounds: (u64, u64),
+    zone_map_checksum: u64,
+    bounds_checksum: u64,
 }
 
 /// One page's entry in a footer section.
@@ -58,6 +63,13 @@ impl PagedFileLayout {
         match summary {
             Summary::ZoneMap => self.zone_map,
             Summary::DerivedBounds => self.bounds,
+        }
+    }
+
+    fn checksum(&self, summary: Summary) -> u64 {
+        match summary {
+            Summary::ZoneMap => self.zone_map_checksum,
+            Summary::DerivedBounds => self.bounds_checksum,
         }
     }
 
@@ -81,23 +93,22 @@ pub fn write(column: &PagedColumn, path: &Path) -> Result<PagedFileLayout, Strin
     }
     let mut section = |entries: &mut dyn Iterator<Item = Result<SummaryEntry, String>>| {
         let start = position;
+        let mut bytes = Vec::new();
         for entry in entries {
             let entry = entry?;
             let (flags, (low, high)) = match entry.interval {
                 Some(interval) => (1_u8, interval),
                 None => (0_u8, (0, 0)),
             };
-            out.write_all(&[flags]).map_err(|error| error.to_string())?;
-            out.write_all(&low.to_le_bytes())
-                .map_err(|error| error.to_string())?;
-            out.write_all(&high.to_le_bytes())
-                .map_err(|error| error.to_string())?;
+            bytes.push(flags);
+            bytes.extend_from_slice(&low.to_le_bytes());
+            bytes.extend_from_slice(&high.to_le_bytes());
             let non_null = u32::try_from(entry.non_null).map_err(|_| "page too large")?;
-            out.write_all(&non_null.to_le_bytes())
-                .map_err(|error| error.to_string())?;
-            position += ENTRY_BYTES as u64;
+            bytes.extend_from_slice(&non_null.to_le_bytes());
         }
-        Ok::<_, String>((start, position - start))
+        out.write_all(&bytes).map_err(|error| error.to_string())?;
+        position += bytes.len() as u64;
+        Ok::<_, String>((start, position - start, section_checksum(&bytes, &offsets)))
     };
     let zone_map = section(&mut column.pages().iter().map(|page| {
         Ok(SummaryEntry {
@@ -112,11 +123,9 @@ pub fn write(column: &PagedColumn, path: &Path) -> Result<PagedFileLayout, Strin
         })
     }))?;
     let mut trailer = Vec::new();
-    for value in offsets
-        .iter()
-        .copied()
-        .chain([zone_map.0, zone_map.1, bounds.0, bounds.1])
-    {
+    for value in offsets.iter().copied().chain([
+        zone_map.0, zone_map.1, bounds.0, bounds.1, zone_map.2, bounds.2,
+    ]) {
         trailer.extend_from_slice(&value.to_le_bytes());
     }
     trailer.extend_from_slice(&(offsets.len() as u64).to_le_bytes());
@@ -126,8 +135,10 @@ pub fn write(column: &PagedColumn, path: &Path) -> Result<PagedFileLayout, Strin
     out.flush().map_err(|error| error.to_string())?;
     Ok(PagedFileLayout {
         offsets,
-        zone_map,
-        bounds,
+        zone_map: (zone_map.0, zone_map.1),
+        bounds: (bounds.0, bounds.1),
+        zone_map_checksum: zone_map.2,
+        bounds_checksum: bounds.2,
     })
 }
 
@@ -156,7 +167,7 @@ pub fn open(file: &File) -> Result<PagedFileLayout, String> {
         .map_err(|error| error.to_string())?;
     let words = trailer.len() / 8;
     let pages = word(&trailer, words - 3) as usize;
-    if words != pages + 4 + 3 {
+    if words != pages + 6 + 3 {
         return Err("paged file trailer does not match its page count".into());
     }
     let offsets = (0..pages).map(|index| word(&trailer, index)).collect();
@@ -165,6 +176,8 @@ pub fn open(file: &File) -> Result<PagedFileLayout, String> {
         offsets,
         zone_map: section(0),
         bounds: section(2),
+        zone_map_checksum: word(&trailer, pages + 4),
+        bounds_checksum: word(&trailer, pages + 5),
     })
 }
 
@@ -181,6 +194,9 @@ pub fn read_summary(
     let mut bytes = vec![0_u8; length as usize];
     file.read_exact_at(&mut bytes, offset)
         .map_err(|error| error.to_string())?;
+    if section_checksum(&bytes, &layout.offsets) != layout.checksum(summary) {
+        return Err("footer section fails its checksum".into());
+    }
     bytes
         .chunks_exact(ENTRY_BYTES)
         .map(|entry| {
@@ -195,4 +211,18 @@ pub fn read_summary(
             Ok(SummaryEntry { interval, non_null })
         })
         .collect()
+}
+
+/// FNV-1a over a section's bytes and then every page offset: binds the
+/// section to the pages it describes, so it detects a section that was
+/// altered or written for another version of the file. It detects
+/// corruption, not a writer that lies.
+fn section_checksum(section: &[u8], offsets: &[u64]) -> u64 {
+    section
+        .iter()
+        .copied()
+        .chain(offsets.iter().flat_map(|offset| offset.to_le_bytes()))
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
+        })
 }

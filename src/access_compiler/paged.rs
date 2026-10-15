@@ -74,7 +74,10 @@ impl PagePolicy {
             }
         };
         let mut candidates = self.menu.iter().map(wrap).collect::<Vec<_>>();
-        if nullable {
+        // Only a page without values needs the bare bit-packed fallback: a
+        // page with values encodes under the menu, and bare bit-packing would
+        // save a frame-of-reference base at the cost of the page's bound.
+        if values.iter().all(Option::is_none) {
             candidates.push(Recipe::Nullable {
                 rank_interval: self.rank_interval,
                 values: Box::new(Recipe::BitPack),
@@ -94,6 +97,82 @@ impl PagePolicy {
         }
         best.ok_or_else(|| "no recipe in the page menu encodes this page".into())
     }
+}
+
+/// Whether the page's bytes bear out what its codec tree asserts about its
+/// dictionaries: every table the tree calls sorted holds strictly increasing
+/// entries. Reads each such table once, O(entries); decodes nothing.
+pub fn dictionaries_sorted(column: &EncodedColumn) -> Result<bool, String> {
+    let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+    let mut table = Vec::new();
+    for node in column.decoder.nodes() {
+        if let DecoderNode::Dictionary {
+            dictionary,
+            entries,
+            sorted_unique: true,
+            ..
+        } = *node
+        {
+            session.read_i64_table(dictionary, entries, &mut table)?;
+            if !table.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Verifies a page's dictionaries when it is sealed, so the facts that rest
+/// on them are checked against the bytes rather than taken from the writer:
+/// a table that is not strictly increasing loses its sorted claim, and with
+/// it the bound and the order-preserving mapping derived from it; a page in
+/// which any id falls outside its table fails to decode and is rejected.
+/// Costs one read of each table and one decode of the page, once per page.
+pub fn verify_dictionaries(column: &mut EncodedColumn) -> Result<(), String> {
+    if !check_dictionaries(column)? {
+        let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+        let mut table = Vec::new();
+        let mut nodes = column.decoder.nodes().to_vec();
+        for node in &mut nodes {
+            if let DecoderNode::Dictionary {
+                dictionary,
+                entries,
+                sorted_unique,
+                ..
+            } = node
+                && *sorted_unique
+            {
+                session.read_i64_table(*dictionary, *entries, &mut table)?;
+                *sorted_unique = table.windows(2).all(|pair| pair[0] < pair[1]);
+            }
+        }
+        column.decoder = super::DecoderIr::new(nodes, column.decoder.root())?;
+    }
+    Ok(())
+}
+
+/// The work `verify_dictionaries` does on a page, without changing it:
+/// whether every table its tree calls sorted is, after a full decode that
+/// fails on any id outside its table. A page without a dictionary passes.
+pub fn check_dictionaries(column: &EncodedColumn) -> Result<bool, String> {
+    if !column
+        .decoder
+        .nodes()
+        .iter()
+        .any(|node| matches!(node, DecoderNode::Dictionary { .. }))
+    {
+        return Ok(true);
+    }
+    let sorted = dictionaries_sorted(column)?;
+    let rows = column.truth.len();
+    let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+    vector::scan(
+        &column.decoder,
+        &mut session,
+        Span::new(0, rows)?,
+        &mut |_, _, _| Ok(()),
+    )?;
+    Ok(sorted)
 }
 
 /// A column stored as pages of at most `page_rows` rows.
@@ -137,7 +216,8 @@ impl PagedColumn {
     /// non-decreasing and starts no lower than the previous page ends.
     pub fn append(&mut self, values: &[Option<i64>], policy: &PagePolicy) -> Result<(), String> {
         for chunk in values.chunks(self.page_rows) {
-            let column = policy.encode(chunk)?;
+            let mut column = policy.encode(chunk)?;
+            verify_dictionaries(&mut column)?;
             let facts = derive_invariants(
                 &column.decoder,
                 column.page.layout(),
@@ -365,6 +445,20 @@ pub fn plan_between(
     high: i64,
     planning: Planning,
 ) -> Result<PageAction, String> {
+    let action = plan_between_unchecked(page, session, low, high, planning)?;
+    check_between(page, session, &action, low, high)?;
+    Ok(action)
+}
+
+/// `plan_between` without the check, to measure what checking costs. No
+/// query runs an unchecked plan.
+pub fn plan_between_unchecked(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    low: i64,
+    high: i64,
+    planning: Planning,
+) -> Result<PageAction, String> {
     if low > high {
         return Err("page predicate bounds are invalid".into());
     }
@@ -398,7 +492,6 @@ pub fn plan_between(
             action => action,
         }
     };
-    check_between(page, session, &action, low, high)?;
     Ok(action)
 }
 
@@ -830,6 +923,13 @@ pub trait PageStore: Sync {
         index: usize,
         access: Access,
     ) -> Result<ReadSession<'a>, String>;
+
+    /// Whether a page is planned from a read of the whole page that its
+    /// execution then reuses, rather than from a read of the fields its facts
+    /// cite: for storage where a small read costs about as much as a page.
+    fn plans_from_page_reads(&self) -> bool {
+        false
+    }
 }
 
 /// Why a session reads a page. Planning reads a few fields; executing a
@@ -884,6 +984,27 @@ impl PageStore for FileStore<'_> {
             self.file,
             offset,
         ))
+    }
+}
+
+/// A file store that plans every page from one read of the whole page and
+/// executes the page from that same read. On storage where a small random
+/// read costs about as much as reading a page, planning in place then costs
+/// no read beyond the ones a scan makes; pages it skips are still read.
+pub struct WholePageFileStore<'f>(pub FileStore<'f>);
+
+impl PageStore for WholePageFileStore<'_> {
+    fn session<'a>(
+        &'a self,
+        page: &'a Page,
+        index: usize,
+        _access: Access,
+    ) -> Result<ReadSession<'a>, String> {
+        self.0.session(page, index, Access::Execute)
+    }
+
+    fn plans_from_page_reads(&self) -> bool {
+        true
     }
 }
 
@@ -951,6 +1072,35 @@ pub fn sum_where_in(
     {
         return Err("SUM WHERE pages cover different rows".into());
     }
+    if selector_store.plans_from_page_reads() {
+        // Each candidate page is read once: planned from that read, and
+        // executed from it unless its plan skips it.
+        let page_results = run_pages(end - first, threads, |offset| {
+            let index = first + offset;
+            let selector_page = &selector.pages[index];
+            let mut session = selector_store.session(selector_page, index, Access::Execute)?;
+            let action = plan_between(selector_page, &mut session, low, high, planning)?;
+            let mut page_counts = PageCounts::default();
+            page_counts.record(&action);
+            let (sum, rows, executed) = execute_page(
+                (selector_page, session),
+                (&value.pages[index], value_store),
+                index,
+                action,
+                (low, high),
+                planning,
+            )?;
+            page_counts.add(&executed);
+            Ok((sum, rows, page_counts))
+        })?;
+        let (mut total, mut matched) = (0_i128, 0);
+        for (sum, rows, page_counts) in page_results {
+            total = total.checked_add(sum).ok_or("SUM WHERE overflow")?;
+            matched += rows;
+            counts.add(&page_counts);
+        }
+        return Ok((total, matched, counts));
+    }
     // Pages are planned on the worker pool once there are enough of them;
     // a column of a few pages is planned on the calling thread.
     let actions = run_pages(end - first, threads, |offset| {
@@ -972,92 +1122,15 @@ pub fn sum_where_in(
     let page_results = run_pages(work.len(), threads, |slot| {
         let (index, action) = &work[slot];
         let selector_page = &selector.pages[*index];
-        let value_page = &value.pages[*index];
-        let mut counts = PageCounts::default();
-        let mut session = selector_store.session(selector_page, *index, Access::Execute)?;
-        let action = action.clone();
-        // A scan of frame-of-reference codes, or a translation of sorted
-        // dictionary ids, over a value page of plain codes runs as one fused
-        // pass over both pages.
-        let compare = match action {
-            PageAction::Scan => Some(vector::CodeCompare::Offset),
-            PageAction::Translate(_) => Some(vector::CodeCompare::SortedDictionary),
-            _ => None,
-        };
-        if let Some(compare) = compare {
-            let mut value_session = value_store.session(value_page, *index, Access::Execute)?;
-            let fused = if plan_sum(value_page, &mut value_session, planning)? == SumAction::Decode
-            {
-                vector::fused_sum_between(
-                    &selector_page.column.decoder,
-                    &mut session,
-                    &value_page.column.decoder,
-                    &mut value_session,
-                    Span::new(0, selector_page.rows())?,
-                    (low, high),
-                    compare,
-                )?
-            } else {
-                None
-            };
-            counts.account(&value_session);
-            if let Some((sum, matched)) = fused {
-                verify_footer(selector_page, &mut session, planning)?;
-                counts.account(&session);
-                return Ok((sum, matched, counts));
-            }
-        }
-        // Search and acceptance select a few contiguous spans; a scan or a
-        // code translation may select rows anywhere, which a bitmap carries
-        // at one bit per row and the value page consumes in one pass.
-        let selected = match action {
-            PageAction::Skip(_) => {
-                counts.account(&session);
-                return Ok((0, 0, counts));
-            }
-            PageAction::Translate(_) | PageAction::Scan => Selected::Bitmap(
-                execute_between_selection(selector_page, &mut session, &action, low, high)?,
-            ),
-            _ => Selected::Spans(execute_between(
-                selector_page,
-                &mut session,
-                &action,
-                low,
-                high,
-            )?),
-        };
-        let matched = match &selected {
-            Selected::Spans(ranges) => ranges.iter().map(|range| range.len()).sum::<usize>(),
-            Selected::Bitmap(selection) => selection.count(),
-        };
-        if !matches!(action, PageAction::Accept(_)) {
-            verify_footer(selector_page, &mut session, planning)?;
-        }
-        counts.account(&session);
-        if matched == 0 {
-            return Ok((0, 0, counts));
-        }
-        let mut session = value_store.session(value_page, *index, Access::Execute)?;
-        let sum_action = plan_sum(value_page, &mut session, planning)?;
-        if matches!(sum_action, SumAction::Constant(_)) {
-            counts.constant_sums += 1;
-        }
-        let sum = match &selected {
-            Selected::Spans(ranges) => execute_sum(value_page, &mut session, &sum_action, ranges)?,
-            Selected::Bitmap(selection) => {
-                // A fused pass decodes every row between the first and last
-                // match; when the matches form few spans, summing span by
-                // span decodes only the matching rows.
-                let hull = selection.hull().map_or(0, |hull| hull.len());
-                if selection.run_count() * SPAN_COST_ROWS < hull {
-                    execute_sum(value_page, &mut session, &sum_action, &selection.ranges())?
-                } else {
-                    execute_sum_selection(value_page, &mut session, &sum_action, selection)?
-                }
-            }
-        };
-        counts.account(&session);
-        Ok((sum, matched, counts))
+        let session = selector_store.session(selector_page, *index, Access::Execute)?;
+        execute_page(
+            (selector_page, session),
+            (&value.pages[*index], value_store),
+            *index,
+            action.clone(),
+            (low, high),
+            planning,
+        )
     })?;
     let mut total = 0_i128;
     let mut matched = 0;
@@ -1067,6 +1140,116 @@ pub fn sum_where_in(
         counts.add(&page_counts);
     }
     Ok((total, matched, counts))
+}
+
+/// Executes one planned selector page and sums the value page over the rows
+/// it selects: the sum, the matched rows, and the reads both pages made.
+/// `session` is the selector page's session, which may already hold the
+/// bytes its plan read.
+fn execute_page(
+    (selector_page, mut session): (&Page, ReadSession<'_>),
+    (value_page, value_store): (&Page, &dyn PageStore),
+    index: usize,
+    action: PageAction,
+    (low, high): (i64, i64),
+    planning: Planning,
+) -> Result<(i128, usize, PageCounts), String> {
+    let mut counts = PageCounts::default();
+    // A scan of frame-of-reference codes, or a translation of sorted
+    // dictionary ids, over a value page of plain codes runs as one fused
+    // pass over both pages.
+    let compare = match action {
+        PageAction::Scan => Some(vector::CodeCompare::Offset),
+        PageAction::Translate(_) => Some(vector::CodeCompare::SortedDictionary),
+        _ => None,
+    };
+    if let Some(compare) = compare {
+        let mut value_session = value_store.session(value_page, index, Access::Execute)?;
+        let fused = if plan_sum(value_page, &mut value_session, planning)? == SumAction::Decode {
+            vector::fused_sum_between(
+                &selector_page.column.decoder,
+                &mut session,
+                &value_page.column.decoder,
+                &mut value_session,
+                Span::new(0, selector_page.rows())?,
+                (low, high),
+                compare,
+            )?
+        } else {
+            None
+        };
+        counts.account(&value_session);
+        if let Some((sum, matched)) = fused {
+            verify_footer(selector_page, &mut session, planning)?;
+            counts.account(&session);
+            return Ok((sum, matched, counts));
+        }
+    }
+    // Search and acceptance select a few contiguous spans; a scan or a
+    // code translation may select rows anywhere, which a bitmap carries
+    // at one bit per row and the value page consumes in one pass.
+    let selected =
+        match action {
+            PageAction::Skip(_) => {
+                counts.account(&session);
+                return Ok((0, 0, counts));
+            }
+            PageAction::Translate(_) | PageAction::Scan => Selected::Bitmap(
+                execute_between_selection(selector_page, &mut session, &action, low, high)?,
+            ),
+            _ => {
+                let spans = execute_between(selector_page, &mut session, &action, low, high)?;
+                // An accepted page with scattered nulls yields one span per
+                // run of values; past a few, one pass over a bitmap sums them
+                // for less than a pass per span.
+                let hull = match (spans.first(), spans.last()) {
+                    (Some(first), Some(last)) => last.end - first.start,
+                    _ => 0,
+                };
+                if spans.len() * SPAN_COST_ROWS < hull || spans.len() <= 1 {
+                    Selected::Spans(spans)
+                } else {
+                    let mut selection =
+                        vector::Selection::empty(Span::new(0, selector_page.rows())?);
+                    for span in &spans {
+                        selection.set_range(span.start, span.end);
+                    }
+                    Selected::Bitmap(selection)
+                }
+            }
+        };
+    let matched = match &selected {
+        Selected::Spans(ranges) => ranges.iter().map(|range| range.len()).sum::<usize>(),
+        Selected::Bitmap(selection) => selection.count(),
+    };
+    if !matches!(action, PageAction::Accept(_)) {
+        verify_footer(selector_page, &mut session, planning)?;
+    }
+    counts.account(&session);
+    if matched == 0 {
+        return Ok((0, 0, counts));
+    }
+    let mut session = value_store.session(value_page, index, Access::Execute)?;
+    let sum_action = plan_sum(value_page, &mut session, planning)?;
+    if matches!(sum_action, SumAction::Constant(_)) {
+        counts.constant_sums += 1;
+    }
+    let sum = match &selected {
+        Selected::Spans(ranges) => execute_sum(value_page, &mut session, &sum_action, ranges)?,
+        Selected::Bitmap(selection) => {
+            // A fused pass decodes every row between the first and last
+            // match; when the matches form few spans, summing span by
+            // span decodes only the matching rows.
+            let hull = selection.hull().map_or(0, |hull| hull.len());
+            if selection.run_count() * SPAN_COST_ROWS < hull {
+                execute_sum(value_page, &mut session, &sum_action, &selection.ranges())?
+            } else {
+                execute_sum_selection(value_page, &mut session, &sum_action, selection)?
+            }
+        }
+    };
+    counts.account(&session);
+    Ok((sum, matched, counts))
 }
 
 /// One conjunct of a conjunctive predicate: `low <= value <= high` on

@@ -107,6 +107,11 @@ path = "tests/paged_conjunctions.rs"
 required-features = ["experiment"]
 
 [[test]]
+name = "selective_kernels"
+path = "tests/selective_kernels.rs"
+required-features = ["experiment"]
+
+[[test]]
 name = "paged_file"
 path = "tests/paged_file.rs"
 required-features = ["experiment"]
