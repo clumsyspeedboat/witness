@@ -4,7 +4,8 @@ use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
-    ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    RowFilter, RowSelection,
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::BoundaryOrder;
@@ -174,6 +175,50 @@ pub fn parquet_indexed_sum(
     parquet_indexed_sum_reader(bytes, lower, upper, 0)
 }
 
+/// A Parquet file in memory whose footer and page index were parsed once,
+/// when it was loaded. A query against it builds its reader from the parsed
+/// metadata, so its time is reading, decoding and filtering pages, as a
+/// reader with a metadata cache would spend it.
+#[derive(Clone)]
+pub struct ParquetTable {
+    bytes: Bytes,
+    metadata: ArrowReaderMetadata,
+}
+
+impl ParquetTable {
+    pub fn load(bytes: Bytes) -> Result<Self, String> {
+        let metadata = ArrowReaderMetadata::load(&bytes, reader_options())
+            .map_err(|error| error.to_string())?;
+        Ok(Self { bytes, metadata })
+    }
+
+    fn builder(&self) -> ParquetRecordBatchReaderBuilder<Bytes> {
+        ParquetRecordBatchReaderBuilder::new_with_metadata(
+            self.bytes.clone(),
+            self.metadata.clone(),
+        )
+    }
+}
+
+/// `parquet_indexed_sum` on a loaded table: page-index pruning without
+/// parsing the page index again.
+pub fn parquet_indexed_sum_loaded(
+    table: &ParquetTable,
+    lower: i64,
+    upper: i64,
+) -> Result<ParquetAggregate, String> {
+    indexed_sum_from(table.builder(), lower, upper, 0)
+}
+
+/// `parquet_full_sum` on a loaded table: every page decoded and filtered.
+pub fn parquet_full_sum_loaded(
+    table: &ParquetTable,
+    lower: i64,
+    upper: i64,
+) -> Result<ParquetAggregate, String> {
+    full_sum_from(table.builder(), lower, upper, 0)
+}
+
 pub fn parquet_boundary_sum(
     bytes: Bytes,
     lower: i64,
@@ -267,10 +312,18 @@ fn parquet_full_sum_reader<T: ChunkReader + 'static>(
     upper: i64,
     bytes_read: usize,
 ) -> Result<ParquetAggregate, String> {
-    let batches = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options())
-        .map_err(|error| error.to_string())?
-        .build()
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options())
         .map_err(|error| error.to_string())?;
+    full_sum_from(builder, lower, upper, bytes_read)
+}
+
+fn full_sum_from<T: ChunkReader + 'static>(
+    builder: ParquetRecordBatchReaderBuilder<T>,
+    lower: i64,
+    upper: i64,
+    bytes_read: usize,
+) -> Result<ParquetAggregate, String> {
+    let batches = builder.build().map_err(|error| error.to_string())?;
     let mut sum = 0i128;
     let mut matched_rows = 0usize;
     let mut timestamp_values_examined = 0usize;
@@ -279,6 +332,21 @@ fn parquet_full_sum_reader<T: ChunkReader + 'static>(
         let timestamps = int64_column(&batch, 0)?;
         let values = int64_column(&batch, 1)?;
         timestamp_values_examined += batch.num_rows();
+        if timestamps.null_count() == 0 && values.null_count() == 0 {
+            // Without nulls, compare, mask and add without a branch. A batch
+            // of i64 values cannot overflow an i128.
+            let (mut batch_sum, mut batch_rows) = (0_i128, 0_usize);
+            for (&timestamp, &value) in timestamps.values().iter().zip(values.values().iter()) {
+                let hit = lower <= timestamp && timestamp < upper;
+                batch_rows += usize::from(hit);
+                batch_sum += i128::from(value) & -i128::from(hit);
+            }
+            matched_rows += batch_rows;
+            sum = sum
+                .checked_add(batch_sum)
+                .ok_or_else(|| "Parquet sum overflow".to_string())?;
+            continue;
+        }
         for index in 0..batch.num_rows() {
             if !timestamps.is_null(index) {
                 let timestamp = timestamps.value(index);
@@ -324,14 +392,11 @@ fn parquet_late_sum_reader<T: ChunkReader + 'static>(
             .ok_or_else(|| {
                 arrow_schema::ArrowError::CastError("expected Int64 timestamp".into())
             })?;
-        Ok(BooleanArray::from_iter((0..timestamps.len()).map(
-            |index| {
-                (!timestamps.is_null(index)).then(|| {
-                    let timestamp = timestamps.value(index);
-                    lower <= timestamp && timestamp < upper
-                })
-            },
-        )))
+        // One comparison per value, packed 64 at a time; a null timestamp
+        // stays null, which the row filter drops.
+        Ok(BooleanArray::from_unary(timestamps, |timestamp| {
+            lower <= timestamp && timestamp < upper
+        }))
     });
     let timestamp_values_examined = usize::try_from(builder.metadata().file_metadata().num_rows())
         .map_err(|_| "Parquet row count exceeds usize")?;
@@ -351,6 +416,15 @@ fn parquet_indexed_sum_reader<T: ChunkReader + 'static>(
 ) -> Result<ParquetAggregate, String> {
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options())
         .map_err(|error| error.to_string())?;
+    indexed_sum_from(builder, lower, upper, bytes_read)
+}
+
+fn indexed_sum_from<T: ChunkReader + 'static>(
+    builder: ParquetRecordBatchReaderBuilder<T>,
+    lower: i64,
+    upper: i64,
+    bytes_read: usize,
+) -> Result<ParquetAggregate, String> {
     let candidates = page_index_candidate_ranges(builder.metadata(), lower, upper, false)?;
     let candidate_ranges = candidates.ranges;
     let timestamp_values_examined = candidate_ranges.iter().map(|range| range.len()).sum();
@@ -367,14 +441,11 @@ fn parquet_indexed_sum_reader<T: ChunkReader + 'static>(
             .ok_or_else(|| {
                 arrow_schema::ArrowError::CastError("expected Int64 timestamp".into())
             })?;
-        Ok(BooleanArray::from_iter((0..timestamps.len()).map(
-            |index| {
-                (!timestamps.is_null(index)).then(|| {
-                    let timestamp = timestamps.value(index);
-                    lower <= timestamp && timestamp < upper
-                })
-            },
-        )))
+        // One comparison per value, packed 64 at a time; a null timestamp
+        // stays null, which the row filter drops.
+        Ok(BooleanArray::from_unary(timestamps, |timestamp| {
+            lower <= timestamp && timestamp < upper
+        }))
     });
     let batches = builder
         .with_row_selection(selection)
@@ -411,14 +482,11 @@ fn parquet_boundary_sum_reader<T: ChunkReader + 'static>(
             .ok_or_else(|| {
                 arrow_schema::ArrowError::CastError("expected Int64 timestamp".into())
             })?;
-        Ok(BooleanArray::from_iter((0..timestamps.len()).map(
-            |index| {
-                (!timestamps.is_null(index)).then(|| {
-                    let timestamp = timestamps.value(index);
-                    lower <= timestamp && timestamp < upper
-                })
-            },
-        )))
+        // One comparison per value, packed 64 at a time; a null timestamp
+        // stays null, which the row filter drops.
+        Ok(BooleanArray::from_unary(timestamps, |timestamp| {
+            lower <= timestamp && timestamp < upper
+        }))
     });
     let batches = builder
         .with_row_selection(selection)
@@ -590,6 +658,17 @@ fn sum_projected_values(
         let batch = batch.map_err(|error| error.to_string())?;
         let values = int64_column(&batch, 0)?;
         matched_rows += values.len();
+        if values.null_count() == 0 {
+            let batch_sum = values
+                .values()
+                .iter()
+                .map(|&value| i128::from(value))
+                .sum::<i128>();
+            sum = sum
+                .checked_add(batch_sum)
+                .ok_or_else(|| "Parquet sum overflow".to_string())?;
+            continue;
+        }
         for index in 0..values.len() {
             if !values.is_null(index) {
                 sum = sum

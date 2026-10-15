@@ -8,6 +8,8 @@ mod checker;
 mod common;
 #[path = "paged_study/corpus.rs"]
 mod corpus;
+#[path = "paged_study/faults.rs"]
+mod faults;
 #[path = "paged_study/measure.rs"]
 mod measure;
 

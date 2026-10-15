@@ -10,7 +10,7 @@ use witness::access_compiler::Recipe;
 /// Rows per page, for Witness pages and Parquet data pages alike, unless
 /// `WITNESS_PAGE_ROWS` sets another size for a sensitivity run.
 pub const PAGE_ROWS: usize = 16_384;
-const REPEATS: usize = 5;
+pub const REPEATS: usize = 5;
 const TARGET_NS: u128 = 2_000_000;
 
 /// Encodings whose rows a reader reaches directly: by offset, through a

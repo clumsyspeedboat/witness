@@ -14,15 +14,18 @@ use witness::access_compiler::paged::{self, PageCounts, PagePolicy, PagedColumn,
 use witness::access_compiler::{
     ClosureMode, ReadSession, derive_invariants, primitive_rule_fingerprint,
 };
-use witness::experiment::time_window::{parquet_full_sum, parquet_indexed_sum, parquet_table_file};
+use witness::experiment::time_window::{
+    ParquetTable, parquet_full_sum_loaded, parquet_indexed_sum_loaded, parquet_table_file,
+};
 use witness::experiment::types::Column;
 
-use crate::checker;
 use crate::common::{
-    PAGE_ROWS, benchmark, compact_menu, csv, direct_menu, page_rows, quote, truth,
+    PAGE_ROWS, REPEATS, benchmark, compact_menu, csv, direct_menu, interleaved, page_rows, quote,
+    truth,
 };
 use crate::corpus::{self, Pair};
 use crate::workload::predicates;
+use crate::{checker, faults};
 
 const DEFAULT_RESULT_DIR: &str = "experiments/results/paged_study";
 const SCALING_PAIRS: usize = 12;
@@ -142,6 +145,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
 
     write_layouts(&result_dir, &columns, &pairs, &layouts, &parquet)?;
+    // Parquet footers and page indexes are parsed once, here, so a timed
+    // query reads and decodes pages as a reader with a metadata cache would.
+    let tables = parquet
+        .iter()
+        .map(|(plain, zstd)| {
+            Ok((
+                ParquetTable::load(plain.clone())?,
+                ParquetTable::load(zstd.clone())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut queries = csv(format!("{result_dir}/queries.csv"))?;
     writeln!(
         queries,
@@ -161,7 +175,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         arm,
                         pair,
                         &layouts,
-                        &parquet[pair_id],
+                        Some(&tables[pair_id]),
                         predicate.low,
                         predicate.high,
                         1,
@@ -212,6 +226,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     if main_run {
         scaling(&result_dir, &columns, &pairs, &layouts)?;
         checker::run(&result_dir, &columns, &pairs, &layouts)?;
+        faults::run(&result_dir, &columns, &pairs, &layouts)?;
     }
     fs::write(
         format!("{result_dir}/freeze.csv"),
@@ -244,7 +259,7 @@ fn run_arm(
     arm: Arm,
     pair: &Pair,
     layouts: &[Layouts],
-    parquet: &(Bytes, Bytes),
+    parquet: Option<&(ParquetTable, ParquetTable)>,
     low: i64,
     high: i64,
     threads: usize,
@@ -277,15 +292,12 @@ fn run_arm(
             })
         }
         Arm::ParquetIndexed { compressed } | Arm::ParquetFull { compressed } => {
-            let bytes = if compressed {
-                parquet.1.clone()
-            } else {
-                parquet.0.clone()
-            };
+            let tables = parquet.ok_or("a Parquet arm needs its loaded tables")?;
+            let table = if compressed { &tables.1 } else { &tables.0 };
             let result = if matches!(arm, Arm::ParquetIndexed { .. }) {
-                parquet_indexed_sum(bytes, low, upper)?
+                parquet_indexed_sum_loaded(table, low, upper)?
             } else {
-                parquet_full_sum(bytes, low, upper)?
+                parquet_full_sum_loaded(table, low, upper)?
             };
             Ok(Outcome {
                 sum: result.sum,
@@ -368,7 +380,7 @@ fn costs(
     let mut output = csv(format!("{result_dir}/costs.csv"))?;
     writeln!(
         output,
-        "pair,pages,rows,derive_ns,plan_ns,plan_logical_bytes,scan_ns"
+        "pair,pages,rows,derive_ns,verify_ns,plan_ns,plan_unchecked_ns,plan_logical_bytes,scan_ns"
     )?;
     for (pair_id, pair) in pairs.iter().enumerate() {
         let column = &layouts[pair.selector].direct;
@@ -383,25 +395,46 @@ fn costs(
             }
             Ok(())
         })?;
+        // Verifying the page's dictionaries when it is sealed: the work
+        // `verify_dictionaries` does, timed without changing the page.
+        let (_, verify_ns, _) = benchmark(|| {
+            for page in column.pages() {
+                black_box(paged::check_dictionaries(&page.column)?);
+            }
+            Ok(())
+        })?;
+        // Planning with and without the check, in interleaved rounds, so the
+        // difference is what checking costs.
         let mut plan_ns = Vec::with_capacity(predicates.len());
+        let mut plan_unchecked_ns = Vec::with_capacity(predicates.len());
         for predicate in &predicates {
-            let (_, median, _) = benchmark(|| {
-                for page in column.pages() {
-                    let mut session =
-                        ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
-                    black_box(paged::plan_between(
-                        page,
-                        &mut session,
-                        predicate.low,
-                        predicate.high,
-                        Planning::Facts,
-                    )?);
+            let plan = |checked: bool| {
+                move || {
+                    for page in column.pages() {
+                        let mut session =
+                            ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+                        let planner = if checked {
+                            paged::plan_between
+                        } else {
+                            paged::plan_between_unchecked
+                        };
+                        black_box(planner(
+                            page,
+                            &mut session,
+                            predicate.low,
+                            predicate.high,
+                            Planning::Facts,
+                        )?);
+                    }
+                    Ok::<_, String>(())
                 }
-                Ok(())
-            })?;
-            plan_ns.push(median);
+            };
+            let [checked, unchecked] = interleaved(&mut [plan(true), plan(false)], REPEATS)?;
+            plan_ns.push(checked.1);
+            plan_unchecked_ns.push(unchecked.1);
         }
         plan_ns.sort_by(f64::total_cmp);
+        plan_unchecked_ns.sort_by(f64::total_cmp);
         let predicate = &predicates[predicates.len() / 2];
         let mut plan_bytes = 0;
         for page in column.pages() {
@@ -420,10 +453,11 @@ fn costs(
         })?;
         writeln!(
             output,
-            "{pair_id},{},{},{derive_ns:.1},{:.1},{plan_bytes},{scan_ns:.1}",
+            "{pair_id},{},{},{derive_ns:.1},{verify_ns:.1},{:.1},{:.1},{plan_bytes},{scan_ns:.1}",
             column.pages().len(),
             column.rows(),
             plan_ns[plan_ns.len() / 2],
+            plan_unchecked_ns[plan_unchecked_ns.len() / 2],
         )?;
     }
     output.flush()?;
@@ -441,7 +475,6 @@ fn scaling(
     order.sort_by_key(|&index| std::cmp::Reverse(columns[pairs[index].selector].values.len()));
     let mut output = csv(format!("{result_dir}/scaling.csv"))?;
     writeln!(output, "pair,predicate,arm,threads,p25_ns,median_ns,p75_ns")?;
-    let no_parquet = (Bytes::new(), Bytes::new());
     for &pair_id in order.iter().take(SCALING_PAIRS) {
         let pair = &pairs[pair_id];
         for predicate in predicates(&columns[pair.selector].values)?
@@ -461,7 +494,7 @@ fn scaling(
                             arm,
                             pair,
                             layouts,
-                            &no_parquet,
+                            None,
                             predicate.low,
                             predicate.high,
                             threads,

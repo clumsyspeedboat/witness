@@ -17,7 +17,9 @@ use std::io::Write;
 use bytes::Bytes;
 use witness::access_compiler::paged::{self, PagePolicy, PagedColumn, Planning};
 use witness::experiment::datasets::scale_columns;
-use witness::experiment::time_window::{parquet_indexed_sum, parquet_table_file};
+use witness::experiment::time_window::{
+    ParquetTable, parquet_indexed_sum_loaded, parquet_table_file,
+};
 
 use common::{PAGE_ROWS, benchmark, csv, direct_menu, quote, truth};
 use workload::predicates;
@@ -66,6 +68,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?);
         // The plain file, for engines outside this crate to query.
         fs::write(format!("{export}/{}.parquet", selector.name), &parquet)?;
+        // Parsed once, outside every timing.
+        let table = ParquetTable::load(parquet.clone())?;
         for predicate in predicates(&selector.values)? {
             let expected = truth(
                 &selector.values,
@@ -121,7 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .upper_exclusive()
                 .map_err(|error| format!("{}: {error}", selector.name))?;
             let run = || {
-                parquet_indexed_sum(parquet.clone(), predicate.low, upper)
+                parquet_indexed_sum_loaded(&table, predicate.low, upper)
                     .map(|result| (result.sum, result.matched_rows))
             };
             if run()? != expected {

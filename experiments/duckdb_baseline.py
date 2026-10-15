@@ -216,8 +216,39 @@ def rows_scanned(con, sql):
     return info["cumulative_rows_scanned"]
 
 
-def measure(study, tables, writer, scratch):
-    for table, parquet, queries in tables:
+DIAGNOSED_TABLES = 3
+
+
+def operator_times(node, times):
+    """Seconds per operator in one profiled query, summed by operator name."""
+    name = node.get("operator_name") or node.get("operator_type") or node.get("name")
+    timing = node.get("operator_timing")
+    if name and timing is not None:
+        times[name] = times.get(name, 0.0) + float(timing)
+    for child in node.get("children", []):
+        operator_times(child, times)
+    return times
+
+
+def diagnose(con, study, table, sql, out):
+    """Which compression DuckDB chose for each column of the table, and where
+    one run of `sql` spends its time, by operator."""
+    for column, compressions in con.execute(
+        "SELECT column_name, string_agg(DISTINCT compression, '+' ORDER BY compression) "
+        "FROM pragma_storage_info('t') WHERE segment_type <> 'VALIDITY' "
+        "GROUP BY column_name ORDER BY column_name"
+    ).fetchall():
+        out.writerow([study, table, f"compression:{column}", compressions])
+    con.execute("PRAGMA enable_profiling='no_output'")
+    con.execute(sql).fetchall()
+    info = json.loads(con.get_profiling_information(format="json"))
+    con.execute("PRAGMA disable_profiling")
+    for name, seconds in sorted(operator_times(info, {}).items()):
+        out.writerow([study, table, f"operator:{name}", f"{seconds:.6f}"])
+
+
+def measure(study, tables, writer, scratch, diagnostics):
+    for position, (table, parquet, queries) in enumerate(tables):
         if not os.path.exists(parquet):
             sys.exit(f"missing {parquet}; run the {study} study first")
         database = os.path.join(scratch, f"{table}.duckdb")
@@ -229,6 +260,16 @@ def measure(study, tables, writer, scratch):
             "duckdb_native": "t",
             "duckdb_parquet": f"read_parquet('{parquet}')",
         }
+        if position < DIAGNOSED_TABLES and queries:
+            con.execute("SET threads = 1")
+            label, where, aggregate, _, _ = queries[len(queries) // 2]
+            diagnose(
+                con,
+                study,
+                f"{table}:{label}",
+                f"SELECT ({aggregate})::HUGEINT, COUNT(*) FROM t WHERE {where}",
+                diagnostics,
+            )
         for threads in THREADS[study]:
             con.execute(f"SET threads = {threads}")
             for label, where, aggregate, matched, expected in queries:
@@ -267,12 +308,15 @@ def main():
     os.makedirs(OUTPUT, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="witness-duckdb-")
     try:
-        for study in studies:
-            tables = QUERIES[study]()
-            with open(f"{OUTPUT}/{study}.csv", "w", newline="") as output:
-                writer = csv.writer(output)
-                writer.writerow(HEADER)
-                measure(study, tables, writer, scratch)
+        with open(f"{OUTPUT}/diagnostics.csv", "w", newline="") as diagnosed:
+            diagnostics = csv.writer(diagnosed)
+            diagnostics.writerow(["study", "table", "item", "value"])
+            for study in studies:
+                tables = QUERIES[study]()
+                with open(f"{OUTPUT}/{study}.csv", "w", newline="") as output:
+                    writer = csv.writer(output)
+                    writer.writerow(HEADER)
+                    measure(study, tables, writer, scratch, diagnostics)
         con = duckdb.connect()
         con.execute("SET threads = 1")
         _, floor, _ = benchmark(lambda: con.execute("SELECT 1").fetchone())

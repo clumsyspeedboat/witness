@@ -98,6 +98,12 @@ printf '8/8 provenance and checksums\n'
   printf 'cargo='; cargo --version
   printf 'python='; python3 --version
   printf 'duckdb='; python3 -c 'import duckdb; print(duckdb.__version__)'
+  printf 'cpu='; lscpu | sed -n 's/^Model name: *//p'
+  printf 'topology='
+  lscpu | awk -F: '/^Socket\(s\)|^Core\(s\) per socket|^Thread\(s\) per core|^NUMA node\(s\)/ {
+    gsub(/^ +/, "", $2); printf "%s=%s; ", $1, $2 }'
+  printf '\n'
+  printf 'rustflags=%s\n' "${RUSTFLAGS:-none}"
   printf 'rows_per_column=131072\nscale_reference_rows=16384\n'
   printf 'timing_scope=resident buffers plus cold XFS mechanism control; single-threaded except paged scaling (1-64 threads)\n'
 } > "$RESULTS/PROVENANCE.txt"

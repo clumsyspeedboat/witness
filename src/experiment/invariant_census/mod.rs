@@ -1,5 +1,6 @@
 mod candidates;
 mod model;
+mod page_facts;
 mod report;
 mod statistics;
 
@@ -58,6 +59,33 @@ pub fn run(result_dir: &str, max_rows: usize) -> Result<(), Box<dyn Error>> {
         candidate_rows.extend(candidates);
     }
     report::write_all(result_dir, &column_rows, &page_rows, &candidate_rows)?;
+    // Facts per page under the paged writer, column by column on every core.
+    let next = AtomicUsize::new(0);
+    let facts = Mutex::new((0..columns.len()).map(|_| None).collect::<Vec<_>>());
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(columns.len()) {
+            scope.spawn(|| {
+                loop {
+                    let id = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(column) = columns.get(id) else {
+                        break;
+                    };
+                    let rows = page_facts::page_facts(id, column).map_err(|error| {
+                        format!(
+                            "{}/{}/{}: {error}",
+                            column.group, column.source, column.name
+                        )
+                    });
+                    facts.lock().unwrap()[id] = Some(rows);
+                }
+            });
+        }
+    });
+    let mut page_fact_rows = Vec::new();
+    for slot in facts.into_inner().unwrap() {
+        page_fact_rows.extend(slot.ok_or("census column has no page facts")??);
+    }
+    page_facts::write(result_dir, &page_fact_rows)?;
     println!(
         "invariant census wrote {} columns, {} pages, and {} encoding candidates",
         column_rows.len(),
