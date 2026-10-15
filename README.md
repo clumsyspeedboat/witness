@@ -62,14 +62,14 @@ cells over **32** sources at 131,072 rows per column.
 | | |
 |---|---|
 | non-decreasing, constant columns included | **10.4%** of columns |
-| where evidence exists and is reachable | **0.14x** a sortedness-aware Parquet reference |
+| where evidence exists and is reachable | **0.16x** a sortedness-aware Parquet reference |
 | price of keeping that access | **2.10x** the bytes |
-| cold disk, fewest-bytes plan | **1.27x** slower than reading the whole file (1,083 scattered reads against one) |
+| cold disk, fewest-bytes plan | **1.28x** slower than reading the whole file (1,083 scattered reads against one) |
 
 The paged study ([`experiments/results/paged_study/`](experiments/results/paged_study/))
 runs **1,166** selective SUM queries over 364 column pairs paged at 16,384 rows,
 every page planned from its own facts, against Parquet read with and without
-its page index, against DuckDB on the same rows
+its page index (footer and page index parsed once per file), against DuckDB on the same rows
 ([`experiments/results/duckdb/`](experiments/results/duckdb/)), and against
 the same executor planning from an exact stored zone map.
 [`experiments/results/paged_scale/`](experiments/results/paged_scale/) repeats
@@ -77,14 +77,16 @@ them on TPC-H SF10 lineitem on 1 to 64 threads.
 
 | | |
 |---|---|
-| paged queries against uncompressed Parquet with page index | **0.32x** the time (median) |
-| the same queries against DuckDB on its own storage, one thread | **0.71x** the time (median) |
-| planned from facts against an exact stored zone map, same executor | **0.96x** the time (geometric mean) |
-| string range and prefix predicates against the zone map, same executor | **0.65x** the time (geometric mean) |
+| paged queries against the faster Parquet read (with or without its page index) | **0.42x** the time (median) |
+| the same queries against DuckDB on its own storage, one thread | **0.59x** the time (median) |
+| planned from facts against an exact stored zone map, same executor | **0.97x** the time (geometric mean) |
+| string range and prefix predicates against the zone map, same executor | **0.64x** the time (geometric mean) |
 | string and float predicates against DuckDB, one thread | **0.14x** and **0.27x** the time (median) |
-| page skips that bounds read from encodings recover | **96.8%** of what stored min/max allow |
-| mutated plans that would answer wrongly, rejected by the checker | **379,753** of 379,753 |
-| sorted key, 0.1% of 60 M rows, one thread | **0.05 ms** against Parquet's 0.98 ms |
+| TPC-H Q6 on SF10 lineitem against DuckDB, one thread | **0.73x** the time |
+| page skips that bounds read from encodings recover | **97.0%** of what stored min/max allow |
+| queries a zone map with a neighbour's or truncated statistics answers wrongly | **88** and **645** of 1,166; planned from facts, none |
+| mutated plans that would answer wrongly, rejected by the checker | **380,210** of 380,210 |
+| sorted key, 0.1% of 60 M rows, one thread | **0.05 ms** against Parquet's 0.28 ms |
 
 Derived knowledge helps when it is present, cheap to reach, and not erased by the
 storage layer beneath it. A plain scan was always correct anyway.

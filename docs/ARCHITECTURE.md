@@ -192,16 +192,27 @@ dictionary, or null suppression. These run on *lanes*: the stored codes of a
 validity bitmap marks. Predicates compare codes with the predicate shifted by
 the base (or with a dictionary code range), sums add codes and the base once
 per batch, and dictionary sums gather from the table read once per page. A
-scanned or translated selector page over a value lane is answered by one
-fused, branch-free pass that compares, masks, and adds, without building a
-selection.
+scanned or translated selector page over a value lane marks its matching rows
+64 at a time. A batch that keeps at most one row in eight (judged from the
+batch before it) reads the value page only at those rows, through
+`ReadSession::unpack_bits_at`, mapping rows to stored values by popcount on
+pages with nulls; other batches are compared, masked, and added in one
+branch-free pass. Conjunctions read later conjuncts and aggregated columns only
+at the rows that survive, once few do.
 
-Every session a paged query opens comes from a `PageStore`: `InMemory`, or a
-`FileStore` that reads one column's pages from a file at known offsets. A
-session opened to plan reads only the fields it needs; one opened to execute
-fetches its page with its first read. `paged_file.rs` writes a column as its
-pages followed by two footer sections, a zone map and the derived bounds,
-each readable with one positioned read.
+When `PagedColumn::append` seals a page, `verify_dictionaries` reads every
+dictionary the codec tree calls sorted and confirms it is strictly increasing
+(a table that is not loses its order facts), and decodes the page once, which
+rejects any id outside its table.
+
+Every session a paged query opens comes from a `PageStore`: `InMemory`, a
+`FileStore` that reads one column's pages from a file at known offsets, or a
+`WholePageFileStore`, which plans each page from one read of the whole page
+that its execution reuses. A `FileStore` session opened to plan reads only the
+fields it needs; one opened to execute fetches its page with its first read.
+`paged_file.rs` writes a column as its pages followed by two footer sections,
+a zone map and the derived bounds, each readable with one positioned read and
+each with a checksum over its bytes and the page offsets.
 
 Two modules carry the calculus beyond integers. `floats.rs` maps every
 non-NaN double to an `i64` key that sorts like the double, so all integer

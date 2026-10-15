@@ -41,8 +41,8 @@ and selective-range reconstruction.
 
 This policy difference is intentional. It creates the measured storage/access
 frontier: the access-ready layout uses 2.10x the bytes of the size-selected
-layout at the canonical aggregate, while its source-level delivered-access
-median is 0.18x.
+layout at the canonical aggregate, while its source-level median query time
+against the Parquet boundary reader is 0.16x.
 
 These are finite policies, not an exhaustive global optimizer.
 
@@ -90,7 +90,7 @@ The claim-bearing predicate experiment includes:
 - complete predicate-to-SUM answers checked for equality before timing.
 
 The source-bootstrap interval for access-ready Witness versus the Parquet
-boundary path is [0.08, 0.14], below parity.
+boundary path is [0.09, 0.17], below parity.
 
 ### PCodec and ORC
 

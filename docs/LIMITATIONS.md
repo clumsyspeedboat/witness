@@ -20,15 +20,15 @@ These constraints are part of the result.
   The separate paged study compares complete queries across multiple pages;
   its medians summarize the fixed workload rather than a population sample.
 - Access-ready Witness versus the Parquet boundary-search path has source
-  median 0.14x with a 95% bootstrap interval [0.08, 0.14]. The interval sits
+  median 0.16x with a 95% bootstrap interval [0.09, 0.17]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
-  (families, then sources within each) gives [0.06, 0.30]. Collapsing each
-  family to a single draw instead gives 0.27x [0.10, 1.05], which spans parity,
+  (families, then sources within each) gives [0.06, 0.28]. Collapsing each
+  family to a single draw instead gives 0.26x [0.10, 1.27], which spans parity,
   but that weights a one-column family like a ten-column one and the singleton
   families are the worst cases. Distribution-free, 9 of the 12 families favour
   the compiled plan: a Wilcoxon signed-rank test on the log ratios gives a
-  two-sided p=0.012. The weaker sign test, which discards magnitude, gives a
+  two-sided p=0.016. The weaker sign test, which discards magnitude, gives a
   one-sided p=0.073 on the same data. Read the separation as evidence for the
   mechanism on this corpus, not as a population-level claim.
 - Monotone and no-fact classes are imbalanced. The no-fact class has six
@@ -68,7 +68,7 @@ These constraints are part of the result.
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.27x a full read; coalescing issued 119 calls and reached 1.00x. This is a
+  1.28x a full read; coalescing issued 119 calls and reached 1.00x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is
@@ -117,9 +117,19 @@ These constraints are part of the result.
 - The paged cold-read study (`paged_cold_study`) evicts the OS page cache
   and confirms eviction with `mincore`, but cannot clear the RAID
   controller's cache, so it too is OS-cold, not device-cold.
-- Structural facts assume checked arithmetic. Checked facts trust the encoder
-  and an authenticated descriptor checksum. The checksum detects accidental
-  or test tampering; it is not a cryptographic trust system.
+- Structural facts assume checked arithmetic. Checked facts (order flags,
+  null placement, the column certificate) trust the encoder and a descriptor
+  checksum, which covers the page header only; the data fields are not
+  checksummed. The checksum detects accidental or test tampering; it is not a
+  cryptographic trust system.
+- The codec tree (codecs, widths, fields, dictionary sizes) travels beside a
+  page in memory rather than inside its bytes, so a paged file is read with
+  the column it was written from. Dictionary order is verified against the
+  page's bytes when the page is sealed.
+- A footer of derived bounds is checked against every page a query reads;
+  pages a query skips or accepts without reading rely on it. One page appended
+  out of order ends the column certificate, and the column is then planned
+  page by page.
 - Certificates are generated and consumed by the same Rust implementation.
   An independent reader implementation has not yet validated the format.
 - The rule grammar is finite. “Optimal” means the selected plan under this

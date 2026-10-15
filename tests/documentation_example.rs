@@ -272,8 +272,8 @@ fn claim_bearing_prose_matches_the_manifest() {
             claim(&manifest, "WitPagedCells").to_string(),
         ),
         (
-            "WitPagedPlainMedian",
-            format!("{}x", claim(&manifest, "WitPagedPlainMedian")),
+            "WitPagedFactsOverBestPlainMedian",
+            format!("{}x", claim(&manifest, "WitPagedFactsOverBestPlainMedian")),
         ),
         (
             "WitPagedBoundSkipRecovery",
