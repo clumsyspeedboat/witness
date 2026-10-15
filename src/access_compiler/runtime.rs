@@ -431,14 +431,24 @@ impl<'a> ReadSession<'a> {
             (1_u64 << width) - 1
         };
         out.reserve(indices.len());
+        // Miniblocks that abut without padding put row r at bit r * width,
+        // which needs no division per row.
+        let abutting = miniblock_bytes * 8 == miniblock_rows * width_bits;
         for &index in indices {
             let row = span.start + index as usize;
             if row >= span.end {
                 return Err("selective unpack position is outside its span".into());
             }
-            let bit_offset = (row % miniblock_rows) * width_bits;
-            let offset = (row / miniblock_rows) * miniblock_bytes + bit_offset / 8 - first_byte;
-            let bit = bit_offset % 8;
+            let (offset, bit) = if abutting {
+                let bit = row * width_bits - first_byte * 8;
+                (bit >> 3, bit & 7)
+            } else {
+                let bit_offset = (row % miniblock_rows) * width_bits;
+                (
+                    (row / miniblock_rows) * miniblock_bytes + bit_offset / 8 - first_byte,
+                    bit_offset % 8,
+                )
+            };
             let value = if width_bits <= 57 && offset + 8 <= bytes.len() {
                 let word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
                 (word >> bit) & mask

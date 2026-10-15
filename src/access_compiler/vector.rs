@@ -447,7 +447,7 @@ pub fn fused_conjunction(
     let mut gathered = vec![Vec::new(); values.len()];
     let mut positions = Vec::with_capacity(BATCH_ROWS);
     let mut words = Vec::with_capacity(BATCH_WORDS);
-    let mut scratch = Selective::default();
+    let mut scratch = Selective::new();
     // Batches start at multiples of 8 when the rows do, as they must for a
     // lane to be read at chosen rows.
     let aligned = rows.start.is_multiple_of(8);
@@ -760,8 +760,11 @@ pub fn fused_sum_between(
     // share of codes the predicate covers.
     let mut selective =
         rows.start.is_multiple_of(8) && matcher.selectivity(domain) * SELECTIVE_SHARE as f64 <= 1.0;
-    let (mut words, mut positions) = (Vec::with_capacity(BATCH_WORDS), Vec::new());
-    let mut scratch = Selective::default();
+    let (mut words, mut positions) = (
+        Vec::with_capacity(BATCH_WORDS),
+        Vec::with_capacity(BATCH_ROWS),
+    );
+    let mut scratch = Selective::new();
     let mut row = rows.start;
     while row < rows.end {
         let end = (row + BATCH_ROWS).min(rows.end);
@@ -1070,8 +1073,9 @@ const BATCH_WORDS: usize = BATCH_ROWS.div_ceil(64);
 /// this many of them; past that, unpacking the whole batch costs less.
 const SELECTIVE_SHARE: usize = 8;
 
-/// Buffers a selective read reuses from batch to batch.
-#[derive(Default)]
+/// Buffers a selective read reuses from batch to batch, allocated once at the
+/// size of a batch: growing them page by page makes threads contend in the
+/// allocator.
 struct Selective {
     /// Per requested position: 1 if the row holds a value, 0 if it is null.
     valid: Vec<u64>,
@@ -1083,6 +1087,18 @@ struct Selective {
     /// The codes read at `stored`.
     read: Vec<u64>,
     words: [u64; BATCH_WORDS],
+}
+
+impl Selective {
+    fn new() -> Self {
+        Self {
+            valid: Vec::with_capacity(BATCH_ROWS),
+            codes: Vec::with_capacity(BATCH_ROWS),
+            stored: Vec::with_capacity(BATCH_ROWS),
+            read: Vec::with_capacity(BATCH_ROWS),
+            words: [0; BATCH_WORDS],
+        }
+    }
 }
 
 /// The rows of `batch` that `matcher` keeps, as words of 64 rows; a null row
