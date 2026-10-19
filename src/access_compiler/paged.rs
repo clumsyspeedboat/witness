@@ -449,7 +449,9 @@ impl PagedColumn {
 /// it clears the deleted rows from the rows it selects.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeletionVector {
-    page_rows: usize,
+    /// First row and row count of each page of the table when the vector
+    /// was made; pages need not be full, since each append starts new ones.
+    pages_at: Vec<(usize, usize)>,
     rows: usize,
     /// Per page with a deleted row: one bit per row of the page.
     pages: BTreeMap<usize, Vec<u64>>,
@@ -460,23 +462,36 @@ impl DeletionVector {
     /// No row deleted yet from the table `column` belongs to.
     pub fn for_column(column: &PagedColumn) -> Self {
         Self {
-            page_rows: column.page_rows,
+            pages_at: column
+                .pages
+                .iter()
+                .map(|page| (page.start, page.rows()))
+                .collect(),
             rows: column.rows,
             pages: BTreeMap::new(),
             deleted: 0,
         }
     }
 
+    /// The page holding `row` and the row's position in it.
+    fn locate(&self, row: usize) -> Option<(usize, usize)> {
+        if row >= self.rows {
+            return None;
+        }
+        let page = self.pages_at.partition_point(|&(start, _)| start <= row) - 1;
+        Some((page, row - self.pages_at[page].0))
+    }
+
     /// Deletes `row`; whether it was live until now.
     pub fn delete(&mut self, row: usize) -> Result<bool, String> {
-        if row >= self.rows {
-            return Err("deleted row lies outside the table".into());
-        }
-        let (page, bit) = (row / self.page_rows, row % self.page_rows);
+        let (page, bit) = self
+            .locate(row)
+            .ok_or("deleted row lies outside the table")?;
+        let rows = self.pages_at[page].1;
         let words = self
             .pages
             .entry(page)
-            .or_insert_with(|| vec![0; self.page_rows.div_ceil(64)]);
+            .or_insert_with(|| vec![0; rows.div_ceil(64)]);
         let mask = 1_u64 << (bit % 64);
         if words[bit / 64] & mask != 0 {
             return Ok(false);
@@ -487,10 +502,11 @@ impl DeletionVector {
     }
 
     pub fn is_deleted(&self, row: usize) -> bool {
-        let (page, bit) = (row / self.page_rows, row % self.page_rows);
-        self.pages
-            .get(&page)
-            .is_some_and(|words| words[bit / 64] >> (bit % 64) & 1 == 1)
+        self.locate(row).is_some_and(|(page, bit)| {
+            self.pages
+                .get(&page)
+                .is_some_and(|words| words[bit / 64] >> (bit % 64) & 1 == 1)
+        })
     }
 
     /// Rows deleted so far.
@@ -503,10 +519,16 @@ impl DeletionVector {
         self.pages.get(&index).map(Vec::as_slice)
     }
 
-    /// Fails unless the vector describes rows of `column`'s table, which may
-    /// since have grown by appended rows; those are live.
+    /// Fails unless the vector describes `column`'s pages, which may since
+    /// have been followed by appended pages; their rows are live.
     fn check(&self, column: &PagedColumn) -> Result<(), String> {
-        if self.page_rows != column.page_rows || self.rows > column.rows {
+        let same = column.pages.len() >= self.pages_at.len()
+            && self
+                .pages_at
+                .iter()
+                .zip(&column.pages)
+                .all(|(&(start, rows), page)| start == page.start && rows == page.rows());
+        if !same {
             return Err("deletion vector does not describe this table's pages".into());
         }
         Ok(())

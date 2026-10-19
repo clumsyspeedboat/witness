@@ -230,7 +230,8 @@ rejects any id outside its table.
 
 Rows are deleted through a `DeletionVector`: one bit per row of a table whose
 columns are paged alike, kept beside the pages, so no page and no fact
-changes. Every fact a plan cites holds for each row of its page, and so for
+changes. It locates a row by the starts of the table's pages, which need not
+be full: every append starts new pages. Every fact a plan cites holds for each row of its page, and so for
 any subset of them; `sum_where_live` and `aggregate_where_live` plan every
 page as though no row were deleted, and execution clears deleted rows from a
 batch's 64-row match words (or from the page's selection) before any value
@@ -240,7 +241,8 @@ Every session a paged query opens comes from a `PageStore`: `InMemory`, a
 `FileStore` that reads one column's pages from a file at known offsets, or a
 `WholePageFileStore`, which plans each page from one read of the whole page
 that its execution reuses. A `FileStore` session opened to plan reads only the
-fields it needs; one opened to execute fetches its page with its first read.
+fields it needs, and a sorted dictionary it searches in one read rather than
+a read per probe; one opened to execute fetches its page with its first read.
 `paged_file.rs` writes a column as its pages followed by two footer sections,
 a zone map and the derived bounds, each readable with one positioned read and
 each with a checksum over its bytes and the page offsets.

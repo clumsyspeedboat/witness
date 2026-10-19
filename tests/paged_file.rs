@@ -194,3 +194,42 @@ fn an_altered_footer_section_fails_its_checksum() {
     let error = paged_file::read_summary(&file, &layout, Summary::DerivedBounds).unwrap_err();
     assert!(error.contains("checksum"), "{error}");
 }
+
+#[test]
+fn planning_dictionary_pages_in_place_reads_each_table_once() {
+    // Values are multiples of 10, so a range inside one gap holds no value
+    // though every page's bounds straddle it: every page is skipped after a
+    // search of its dictionary.
+    let values = (0..20 * PAGE as i64)
+        .map(|row| Some(row * 7_919 % 1_000 * 10))
+        .collect::<Vec<_>>();
+    let only_dictionary = PagePolicy::smallest(vec![Recipe::Dictionary(Box::new(Recipe::BitPack))]);
+    let column = PagedColumn::from_values(&values, PAGE, &only_dictionary).unwrap();
+    let path = scratch("dictionary.wpf");
+    let layout = paged_file::write(&column, &path).unwrap();
+    let file = File::open(&path).unwrap();
+    let store = FileStore {
+        file: &file,
+        offsets: layout.offsets.clone(),
+    };
+    let (sum, rows, counts) = sum_where_in(
+        (&column, &store),
+        (&column, &store),
+        5_001,
+        5_009,
+        Planning::Facts,
+        1,
+    )
+    .unwrap();
+    assert_eq!((sum, rows), (0, 0));
+    assert_eq!(counts.code_skipped, column.pages().len());
+    // A few reads per page: the bound's two entries and the table, not a read
+    // per probe of the search.
+    assert!(
+        counts.io_operations <= 4 * column.pages().len(),
+        "{} reads for {} pages",
+        counts.io_operations,
+        column.pages().len()
+    );
+    fs::remove_file(&path).unwrap();
+}

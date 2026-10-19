@@ -2300,14 +2300,20 @@ impl RunSearch {
 }
 
 /// How many entries of a sorted table lie below `bound`: the code of the
-/// first entry at or above it, found by one binary search.
+/// first entry at or above it, found by one binary search. Resident bytes
+/// are probed where they lie; from storage, where each probe would be a
+/// request of its own, the table is fetched in one read and searched.
 pub fn entries_below(
     session: &mut ReadSession<'_>,
     table: FieldId,
     entries: usize,
     bound: i64,
 ) -> Result<usize, String> {
-    table_bound(session, table, entries, bound, false)
+    if session.resident() {
+        return table_bound(session, table, entries, bound, false);
+    }
+    let values = session.read_i64_values(table, 0, entries)?;
+    Ok(values.partition_point(|&entry| entry < bound))
 }
 
 /// `search_monotone` within each block of `max_rows` rows: the shape a

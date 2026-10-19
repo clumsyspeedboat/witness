@@ -127,6 +127,11 @@ path = "tests/paged_deletes.rs"
 required-features = ["experiment"]
 
 [[test]]
+name = "paged_differential"
+path = "tests/paged_differential.rs"
+required-features = ["experiment"]
+
+[[test]]
 name = "strings"
 path = "tests/strings.rs"
 required-features = ["experiment"]

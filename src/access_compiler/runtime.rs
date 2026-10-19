@@ -138,6 +138,12 @@ impl<'a> ReadSession<'a> {
         }
     }
 
+    /// Whether the session reads the page's bytes where they already lie in
+    /// memory, rather than fetching them from a byte bundle or a file.
+    pub fn resident(&self) -> bool {
+        matches!(self.source, ReadSource::Memory)
+    }
+
     pub fn metrics(&self) -> AccessMetrics {
         if !self.track_access {
             return AccessMetrics {
