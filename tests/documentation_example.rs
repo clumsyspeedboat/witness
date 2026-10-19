@@ -194,6 +194,47 @@ fn claim_bearing_prose_matches_the_manifest() {
 
     let boundary = format!("median {median}x with a 95% bootstrap interval [{ci_low}, {ci_high}]");
     assert!(limitations.contains(&boundary), "stale boundary summary");
+    // The same headline under the family structure of the sources.
+    for (name, rendered) in [
+        (
+            "cluster interval",
+            format!(
+                "gives [{}, {}]",
+                claim(&manifest, "WitClusterDirectBoundaryCiLow"),
+                claim(&manifest, "WitClusterDirectBoundaryCiHigh")
+            ),
+        ),
+        (
+            "family view",
+            format!(
+                "{}x [{}, {}]",
+                claim(&manifest, "WitFamilyDirectBoundaryMedian"),
+                claim(&manifest, "WitFamilyDirectBoundaryCiLow"),
+                claim(&manifest, "WitFamilyDirectBoundaryCiHigh")
+            ),
+        ),
+        (
+            "family wins",
+            format!(
+                "{} of the {} families",
+                claim(&manifest, "WitFamilyWins"),
+                claim(&manifest, "WitFamilies")
+            ),
+        ),
+        (
+            "Wilcoxon p",
+            format!("p={}", claim(&manifest, "WitFamilyWilcoxonP")),
+        ),
+        (
+            "sign-test p",
+            format!("p={}", claim(&manifest, "WitFamilySignP")),
+        ),
+    ] {
+        assert!(
+            limitations.contains(&rendered),
+            "stale {name}: expected {rendered:?}"
+        );
+    }
     assert!(
         encodings.contains(&format!("[{ci_low}, {ci_high}], below parity")),
         "stale encoding-scope interval"

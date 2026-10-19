@@ -23,8 +23,8 @@ These constraints are part of the result.
   median 0.15x with a 95% bootstrap interval [0.08, 0.16]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
-  (families, then sources within each) gives [0.06, 0.28]. Collapsing each
-  family to a single draw instead gives 0.26x [0.10, 1.27], which spans parity,
+  (families, then sources within each) gives [0.06, 0.26]. Collapsing each
+  family to a single draw instead gives 0.25x [0.09, 1.15], which spans parity,
   but that weights a one-column family like a ten-column one and the singleton
   families are the worst cases. Distribution-free, 9 of the 12 families favour
   the compiled plan: a Wilcoxon signed-rank test on the log ratios gives a

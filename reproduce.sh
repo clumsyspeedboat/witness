@@ -133,7 +133,7 @@ printf '8/8 provenance and checksums\n'
     docs/generated/artifacts/* \
     experiments/generated/documentation_example/generated.rs \
     src/bin/witness_explore.rs \
-    notebooks/witness_paper_companion.ipynb
+    docs/notebooks/witness_companion.ipynb
 } > "$RESULTS/CHECKSUMS.sha256"
 
 printf 'Complete: canonical results, claim manifest, and walkthrough regenerated.\n'

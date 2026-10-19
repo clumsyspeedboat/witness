@@ -96,9 +96,9 @@ them on TPC-H SF10 lineitem on 1 to 64 threads.
 Derived knowledge helps when it is present, cheap to reach, and not erased by the
 storage layer beneath it. A plain scan was always correct anyway.
 
-- [Runnable companion notebook](notebooks/witness_paper_companion.ipynb): the
-  study cell by cell, each cell labelled with the paper section it mirrors.
-  Toy examples compute live; measured results load from the canonical CSVs.
+- [Runnable companion notebook](docs/notebooks/witness_companion.ipynb): the
+  study cell by cell, from one page's bytes to the paged results. Toy
+  examples compute live; measured results load from the canonical CSVs.
 - [Walkthrough](docs/WALKTHROUGH.md): the idea without implementation detail.
 - [Generated worked example](docs/generated/END_TO_END_EXAMPLE.md): 16 rows,
   five columns, real serialized files, exact offsets, plans, and byte counts.
