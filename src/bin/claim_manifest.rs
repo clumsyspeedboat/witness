@@ -1510,6 +1510,37 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             &format!("WitScaleOrderkey{suffix}ParquetMs"),
             &format!("{:.2}", parquet / 1e6),
         );
+        // Parquet's time on this query moves between runs far more than
+        // Witness's, so its range across runs is reported beside it.
+        let mut runs = Vec::new();
+        for dir in std::iter::once(PAGED_SCALE.to_string())
+            .chain(REPEATS.iter().map(|dir| format!("{dir}/paged_scale")))
+        {
+            let scaling = read_csv(&format!("{dir}/scaling.csv"))?;
+            for row in &scaling {
+                if scaling.field(row, "selector")? == "c0_l_orderkey_x1"
+                    && scaling.field(row, "predicate")? == predicate
+                    && scaling.field(row, "arm")? == "parquet_plain_indexed"
+                    && scaling.field(row, "threads")? == "1"
+                {
+                    runs.push(scaling.field(row, "median_ns")?.parse::<f64>()? / 1e6);
+                }
+            }
+        }
+        runs.sort_by(f64::total_cmp);
+        let (Some(low), Some(high)) = (runs.first(), runs.last()) else {
+            return Err("scale orderkey rows are absent from a run".into());
+        };
+        define(
+            out,
+            &format!("WitScaleOrderkey{suffix}ParquetMsRunLow"),
+            &format!("{low:.2}"),
+        );
+        define(
+            out,
+            &format!("WitScaleOrderkey{suffix}ParquetMsRunHigh"),
+            &format!("{high:.2}"),
+        );
     }
     Ok(())
 }

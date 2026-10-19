@@ -280,6 +280,18 @@ fn claim_bearing_prose_matches_the_manifest() {
             format!("{}%", claim(&manifest, "WitPagedBoundSkipRecovery")),
         ),
         (
+            "WitPagedFactsOverZonemapGeo",
+            format!("{}x", claim(&manifest, "WitPagedFactsOverZonemapGeo")),
+        ),
+        (
+            "WitPagedFactsExtraSkipPercent",
+            format!("{}%", claim(&manifest, "WitPagedFactsExtraSkipPercent")),
+        ),
+        (
+            "WitDeleteRandomTenOverNone",
+            format!("{}x", claim(&manifest, "WitDeleteRandomTenOverNone")),
+        ),
+        (
             "WitScaleOrderkeyTenthMs",
             format!("{} ms", claim(&manifest, "WitScaleOrderkeyTenthMs")),
         ),
