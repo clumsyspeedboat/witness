@@ -867,6 +867,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     cold_claims(&mut out)?;
     ablation_claims(&mut out)?;
     fault_claims(&mut out)?;
+    delete_claims(&mut out)?;
     page_fact_claims(&mut out)?;
     distribution_claims(&mut out)?;
 
@@ -1120,7 +1121,10 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
     // Latency per (pair, predicate, arm), and the page decisions of the
     // Witness arm with facts.
     let mut latency = BTreeMap::<(String, String), BTreeMap<String, f64>>::new();
-    let mut decisions = [0_usize; 5]; // pages, skipped, accepted, exact skips, exact accepts
+    // pages, skipped, accepted, exact skips, exact accepts, dictionary skips
+    let mut decisions = [0_usize; 6];
+    // Skips and accepts of derived bounds alone, without the shortcuts.
+    let mut bound_decisions = [0_usize; 2];
     for row in &queries {
         let cell = (
             queries.field(row, "pair")?,
@@ -1138,11 +1142,17 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
                 "accepted",
                 "oracle_skipped",
                 "oracle_accepted",
+                "code_skipped",
             ]
             .into_iter()
             .enumerate()
             {
                 decisions[slot] += queries.field(row, name)?.parse::<usize>()?;
+            }
+        }
+        if arm == "witness_direct_factbounds" {
+            for (slot, name) in ["skipped", "accepted"].into_iter().enumerate() {
+                bound_decisions[slot] += queries.field(row, name)?.parse::<usize>()?;
             }
         }
     }
@@ -1218,21 +1228,58 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
     let [
         pages_total,
         skipped,
-        accepted,
+        _,
         exact_skipped,
         exact_accepted,
+        code_skipped,
     ] = decisions;
+    let [bound_skipped, bound_accepted] = bound_decisions;
     let percent = |part: usize, whole: usize| format!("{:.1}", part as f64 * 100.0 / whole as f64);
     define(out, "WitPagedSkippedPages", &percent(skipped, pages_total));
+    // What derived bounds alone recover of an exact zone map's decisions.
     define(
         out,
         "WitPagedBoundSkipRecovery",
-        &percent(skipped.min(exact_skipped), exact_skipped),
+        &percent(bound_skipped.min(exact_skipped), exact_skipped),
     );
     define(
         out,
         "WitPagedBoundAcceptRecovery",
-        &percent(accepted.min(exact_accepted), exact_accepted),
+        &percent(bound_accepted.min(exact_accepted), exact_accepted),
+    );
+    // Facts also skip pages whose dictionary holds no value in the range,
+    // and pages outside an ordered column's range: more than an exact zone
+    // map can.
+    define(
+        out,
+        "WitPagedFactsSkips",
+        &group_digits(&skipped.to_string()),
+    );
+    define(
+        out,
+        "WitPagedZonemapSkips",
+        &group_digits(&exact_skipped.to_string()),
+    );
+    define(
+        out,
+        "WitPagedCodeSkips",
+        &group_digits(&code_skipped.to_string()),
+    );
+    define(
+        out,
+        "WitPagedCodeSkipShare",
+        &percent(code_skipped, skipped),
+    );
+    if skipped < exact_skipped {
+        return Err("facts skip fewer pages than an exact zone map".into());
+    }
+    define(
+        out,
+        "WitPagedFactsExtraSkipPercent",
+        &format!(
+            "{:.0}",
+            (skipped - exact_skipped) as f64 * 100.0 / exact_skipped as f64
+        ),
     );
 
     let per_page = |name: &str| {
@@ -1819,6 +1866,28 @@ fn separation_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         writeln!(table, "{} & {cells} \\\\", group_digits(&rows.to_string()))?;
     }
     define(out, "WitPagedSizeRows", table.trim_end());
+    // The most planning costs against a scan, at any page size.
+    let mut plan_shares = Vec::new();
+    for dir in std::iter::once(PAGED.to_string()).chain(
+        PAGE_SIZES
+            .iter()
+            .map(|(rows, _)| format!("{PAGED}_rows{rows}")),
+    ) {
+        let costs = read_csv(&format!("{dir}/costs.csv"))?;
+        let shares = costs
+            .iter()
+            .map(|row| {
+                Ok(costs.field(row, "plan_ns")?.parse::<f64>()?
+                    / costs.field(row, "scan_ns")?.parse::<f64>()?)
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        plan_shares.push(median(&shares) * 100.0);
+    }
+    define(
+        out,
+        "WitPagedSizePlanMaxPercent",
+        &format!("{:.2}", plan_shares.iter().copied().fold(0.0, f64::max)),
+    );
 
     // Slack of derived bounds against exact statistics, over pages that
     // hold a value.
@@ -2892,7 +2961,7 @@ fn ablation_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             .entry(actions.field(row, "action")?)
             .or_default() += actions.field(row, "pages")?.parse::<f64>()?;
     }
-    let shortcut = ["search", "search_piecewise", "translate"];
+    let shortcut = ["search", "search_piecewise", "translate", "skip_codes"];
     let licensed = by_recipe
         .values()
         .filter(|actions| {
@@ -2966,7 +3035,7 @@ fn paged_tables(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         .map(|row| Ok((pairs.field(row, "pair")?, pairs.field(row, "group")?)))
         .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
 
-    let mut decisions = BTreeMap::<String, [usize; 6]>::new();
+    let mut decisions = BTreeMap::<String, [usize; 7]>::new();
     let mut bucket_selectivity = BTreeMap::<String, Vec<f64>>::new();
     let latency = paged_latency(PAGED)?;
     let mut group_pages = BTreeMap::<String, [usize; 2]>::new();
@@ -2994,6 +3063,7 @@ fn paged_tables(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             "searched",
             "translated",
             "scanned",
+            "code_skipped",
         ]
         .into_iter()
         .enumerate()
@@ -3013,16 +3083,27 @@ fn paged_tables(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         ("10pct", "10"),
         ("50pct", "50"),
     ] {
-        let [pages, skipped, accepted, searched, translated, scanned] = *decisions
+        let [
+            pages,
+            skipped,
+            accepted,
+            searched,
+            translated,
+            scanned,
+            code_skipped,
+        ] = *decisions
             .get(bucket)
             .ok_or("selectivity bucket is absent")?;
         let selectivities = &bucket_selectivity[bucket];
+        // Skips by bound (and by the column's order) apart from skips
+        // because the page's dictionary holds no value in the range.
         writeln!(
             table,
-            "{label}\\% & {} & {:.2} & {} & {} & {} & {} & {} \\\\",
+            "{label}\\% & {} & {:.2} & {} & {} & {} & {} & {} & {} \\\\",
             group_digits(&selectivities.len().to_string()),
             median(selectivities) * 100.0,
-            share(skipped, pages),
+            share(skipped - code_skipped, pages),
+            share(code_skipped, pages),
             share(accepted, pages),
             share(searched, pages),
             share(translated, pages),
@@ -3545,6 +3626,155 @@ fn fault_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         out,
         "WitFaultQueries",
         &group_digits(&get("neighbour", "zonemap")?[0].to_string()),
+    );
+    Ok(())
+}
+
+/// Median query time per (pair, predicate), deletion, and planner in one
+/// run of the deletion study, and the pages each plan skipped.
+type DeletionTimes = BTreeMap<(String, String), BTreeMap<(String, String), (f64, usize)>>;
+
+fn deletion_times(dir: &str) -> Result<DeletionTimes, Box<dyn Error>> {
+    let deletes = read_csv(&format!("{dir}/deletes.csv"))?;
+    let mut times = DeletionTimes::new();
+    for row in &deletes {
+        times
+            .entry((
+                deletes.field(row, "pair")?,
+                deletes.field(row, "predicate")?,
+            ))
+            .or_default()
+            .insert(
+                (deletes.field(row, "deletion")?, deletes.field(row, "arm")?),
+                (
+                    deletes.field(row, "median_ns")?.parse::<f64>()?,
+                    deletes.field(row, "skipped")?.parse::<usize>()?,
+                ),
+            );
+    }
+    Ok(times)
+}
+
+/// Per query, the time with `deletion` over the time with none, both under
+/// `planner`.
+fn deletion_ratios(times: &DeletionTimes, deletion: &str, planner: &str) -> Vec<f64> {
+    times
+        .values()
+        .filter_map(|cells| {
+            let with = cells.get(&(deletion.to_string(), planner.to_string()))?.0;
+            let without = cells.get(&("none".to_string(), planner.to_string()))?.0;
+            Some(with / without)
+        })
+        .collect()
+}
+
+/// Claims from the deletion study: what deleting a share of each table's
+/// rows costs a query planned as though none were deleted, under facts and
+/// under the zone map; and that no plan changed.
+fn delete_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let times = deletion_times(PAGED)?;
+    // A plan must not depend on the deletions.
+    for ((pair, predicate), cells) in &times {
+        for planner in ["facts", "zonemap"] {
+            let skips = cells
+                .iter()
+                .filter(|((_, arm), _)| arm == planner)
+                .map(|(_, (_, skipped))| *skipped)
+                .collect::<BTreeSet<_>>();
+            if skips.len() > 1 {
+                return Err(format!(
+                    "deleting rows changed the {planner} plan of {pair} {predicate}"
+                )
+                .into());
+            }
+        }
+    }
+    define(
+        out,
+        "WitDeleteQueries",
+        &group_digits(&times.len().to_string()),
+    );
+    let deletes = read_csv(&format!("{PAGED}/deletes.csv"))?;
+    let pairs = read_csv(&format!("{PAGED}/pairs.csv"))?;
+    let rows_of = pairs
+        .iter()
+        .map(|row| {
+            Ok((
+                pairs.field(row, "pair")?,
+                pairs.field(row, "rows")?.parse::<f64>()?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+    for (deletion, suffix) in [
+        ("random1", "RandomOne"),
+        ("random10", "RandomTen"),
+        ("block10", "BlockTen"),
+    ] {
+        // Share of each table's rows deleted, from one row per table.
+        let mut seen = BTreeSet::new();
+        let mut shares = Vec::new();
+        for row in &deletes {
+            let pair = deletes.field(row, "pair")?;
+            if deletes.field(row, "deletion")? == deletion && seen.insert(pair.clone()) {
+                let rows = rows_of.get(&pair).ok_or("deletion names an unknown pair")?;
+                shares.push(deletes.field(row, "deleted_rows")?.parse::<f64>()? / rows);
+            }
+        }
+        define(
+            out,
+            &format!("WitDelete{suffix}Percent"),
+            &format!("{:.1}", median(&shares) * 100.0),
+        );
+        define(
+            out,
+            &format!("WitDelete{suffix}OverNone"),
+            &format!("{:.2}", median(&deletion_ratios(&times, deletion, "facts"))),
+        );
+    }
+    define(
+        out,
+        "WitDeleteZonemapRandomTenOverNone",
+        &format!(
+            "{:.2}",
+            median(&deletion_ratios(&times, "random10", "zonemap"))
+        ),
+    );
+    for (deletion, suffix) in [("none", "None"), ("random10", "RandomTen")] {
+        let ratios = times
+            .values()
+            .filter_map(|cells| {
+                let facts = cells.get(&(deletion.to_string(), "facts".to_string()))?.0;
+                let zone_map = cells.get(&(deletion.to_string(), "zonemap".to_string()))?.0;
+                Some(facts / zone_map)
+            })
+            .collect::<Vec<_>>();
+        define(
+            out,
+            &format!("WitDeleteFactsOverZonemap{suffix}Geo"),
+            &format!("{:.2}", geometric_mean(&ratios)),
+        );
+    }
+    // The cost of deleting a tenth of the rows at random, in every run.
+    let mut values = Vec::new();
+    for dir in std::iter::once(PAGED.to_string())
+        .chain(REPEATS.iter().map(|dir| format!("{dir}/paged_study")))
+    {
+        values.push(median(&deletion_ratios(
+            &deletion_times(&dir)?,
+            "random10",
+            "facts",
+        )));
+    }
+    values.sort_by(f64::total_cmp);
+    define(
+        out,
+        "WitDeleteRandomTenOverNoneRunLow",
+        &format!("{:.2}", values[0]),
+    );
+    define(
+        out,
+        "WitDeleteRandomTenOverNoneRunHigh",
+        &format!("{:.2}", values[values.len() - 1]),
     );
     Ok(())
 }

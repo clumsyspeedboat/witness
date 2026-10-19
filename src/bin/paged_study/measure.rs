@@ -25,7 +25,7 @@ use crate::common::{
 };
 use crate::corpus::{self, Pair};
 use crate::workload::predicates;
-use crate::{checker, faults};
+use crate::{checker, deletes, faults};
 
 const DEFAULT_RESULT_DIR: &str = "experiments/results/paged_study";
 const SCALING_PAIRS: usize = 12;
@@ -159,7 +159,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut queries = csv(format!("{result_dir}/queries.csv"))?;
     writeln!(
         queries,
-        "pair,predicate,requested,low,high,matched_rows,expected_sum,pages,arm,p25_ns,median_ns,p75_ns,skipped,accepted,searched,translated,scanned,constant_sums,candidate_pages,oracle_skipped,oracle_accepted"
+        "pair,predicate,requested,low,high,matched_rows,expected_sum,pages,arm,p25_ns,median_ns,p75_ns,skipped,accepted,searched,translated,scanned,constant_sums,candidate_pages,oracle_skipped,oracle_accepted,code_skipped"
     )?;
     for (pair_id, pair) in pairs.iter().enumerate() {
         let selector = &columns[pair.selector].values;
@@ -195,7 +195,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let counts = outcome.counts;
                 writeln!(
                     queries,
-                    "{pair_id},{},{},{},{},{},{},{pages},{},{p25:.1},{median:.1},{p75:.1},{},{},{},{},{},{},{},{oracle_skipped},{oracle_accepted}",
+                    "{pair_id},{},{},{},{},{},{},{pages},{},{p25:.1},{median:.1},{p75:.1},{},{},{},{},{},{},{},{oracle_skipped},{oracle_accepted},{}",
                     predicate.label,
                     predicate.requested,
                     predicate.low,
@@ -213,6 +213,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .candidate_pages
                         .map(|pages| pages.to_string())
                         .unwrap_or_default(),
+                    counts.code_skipped,
                 )?;
             }
         }
@@ -227,6 +228,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         scaling(&result_dir, &columns, &pairs, &layouts)?;
         checker::run(&result_dir, &columns, &pairs, &layouts)?;
         faults::run(&result_dir, &columns, &pairs, &layouts)?;
+        deletes::run(&result_dir, &columns, &pairs, &layouts)?;
     }
     fs::write(
         format!("{result_dir}/freeze.csv"),

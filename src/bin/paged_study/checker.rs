@@ -11,7 +11,7 @@ use std::io::Write;
 
 use witness::access_compiler::paged::{self, Licence, Page, PageAction, Planning};
 use witness::access_compiler::{
-    Authorization, ClosureMode, NullPlacement, ReadSession, Span, push_range,
+    Authorization, ClosureMode, FactScope, NullPlacement, ReadSession, Span, push_range,
 };
 use witness::experiment::types::Column;
 
@@ -73,6 +73,16 @@ type Actions = BTreeMap<(String, &'static str), usize>;
 
 fn action_name(action: &PageAction) -> &'static str {
     match action {
+        // A skip because no dictionary code lies in the range, where the
+        // page's bounds straddle it.
+        PageAction::Skip(Licence {
+            fact:
+                Authorization::Fact {
+                    scope: FactScope::Mapping,
+                    ..
+                },
+            ..
+        }) => "skip_codes",
         PageAction::Skip(_) => "skip",
         PageAction::Accept(_) => "accept",
         PageAction::Search { .. } => "search",
