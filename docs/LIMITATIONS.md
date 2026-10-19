@@ -23,8 +23,8 @@ These constraints are part of the result.
   median 0.15x with a 95% bootstrap interval [0.08, 0.16]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
-  (families, then sources within each) gives [0.06, 0.26]. Collapsing each
-  family to a single draw instead gives 0.25x [0.09, 1.15], which spans parity,
+  (families, then sources within each) gives [0.06, 0.28]. Collapsing each
+  family to a single draw instead gives 0.26x [0.10, 1.14], which spans parity,
   but that weights a one-column family like a ten-column one and the singleton
   families are the worst cases. Distribution-free, 9 of the 12 families favour
   the compiled plan: a Wilcoxon signed-rank test on the log ratios gives a
@@ -68,7 +68,7 @@ These constraints are part of the result.
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.29x a full read; coalescing issued 119 calls and reached 1.00x. This is a
+  1.28x a full read; coalescing issued 119 calls and reached 1.00x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is
@@ -126,6 +126,10 @@ These constraints are part of the result.
   page in memory rather than inside its bytes, so a paged file is read with
   the column it was written from. Dictionary order is verified against the
   page's bytes when the page is sealed.
+- Planning in place from a file reads a dictionary it must search in one
+  request rather than one request per probe. That issues fewer requests but
+  reads every entry of a large dictionary; fetching only small tables whole and
+  probing large ones would balance the two, and is not yet done.
 - A footer of derived bounds is checked against every page a query reads;
   pages a query skips or accepts without reading rely on it. One page appended
   out of order ends the column certificate, and the column is then planned
