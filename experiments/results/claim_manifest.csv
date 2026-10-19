@@ -189,6 +189,8 @@ WitPagedZonemapSkips,"5,400"
 WitPagedCodeSkips,"1,519"
 WitPagedCodeSkipShare,22.5
 WitPagedFactsExtraSkipPercent,25
+WitPagedCodeSkipQueries,129
+WitPagedCodeSkipQueriesGeo,0.78
 WitPagedDeriveNsPerPage,292
 WitPagedPlanNsPerPage,84
 WitPagedPlanBytesPerPage,10.0

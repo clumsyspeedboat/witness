@@ -1281,6 +1281,36 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             (skipped - exact_skipped) as f64 * 100.0 / exact_skipped as f64
         ),
     );
+    // The queries in which some page was skipped for its dictionary, and
+    // how facts fare against the zone map on them.
+    let mut code_cells = BTreeSet::new();
+    for row in &queries {
+        if queries.field(row, "arm")? == "witness_direct_facts"
+            && queries.field(row, "code_skipped")?.parse::<usize>()? > 0
+        {
+            code_cells.insert((
+                queries.field(row, "pair")?,
+                queries.field(row, "predicate")?,
+            ));
+        }
+    }
+    let code_ratios = latency
+        .iter()
+        .filter(|(cell, _)| code_cells.contains(*cell))
+        .filter_map(|(_, arms)| {
+            Some(arms.get("witness_direct_facts")? / arms.get("witness_direct_zonemap")?)
+        })
+        .collect::<Vec<_>>();
+    define(
+        out,
+        "WitPagedCodeSkipQueries",
+        &group_digits(&code_ratios.len().to_string()),
+    );
+    define(
+        out,
+        "WitPagedCodeSkipQueriesGeo",
+        &format!("{:.2}", geometric_mean(&code_ratios)),
+    );
 
     let per_page = |name: &str| {
         costs
