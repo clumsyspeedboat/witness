@@ -11,7 +11,7 @@ use witness::access_compiler::paged::{
 };
 use witness::access_compiler::{
     ClosureMode, DecoderIr, DecoderNode, EncodedColumn, FieldLocation, InputColumn, ReadSession,
-    Recipe, SerializedPage, encode,
+    Recipe, SerializedPage, Span, encode, vector,
 };
 
 const PLANNERS: [Planning; 6] = [
@@ -330,6 +330,40 @@ proptest! {
                 paged::sum_where(&selector_pages, &value_pages, low, high, planning, 1).unwrap();
             prop_assert_eq!((sum, matched), truth(&selector, &value, low, high));
         }
+    }
+
+    /// A selection sum reads a batch only at its selected rows when they are
+    /// few, and unpacks it otherwise; both must add exactly the selected
+    /// values, whatever row the selection's first row falls on.
+    #[test]
+    fn selection_sums_equal_the_truth_however_sparse(
+        seed in 0_u64..1_000_000,
+        rows in 1_usize..6_000,
+        domain_bits in 1_u32..40,
+        null_every in prop::sample::select(vec![0_u64, 2, 9]),
+        per_mille in prop::sample::select(vec![1_u64, 20, 125, 400, 1_000]),
+        recipe in prop::sample::select(vec![0_u8, 1]),
+    ) {
+        let values = column(seed, rows, 1 << domain_bits, null_every);
+        let recipe = if recipe == 0 {
+            Recipe::For(bitpack())
+        } else {
+            Recipe::Dictionary(bitpack())
+        };
+        let pages = PagedColumn::from_values(&values, rows, &only(recipe)).unwrap();
+        let page = &pages.pages()[0];
+        let mut state = seed ^ 0x51_ec7;
+        let mut selection = vector::Selection::empty(Span::new(0, rows).unwrap());
+        let mut expected = 0_i128;
+        for (row, value) in values.iter().enumerate() {
+            if next(&mut state) % 1_000 < per_mille {
+                selection.set_range(row, row + 1);
+                expected += value.map_or(0, i128::from);
+            }
+        }
+        let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+        let sum = vector::sum_selection(&page.column.decoder, &mut session, &selection).unwrap();
+        prop_assert_eq!(sum, expected);
     }
 }
 

@@ -168,10 +168,30 @@ licenses it and, for a bound, the interval it read; `check_between` and
 | all-null | skip |
 | bound disjoint from the predicate | skip |
 | bound inside the predicate | accept every non-null row without decoding |
+| sorted dictionary with no entry in the predicate | skip |
 | non-decreasing | boundary search |
 | piecewise non-decreasing | search inside each block |
 | order-preserving sorted dictionary | translate to a code range |
 | none | scan |
+
+A sorted dictionary lists every value its page holds, at the root or under a
+nullable root. When the predicate lies strictly inside its first and last
+entries, one binary search finds the first entry at or above the predicate's
+low end; if that entry lies above the high end, no entry lies in the
+predicate, even though the page's bounds straddle it. The skip cites the
+dictionary's order-preserving mapping and records the empty code range;
+`check_between` reads the entries on either side of it, which in a sorted
+table show that none lies in the predicate. It is sound because
+`verify_dictionaries` checked every id against its table when the page was
+sealed. Like a search or a translation, it is a shortcut of the encoding:
+`Planning::FactBounds` scans such a page, and
+`Planning::StoredStatisticsPlus` skips it.
+
+When a page is sealed, the facts a planner consults at its root (bound
+sources, order and null placement, a sorted dictionary) are gathered from its
+fact set into a small summary, so planning reads a few fields instead of
+searching the set; every action still cites its fact, and the checker
+confirms the citation against the full set.
 
 SUM over a dense value page whose bound has equal ends multiplies instead of
 decoding. Every page is planned on the calling thread; only pages left with
@@ -184,7 +204,10 @@ can hold only to the recorded values, never to the bytes.
 Pages execute on `vector.rs`, which reads the decoder IR at run time and
 dispatches once per chunk: up to 1,024 decoded values, one run, or a stretch
 of nulls. Scattered matches travel as a one-bit-per-row `Selection` consumed
-in one masked pass; few matches are summed span by span.
+in one masked pass; few matches are summed span by span. On a page of runs
+(run-length codes, or a sorted dictionary over run-length ids) a boundary
+search probes run values and adds run lengths from the nearest run-index
+entry, rather than locating a row through the run index at every probe.
 
 Most pages are bit-packed codes under a frame-of-reference base, a
 dictionary, or null suppression. These run on *lanes*: the stored codes of a
@@ -204,6 +227,14 @@ When `PagedColumn::append` seals a page, `verify_dictionaries` reads every
 dictionary the codec tree calls sorted and confirms it is strictly increasing
 (a table that is not loses its order facts), and decodes the page once, which
 rejects any id outside its table.
+
+Rows are deleted through a `DeletionVector`: one bit per row of a table whose
+columns are paged alike, kept beside the pages, so no page and no fact
+changes. Every fact a plan cites holds for each row of its page, and so for
+any subset of them; `sum_where_live` and `aggregate_where_live` plan every
+page as though no row were deleted, and execution clears deleted rows from a
+batch's 64-row match words (or from the page's selection) before any value
+is read. An update is a delete and an append.
 
 Every session a paged query opens comes from a `PageStore`: `InMemory`, a
 `FileStore` that reads one column's pages from a file at known offsets, or a

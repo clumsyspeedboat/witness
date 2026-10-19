@@ -39,8 +39,8 @@ These constraints are part of the result.
 - The claim-bearing query shape is a selector predicate followed by an aligned
   SUM, with quantile-derived selectivities from roughly 0.1% to 50%.
 - GET, SUM, BETWEEN, selected-range SUM, and equality/membership controls test
-  individual mechanisms. Joins, group-by, top-k, updates, and multi-predicate
-  planning are not evaluated.
+  individual mechanisms. Joins, group-by, top-k, and in-place updates are not
+  evaluated; deletes are, as deletion vectors beside the pages.
 - The two additional plans are feasibility evidence, not precise ratios, but for
   different reasons. Dictionary range translation reuses the main predicate
   study's per-cell ratios, with the same harness and answer checks; its figure is
@@ -155,8 +155,11 @@ These constraints are part of the result.
 - The access-ready byte premium is 2.10x in the canonical aggregate. The
   smaller delivered closure is therefore purchased, not free.
 - Witness stores columns as independently encoded pages, appended and sealed,
-  with a checked order certificate across pages; pages are never updated in
-  place or deleted. It has no production multi-column table container, schema evolution,
+  with a checked order certificate across pages; pages are never rewritten in
+  place. Deleted rows are marked in a deletion vector held in memory beside the
+  pages: it is not part of the paged file format, deleted rows are never
+  compacted away, and a page's bounds are not tightened after deletes. It has
+  no production multi-column table container, schema evolution,
   encryption, checksummed payload blocks, transactions, crash recovery, or
   concurrent writer protocol.
 - Tiny artifacts in the generated walkthrough are mechanics examples.

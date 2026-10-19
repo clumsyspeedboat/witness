@@ -591,19 +591,21 @@ impl<'a> ReadSession<'a> {
         }
         match location {
             FieldLocation::Direct { offset } => {
-                let delivered = match self.mode {
-                    ClosureMode::Selective => Span::new(
-                        offset + span.start / read_granularity * read_granularity,
-                        offset
-                            + span
-                                .end
-                                .div_ceil(read_granularity)
-                                .saturating_mul(read_granularity)
-                                .min(length),
-                    )?,
-                    ClosureMode::FullPage => Span::new(0, self.page.bytes().len())?,
-                };
+                // Only an accounted or file-backed session records what a read
+                // delivers; an untracked read of resident bytes skips the work.
                 if self.track_access || !matches!(&self.source, ReadSource::Memory) {
+                    let delivered = match self.mode {
+                        ClosureMode::Selective => Span::new(
+                            offset + span.start / read_granularity * read_granularity,
+                            offset
+                                + span
+                                    .end
+                                    .div_ceil(read_granularity)
+                                    .saturating_mul(read_granularity)
+                                    .min(length),
+                        )?,
+                        ClosureMode::FullPage => Span::new(0, self.page.bytes().len())?,
+                    };
                     self.deliver(delivered)?;
                 }
                 let range = offset + span.start..offset + span.end;

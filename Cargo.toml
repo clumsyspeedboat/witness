@@ -117,6 +117,16 @@ path = "tests/paged_file.rs"
 required-features = ["experiment"]
 
 [[test]]
+name = "dictionary_skips"
+path = "tests/dictionary_skips.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "paged_deletes"
+path = "tests/paged_deletes.rs"
+required-features = ["experiment"]
+
+[[test]]
 name = "strings"
 path = "tests/strings.rs"
 required-features = ["experiment"]

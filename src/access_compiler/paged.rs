@@ -9,6 +9,7 @@
 //! a fact that holds on some pages but not the column, a column that grows
 //! by appending pages, and work that runs on pages in parallel.
 
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::{
@@ -32,6 +33,8 @@ pub struct Page {
     pub stats: Option<(i128, i128)>,
     /// Non-null rows of the page, stored with the statistics.
     pub non_null: usize,
+    /// The facts the planner consults, gathered from `facts` at sealing.
+    plan: RootFacts,
 }
 
 impl Page {
@@ -41,6 +44,101 @@ impl Page {
 
     fn root(&self) -> super::NodeId {
         self.column.decoder.root()
+    }
+}
+
+/// The facts a planner consults at a page's root, gathered from the page's
+/// fact set once, when the page is sealed, so that planning a query reads a
+/// few fields instead of searching the set. Each action still cites its
+/// fact, and the checker confirms the citation against the full set.
+#[derive(Clone, Debug, Default)]
+struct RootFacts {
+    all_null: bool,
+    bounds: Vec<(FactScope, super::BoundSource)>,
+    /// Null placement of a non-decreasing root, unless nulls may be anywhere.
+    monotone_nulls: Option<NullPlacement>,
+    piecewise_rows: Option<usize>,
+    /// The root is an order-preserving sorted dictionary, so a value range
+    /// becomes a code range.
+    translate: bool,
+    /// A sorted dictionary holding the page's non-null values, with a gap
+    /// between entries that a predicate could fall into.
+    dictionary: Option<SortedDictionary>,
+}
+
+/// A sorted, deduplicated dictionary whose entries are a page's non-null
+/// values: the page's root, or the values under a nullable root.
+#[derive(Clone, Copy, Debug)]
+struct SortedDictionary {
+    node: super::NodeId,
+    table: super::FieldId,
+    entries: usize,
+}
+
+impl RootFacts {
+    fn gather(column: &EncodedColumn, facts: &InvariantSet) -> Result<Self, String> {
+        let decoder = &column.decoder;
+        let root = decoder.root();
+        let order = Property::Mapping(MappingInvariant::OrderPreserving);
+        // A dictionary holding every integer from its first entry to its last
+        // has no gap, so no predicate can miss all its entries while
+        // overlapping their range; such a page is never searched for one.
+        let mut dictionary = sorted_dictionary(decoder)
+            .filter(|dictionary| facts.contains(dictionary.node, FactScope::Mapping, order));
+        if let Some(found) = dictionary
+            && found.entries > 0
+        {
+            let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+            let first = i128::from(session.read_i64(found.table, 0)?);
+            let last = i128::from(session.read_i64(found.table, found.entries - 1)?);
+            if last - first + 1 == found.entries as i128 {
+                dictionary = None;
+            }
+        }
+        Ok(Self {
+            all_null: facts.contains(
+                root,
+                FactScope::AllRows,
+                Property::Value(ValueInvariant::AllNull),
+            ),
+            bounds: facts
+                .iter()
+                .filter(|fact| fact.node == root)
+                .filter_map(|fact| match fact.property {
+                    Property::Value(ValueInvariant::Bounded(source)) => Some((fact.scope, source)),
+                    _ => None,
+                })
+                .collect(),
+            monotone_nulls: facts
+                .root_monotone_nulls(root)
+                .filter(|nulls| *nulls != NullPlacement::Arbitrary),
+            piecewise_rows: facts.root_piecewise_monotone_rows(root),
+            translate: sorted_dictionary(decoder).is_some_and(|dictionary| dictionary.node == root)
+                && facts.contains(root, FactScope::Mapping, order),
+            dictionary,
+        })
+    }
+}
+
+/// The sorted dictionary at the root of `decoder`, or under a nullable root.
+fn sorted_dictionary(decoder: &super::DecoderIr) -> Option<SortedDictionary> {
+    let root = decoder.root();
+    let node = match decoder.node(root).ok()? {
+        DecoderNode::Nullable { values, .. } => *values,
+        _ => root,
+    };
+    match *decoder.node(node).ok()? {
+        DecoderNode::Dictionary {
+            dictionary,
+            entries,
+            sorted_unique: true,
+            ..
+        } => Some(SortedDictionary {
+            node,
+            table: dictionary,
+            entries,
+        }),
+        _ => None,
     }
 }
 
@@ -247,6 +345,7 @@ impl PagedColumn {
             let present = chunk.iter().flatten().map(|&value| i128::from(value));
             let stats = present.clone().min().zip(present.clone().max());
             let non_null = present.count();
+            let plan = RootFacts::gather(&column, &facts)?;
             self.pages.push(Page {
                 start: self.rows,
                 column,
@@ -254,6 +353,7 @@ impl PagedColumn {
                 ends,
                 stats,
                 non_null,
+                plan,
             });
             self.rows += chunk.len();
         }
@@ -338,6 +438,85 @@ impl PagedColumn {
             .iter()
             .map(|page| page.column.page.bytes().len())
             .sum()
+    }
+}
+
+/// Rows deleted from a table whose columns are paged alike: one bit per row,
+/// kept beside the pages, so deleting changes no page and no fact. Every
+/// fact a plan cites holds for each row of its page (a bound, an order, a
+/// constant, a dictionary's codes), and so for every subset of those rows:
+/// a plan made without looking at the deletions stays sound, and executing
+/// it clears the deleted rows from the rows it selects.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeletionVector {
+    page_rows: usize,
+    rows: usize,
+    /// Per page with a deleted row: one bit per row of the page.
+    pages: BTreeMap<usize, Vec<u64>>,
+    deleted: usize,
+}
+
+impl DeletionVector {
+    /// No row deleted yet from the table `column` belongs to.
+    pub fn for_column(column: &PagedColumn) -> Self {
+        Self {
+            page_rows: column.page_rows,
+            rows: column.rows,
+            pages: BTreeMap::new(),
+            deleted: 0,
+        }
+    }
+
+    /// Deletes `row`; whether it was live until now.
+    pub fn delete(&mut self, row: usize) -> Result<bool, String> {
+        if row >= self.rows {
+            return Err("deleted row lies outside the table".into());
+        }
+        let (page, bit) = (row / self.page_rows, row % self.page_rows);
+        let words = self
+            .pages
+            .entry(page)
+            .or_insert_with(|| vec![0; self.page_rows.div_ceil(64)]);
+        let mask = 1_u64 << (bit % 64);
+        if words[bit / 64] & mask != 0 {
+            return Ok(false);
+        }
+        words[bit / 64] |= mask;
+        self.deleted += 1;
+        Ok(true)
+    }
+
+    pub fn is_deleted(&self, row: usize) -> bool {
+        let (page, bit) = (row / self.page_rows, row % self.page_rows);
+        self.pages
+            .get(&page)
+            .is_some_and(|words| words[bit / 64] >> (bit % 64) & 1 == 1)
+    }
+
+    /// Rows deleted so far.
+    pub fn deleted(&self) -> usize {
+        self.deleted
+    }
+
+    /// The deleted rows of page `index`: bit `r` stands for its row `r`.
+    fn page(&self, index: usize) -> Option<&[u64]> {
+        self.pages.get(&index).map(Vec::as_slice)
+    }
+
+    /// Fails unless the vector describes rows of `column`'s table, which may
+    /// since have grown by appended rows; those are live.
+    fn check(&self, column: &PagedColumn) -> Result<(), String> {
+        if self.page_rows != column.page_rows || self.rows > column.rows {
+            return Err("deletion vector does not describe this table's pages".into());
+        }
+        Ok(())
+    }
+}
+
+/// Clears the rows `dead` marks deleted from a selection over a whole page.
+fn clear_deleted(selection: &mut vector::Selection, dead: &[u64]) {
+    for (word, dead) in selection.words.iter_mut().zip(dead) {
+        *word &= !dead;
     }
 }
 
@@ -462,22 +641,22 @@ pub fn plan_between_unchecked(
     if low > high {
         return Err("page predicate bounds are invalid".into());
     }
-    let (low_bound, high_bound) = (i128::from(low), i128::from(high));
-    let is_shortcut = |action: &PageAction| {
-        matches!(
-            action,
-            PageAction::Search { .. }
-                | PageAction::SearchPiecewise { .. }
-                | PageAction::Translate(_)
-        )
+    // A shortcut is an action only the encoding licenses: a search, a code
+    // translation, or a skip because no dictionary code lies in the range.
+    let is_shortcut = |action: &PageAction| match action {
+        PageAction::Search { .. }
+        | PageAction::SearchPiecewise { .. }
+        | PageAction::Translate(_) => true,
+        PageAction::Skip(licence) => cites_dictionary_order(licence),
+        PageAction::Accept(_) | PageAction::Scan => false,
     };
     let action = if planning == Planning::ScanOnly {
         PageAction::Scan
     } else if planning.uses_statistics() {
-        match choose_by_statistics(page, low_bound, high_bound) {
+        match choose_by_statistics(page, i128::from(low), i128::from(high)) {
             // A page the statistics cannot decide may still take a shortcut.
             PageAction::Scan if planning.uses_shortcuts() => {
-                let candidate = choose_between(page, session, low_bound, high_bound)?;
+                let candidate = choose_between(page, session, low, high, true)?;
                 if is_shortcut(&candidate) {
                     candidate
                 } else {
@@ -487,12 +666,25 @@ pub fn plan_between_unchecked(
             action => action,
         }
     } else {
-        match choose_between(page, session, low_bound, high_bound)? {
+        match choose_between(page, session, low, high, planning.uses_shortcuts())? {
             action if is_shortcut(&action) && !planning.uses_shortcuts() => PageAction::Scan,
             action => action,
         }
     };
     Ok(action)
+}
+
+/// Whether `licence` cites the order-preserving mapping of a dictionary: the
+/// licence of a translation, and of a skip that found no code in the range.
+fn cites_dictionary_order(licence: &Licence) -> bool {
+    matches!(
+        licence.fact,
+        Authorization::Fact {
+            scope: FactScope::Mapping,
+            property: Property::Mapping(MappingInvariant::OrderPreserving),
+            ..
+        }
+    )
 }
 
 fn choose_by_statistics(page: &Page, low: i128, high: i128) -> PageAction {
@@ -533,18 +725,20 @@ fn check_statistics(
     }
 }
 
+/// The cheapest action the page's facts license for `low <= value <= high`;
+/// without `shortcuts`, only a skip or an acceptance by a bound, or a scan,
+/// so that a planner denied the encoding's shortcuts does not pay to find
+/// them.
 fn choose_between(
     page: &Page,
     session: &mut ReadSession<'_>,
-    low: i128,
-    high: i128,
+    low: i64,
+    high: i64,
+    shortcuts: bool,
 ) -> Result<PageAction, String> {
     let root = page.root();
-    if page.facts.contains(
-        root,
-        FactScope::AllRows,
-        Property::Value(ValueInvariant::AllNull),
-    ) {
+    let facts = &page.plan;
+    if facts.all_null {
         return Ok(PageAction::Skip(cite(
             root,
             FactScope::AllRows,
@@ -552,24 +746,49 @@ fn choose_between(
             None,
         )));
     }
-    for (scope, source) in root_bounds(page) {
+    let (low_bound, high_bound) = (i128::from(low), i128::from(high));
+    // The first and last entries of a sorted dictionary, read as its bound.
+    let mut ends = None;
+    for &(scope, source) in &facts.bounds {
         let (lower, upper) = bound_interval(session, source)?;
+        if matches!(source, super::BoundSource::TableEnds { .. }) {
+            ends = Some((lower, upper));
+        }
         let licence = cite(
             root,
             scope,
             ValueInvariant::Bounded(source),
             Some((lower, upper)),
         );
-        if upper < low || lower > high {
+        if upper < low_bound || lower > high_bound {
             return Ok(PageAction::Skip(licence));
         }
-        if low <= lower && upper <= high {
+        if low_bound <= lower && upper <= high_bound {
             return Ok(PageAction::Accept(licence));
         }
     }
-    if let Some(nulls) = page.facts.root_monotone_nulls(root)
-        && nulls != NullPlacement::Arbitrary
+    if !shortcuts {
+        return Ok(PageAction::Scan);
+    }
+    // A sorted dictionary lists every value its page holds, so it shows when
+    // none lies in the range, even where the page's bounds straddle it. That
+    // needs the range strictly inside the first and last entries; then one
+    // search finds the first entry at or above `low`, and if it lies above
+    // `high`, no entry is in the range.
+    if let Some(dictionary) = facts.dictionary
+        && ends.is_none_or(|(first, last)| first < low_bound && high_bound < last)
     {
+        let at = vector::entries_below(session, dictionary.table, dictionary.entries, low)?;
+        if at == dictionary.entries
+            || i128::from(session.read_i64(dictionary.table, at)?) > high_bound
+        {
+            return Ok(PageAction::Skip(dictionary_licence(
+                dictionary.node,
+                Some((at as i128, at as i128)),
+            )));
+        }
+    }
+    if let Some(nulls) = facts.monotone_nulls {
         let scope = if nulls == NullPlacement::NoNulls {
             FactScope::AllRows
         } else {
@@ -580,7 +799,7 @@ fn choose_between(
             nulls,
         });
     }
-    if let Some(max_rows) = page.facts.root_piecewise_monotone_rows(root) {
+    if let Some(max_rows) = facts.piecewise_rows {
         return Ok(PageAction::SearchPiecewise {
             licence: cite(
                 root,
@@ -591,23 +810,69 @@ fn choose_between(
             max_rows,
         });
     }
-    if sorted_dictionary_root(page)
-        && page.facts.contains(
-            root,
-            FactScope::Mapping,
-            Property::Mapping(MappingInvariant::OrderPreserving),
-        )
-    {
-        return Ok(PageAction::Translate(Licence {
-            fact: Authorization::Fact {
-                node: root,
-                scope: FactScope::Mapping,
-                property: Property::Mapping(MappingInvariant::OrderPreserving),
-            },
-            evidence: None,
-        }));
+    if facts.translate {
+        return Ok(PageAction::Translate(dictionary_licence(root, None)));
     }
     Ok(PageAction::Scan)
+}
+
+/// A licence citing the order-preserving mapping of the dictionary at `node`.
+fn dictionary_licence(node: super::NodeId, evidence: Option<(i128, i128)>) -> Licence {
+    Licence {
+        fact: Authorization::Fact {
+            node,
+            scope: FactScope::Mapping,
+            property: Property::Mapping(MappingInvariant::OrderPreserving),
+        },
+        evidence,
+    }
+}
+
+/// Confirms a skip that found no dictionary code in `[low, high]`: the
+/// licence cites the page's own sorted dictionary and the order-preserving
+/// mapping the page proves for it, and records an empty code range at a
+/// position where the entry before lies below `low` and the entry at it
+/// above `high`. The table is sorted, so two reads show that no entry lies
+/// in the range; and every dictionary id was checked to lie inside its table
+/// when the page was sealed, so no stored row holds a value the table does
+/// not list.
+fn check_dictionary_skip(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    licence: &Licence,
+    low: i64,
+    high: i64,
+) -> Result<(), String> {
+    let Authorization::Fact { node, .. } = licence.fact else {
+        return Err("dictionary skip cites no fact".into());
+    };
+    let dictionary = sorted_dictionary(&page.column.decoder)
+        .filter(|dictionary| dictionary.node == node)
+        .ok_or("dictionary skip cites no sorted dictionary of the page")?;
+    if !page.facts.contains(
+        node,
+        FactScope::Mapping,
+        Property::Mapping(MappingInvariant::OrderPreserving),
+    ) {
+        return Err("dictionary skip cites an order the page does not prove".into());
+    }
+    let Some((first, end)) = licence.evidence else {
+        return Err("dictionary skip records no code range".into());
+    };
+    if first < end {
+        return Err("dictionary skip cites a code range that holds codes".into());
+    }
+    let at = usize::try_from(first)
+        .ok()
+        .filter(|&at| first == end && at <= dictionary.entries)
+        .ok_or("dictionary skip records a code range outside its table")?;
+    if at > 0 && session.read_i64(dictionary.table, at - 1)? >= low {
+        return Err("dictionary skip records a range after an entry in the predicate".into());
+    }
+    if at < dictionary.entries && session.read_i64(dictionary.table, at)? <= high {
+        return Err("dictionary skip records a range before an entry in the predicate".into());
+    }
+    Ok(())
 }
 
 /// Confirms that `action` is licensed for `low <= value <= high`: the cited
@@ -623,6 +888,7 @@ pub fn check_between(
     if low > high {
         return Err("BETWEEN needs low <= high".into());
     }
+    let predicate = (low, high);
     let (low, high) = (i128::from(low), i128::from(high));
     match action {
         PageAction::Scan => Ok(()),
@@ -636,6 +902,9 @@ pub fn check_between(
                 high,
                 matches!(action, PageAction::Accept(_)),
             )
+        }
+        PageAction::Skip(licence) if cites_dictionary_order(licence) => {
+            check_dictionary_skip(page, session, licence, predicate.0, predicate.1)
         }
         PageAction::Skip(licence) => match cited(page, licence)? {
             (FactScope::AllRows, ValueInvariant::AllNull) => Ok(()),
@@ -750,7 +1019,7 @@ pub fn plan_sum(
         return Ok(action);
     }
     if planning.uses_bounds() {
-        for (scope, source) in root_bounds(page) {
+        for &(scope, source) in root_bounds(page) {
             if scope != FactScope::AllRows {
                 continue;
             }
@@ -870,6 +1139,9 @@ pub fn execute_sum_selection(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PageCounts {
     pub skipped: usize,
+    /// Of the skipped pages, those whose sorted dictionary holds no value
+    /// in the range although the page's bounds straddle it.
+    pub code_skipped: usize,
     pub accepted: usize,
     pub searched: usize,
     pub translated: usize,
@@ -891,7 +1163,10 @@ impl PageCounts {
 
     fn record(&mut self, action: &PageAction) {
         match action {
-            PageAction::Skip(_) => self.skipped += 1,
+            PageAction::Skip(licence) => {
+                self.skipped += 1;
+                self.code_skipped += usize::from(cites_dictionary_order(licence));
+            }
             PageAction::Accept(_) => self.accepted += 1,
             PageAction::Search { .. } | PageAction::SearchPiecewise { .. } => self.searched += 1,
             PageAction::Translate(_) => self.translated += 1,
@@ -901,6 +1176,7 @@ impl PageCounts {
 
     fn add(&mut self, other: &Self) {
         self.skipped += other.skipped;
+        self.code_skipped += other.code_skipped;
         self.accepted += other.accepted;
         self.searched += other.searched;
         self.translated += other.translated;
@@ -1031,10 +1307,65 @@ pub fn sum_where(
 
 /// `sum_where` over pages read from the given stores.
 pub fn sum_where_in(
-    (selector, selector_store): (&PagedColumn, &dyn PageStore),
-    (value, value_store): (&PagedColumn, &dyn PageStore),
+    selector: (&PagedColumn, &dyn PageStore),
+    value: (&PagedColumn, &dyn PageStore),
     low: i64,
     high: i64,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    sum_where_with(selector, value, None, (low, high), planning, threads)
+}
+
+/// `sum_where` over the rows `deleted` leaves.
+pub fn sum_where_live(
+    selector: &PagedColumn,
+    value: &PagedColumn,
+    deleted: &DeletionVector,
+    low: i64,
+    high: i64,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    sum_where_live_in(
+        (selector, &InMemory),
+        (value, &InMemory),
+        deleted,
+        low,
+        high,
+        planning,
+        threads,
+    )
+}
+
+/// `sum_where_in` over the rows `deleted` leaves. Every page is planned as
+/// though no row were deleted, since each fact a plan cites also holds for
+/// the rows that remain; the deleted rows leave each page's selection before
+/// its values are summed.
+pub fn sum_where_live_in(
+    selector: (&PagedColumn, &dyn PageStore),
+    value: (&PagedColumn, &dyn PageStore),
+    deleted: &DeletionVector,
+    low: i64,
+    high: i64,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    sum_where_with(
+        selector,
+        value,
+        Some(deleted),
+        (low, high),
+        planning,
+        threads,
+    )
+}
+
+fn sum_where_with(
+    (selector, selector_store): (&PagedColumn, &dyn PageStore),
+    (value, value_store): (&PagedColumn, &dyn PageStore),
+    deleted: Option<&DeletionVector>,
+    (low, high): (i64, i64),
     planning: Planning,
     threads: usize,
 ) -> Result<(i128, usize, PageCounts), String> {
@@ -1047,6 +1378,10 @@ pub fn sum_where_in(
     {
         return Err("SUM WHERE needs two columns paged alike".into());
     }
+    if let Some(deleted) = deleted {
+        deleted.check(selector)?;
+    }
+    let dead = |index: usize| deleted.and_then(|deleted| deleted.page(index));
     // Every page is planned first, then only pages left with work are
     // executed; both phases share the worker pool, so a query that skips
     // nearly every page executes almost nothing.
@@ -1089,6 +1424,7 @@ pub fn sum_where_in(
                 action,
                 (low, high),
                 planning,
+                dead(index),
             )?;
             page_counts.add(&executed);
             Ok((sum, rows, page_counts))
@@ -1130,6 +1466,7 @@ pub fn sum_where_in(
             action.clone(),
             (low, high),
             planning,
+            dead(*index),
         )
     })?;
     let mut total = 0_i128;
@@ -1145,7 +1482,7 @@ pub fn sum_where_in(
 /// Executes one planned selector page and sums the value page over the rows
 /// it selects: the sum, the matched rows, and the reads both pages made.
 /// `session` is the selector page's session, which may already hold the
-/// bytes its plan read.
+/// bytes its plan read. Rows `dead` marks deleted are never selected.
 fn execute_page(
     (selector_page, mut session): (&Page, ReadSession<'_>),
     (value_page, value_store): (&Page, &dyn PageStore),
@@ -1153,6 +1490,7 @@ fn execute_page(
     action: PageAction,
     (low, high): (i64, i64),
     planning: Planning,
+    dead: Option<&[u64]>,
 ) -> Result<(i128, usize, PageCounts), String> {
     let mut counts = PageCounts::default();
     // A scan of frame-of-reference codes, or a translation of sorted
@@ -1166,7 +1504,7 @@ fn execute_page(
     if let Some(compare) = compare {
         let mut value_session = value_store.session(value_page, index, Access::Execute)?;
         let fused = if plan_sum(value_page, &mut value_session, planning)? == SumAction::Decode {
-            vector::fused_sum_between(
+            vector::fused_sum_between_live(
                 &selector_page.column.decoder,
                 &mut session,
                 &value_page.column.decoder,
@@ -1174,6 +1512,7 @@ fn execute_page(
                 Span::new(0, selector_page.rows())?,
                 (low, high),
                 compare,
+                dead,
             )?
         } else {
             None
@@ -1218,10 +1557,54 @@ fn execute_page(
                 }
             }
         };
-    let matched = match &selected {
-        Selected::Spans(ranges) => ranges.iter().map(|range| range.len()).sum::<usize>(),
-        Selected::Bitmap(selection) => selection.count(),
+    // Deleted rows leave the selection. When few of the selected rows are
+    // deleted, the selection keeps its form, and the deleted rows' values
+    // are subtracted from its sum; when many are, they are cleared from it.
+    let selected = match dead {
+        None => selected,
+        Some(dead) => {
+            let page = Span::new(0, selector_page.rows())?;
+            let mut gone = match &selected {
+                Selected::Spans(spans) => {
+                    let mut selection = vector::Selection::empty(page);
+                    for span in spans {
+                        selection.set_range(span.start, span.end);
+                    }
+                    selection
+                }
+                Selected::Bitmap(selection) => selection.clone(),
+                Selected::Less(..) => {
+                    return Err("page selection lost its deleted rows twice".into());
+                }
+            };
+            let kept = gone.count();
+            for (word, dead) in gone.words.iter_mut().zip(dead) {
+                *word &= dead;
+            }
+            let removed = gone.count();
+            if removed == 0 {
+                selected
+            } else if removed * DELETED_SHARE <= kept {
+                Selected::Less(Box::new(selected), gone)
+            } else {
+                // Every selected row that was not deleted.
+                let mut selection = match selected {
+                    Selected::Spans(spans) => {
+                        let mut selection = vector::Selection::empty(page);
+                        for span in &spans {
+                            selection.set_range(span.start, span.end);
+                        }
+                        selection
+                    }
+                    Selected::Bitmap(selection) => selection,
+                    Selected::Less(..) => unreachable!("rejected above"),
+                };
+                clear_deleted(&mut selection, dead);
+                Selected::Bitmap(selection)
+            }
+        }
     };
+    let matched = selected.count();
     if !matches!(action, PageAction::Accept(_)) {
         verify_footer(selector_page, &mut session, planning)?;
     }
@@ -1234,20 +1617,7 @@ fn execute_page(
     if matches!(sum_action, SumAction::Constant(_)) {
         counts.constant_sums += 1;
     }
-    let sum = match &selected {
-        Selected::Spans(ranges) => execute_sum(value_page, &mut session, &sum_action, ranges)?,
-        Selected::Bitmap(selection) => {
-            // A fused pass decodes every row between the first and last
-            // match; when the matches form few spans, summing span by
-            // span decodes only the matching rows.
-            let hull = selection.hull().map_or(0, |hull| hull.len());
-            if selection.run_count() * SPAN_COST_ROWS < hull {
-                execute_sum(value_page, &mut session, &sum_action, &selection.ranges())?
-            } else {
-                execute_sum_selection(value_page, &mut session, &sum_action, selection)?
-            }
-        }
-    };
+    let sum = sum_selected(value_page, &mut session, &sum_action, &selected)?;
     counts.account(&session);
     Ok((sum, matched, counts))
 }
@@ -1286,6 +1656,29 @@ pub fn aggregate_where(
     planning: Planning,
     threads: usize,
 ) -> Result<(i128, usize, PageCounts), String> {
+    aggregate_where_with(conjuncts, aggregate, None, planning, threads)
+}
+
+/// `aggregate_where` over the rows `deleted` leaves. Pages are planned as
+/// though no row were deleted; the deleted rows leave each page's selection
+/// before any later conjunct or value is read.
+pub fn aggregate_where_live(
+    conjuncts: &[Conjunct<'_>],
+    aggregate: Aggregate<'_>,
+    deleted: &DeletionVector,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    aggregate_where_with(conjuncts, aggregate, Some(deleted), planning, threads)
+}
+
+fn aggregate_where_with(
+    conjuncts: &[Conjunct<'_>],
+    aggregate: Aggregate<'_>,
+    deleted: Option<&DeletionVector>,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
     let Some(first) = conjuncts.first() else {
         return Err("a conjunctive query needs a conjunct".into());
     };
@@ -1316,6 +1709,9 @@ pub fn aggregate_where(
         if conjunct.low > conjunct.high {
             return Err("BETWEEN needs low <= high".into());
         }
+    }
+    if let Some(deleted) = deleted {
+        deleted.check(shape)?;
     }
     // An ordered column narrows the pages any conjunct on it can match.
     let (mut first_page, mut end_page) = (0, shape.pages.len());
@@ -1377,6 +1773,7 @@ pub fn aggregate_where(
     let page_results = run_pages(work.len(), threads, |slot| {
         let (index, actions) = &work[slot];
         let rows = Span::new(0, shape.pages[*index].rows())?;
+        let dead = deleted.and_then(|deleted| deleted.page(*index));
         // Scans and code translations run as one fused pass over the page
         // when every page involved is plain codes.
         if !actions.is_empty()
@@ -1414,12 +1811,16 @@ pub fn aggregate_where(
                     ]))
                 }
             };
-            if let Some((value, matched)) = vector::fused_conjunction(&mut pages, &mut fused, rows)?
+            if let Some((value, matched)) =
+                vector::fused_conjunction_live(&mut pages, &mut fused, rows, dead)?
             {
                 return Ok((value, matched, 0));
             }
         }
         let mut selection = vector::Selection::full(rows);
+        if let Some(dead) = dead {
+            clear_deleted(&mut selection, dead);
+        }
         for (conjunct_slot, action) in actions {
             let conjunct = &conjuncts[*conjunct_slot];
             let page = &conjunct.column.pages[*index];
@@ -1540,6 +1941,49 @@ const SPAN_COST_ROWS: usize = 64;
 enum Selected {
     Spans(Vec<Span>),
     Bitmap(vector::Selection),
+    /// A selection less a few deleted rows inside it, whose values are
+    /// subtracted from the selection's sum.
+    Less(Box<Selected>, vector::Selection),
+}
+
+impl Selected {
+    fn count(&self) -> usize {
+        match self {
+            Self::Spans(ranges) => ranges.iter().map(|range| range.len()).sum(),
+            Self::Bitmap(selection) => selection.count(),
+            Self::Less(selected, gone) => selected.count() - gone.count(),
+        }
+    }
+}
+
+/// A selection keeps its form while at most one of its rows in this many is
+/// deleted; past that, the deleted rows are cleared from it.
+const DELETED_SHARE: usize = 8;
+
+/// SUM over the rows `selected` holds of a value page.
+fn sum_selected(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    action: &SumAction,
+    selected: &Selected,
+) -> Result<i128, String> {
+    match selected {
+        Selected::Spans(ranges) => execute_sum(page, session, action, ranges),
+        Selected::Bitmap(selection) => {
+            // A fused pass decodes every row between the first and last
+            // match; when the matches form few spans, summing span by
+            // span decodes only the matching rows.
+            let hull = selection.hull().map_or(0, |hull| hull.len());
+            if selection.run_count() * SPAN_COST_ROWS < hull {
+                execute_sum(page, session, action, &selection.ranges())
+            } else {
+                execute_sum_selection(page, session, action, selection)
+            }
+        }
+        Selected::Less(selected, gone) => sum_selected(page, session, action, selected)?
+            .checked_sub(execute_sum_selection(page, session, action, gone)?)
+            .ok_or_else(|| "SUM WHERE overflow".into()),
+    }
 }
 
 /// Matching rows of a paged column, as column-row spans.
@@ -1613,16 +2057,8 @@ where
         .collect()
 }
 
-fn root_bounds(page: &Page) -> Vec<(FactScope, super::BoundSource)> {
-    let root = page.root();
-    page.facts
-        .iter()
-        .filter(|fact| fact.node == root)
-        .filter_map(|fact| match fact.property {
-            Property::Value(ValueInvariant::Bounded(source)) => Some((fact.scope, source)),
-            _ => None,
-        })
-        .collect()
+fn root_bounds(page: &Page) -> &[(FactScope, super::BoundSource)] {
+    &page.plan.bounds
 }
 
 /// The tightest interval the page's bound facts give its non-null values,
@@ -1639,7 +2075,7 @@ pub fn derived_bounds_in(
     session: &mut ReadSession<'_>,
 ) -> Result<Option<(i128, i128)>, String> {
     let mut tightest: Option<(i128, i128)> = None;
-    for (_, source) in root_bounds(page) {
+    for &(_, source) in root_bounds(page) {
         let (lower, upper) = bound_interval(session, source)?;
         tightest = Some(tightest.map_or((lower, upper), |(low, high)| {
             (low.max(lower), high.min(upper))

@@ -99,11 +99,24 @@ impl Selection {
         Self { rows, words }
     }
 
-    /// Selects every row in `start..end`, which must lie within `rows`.
+    /// Selects every row in `start..end`, which must lie within `rows`, a
+    /// word at a time.
     pub fn set_range(&mut self, start: usize, end: usize) {
-        for row in start..end {
-            let bit = row - self.rows.start;
-            self.words[bit / 64] |= 1 << (bit % 64);
+        if start >= end {
+            return;
+        }
+        let (first, last) = (start - self.rows.start, end - self.rows.start);
+        let (first_word, last_word) = (first / 64, (last - 1) / 64);
+        for index in first_word..=last_word {
+            let mut mask = !0_u64;
+            if index == first_word {
+                mask &= !0 << (first % 64);
+            }
+            let high = last - index * 64;
+            if index == last_word && high < 64 {
+                mask &= (1 << high) - 1;
+            }
+            self.words[index] |= mask;
         }
     }
 
@@ -368,6 +381,18 @@ pub fn fused_conjunction(
     aggregate: &mut FusedAggregate<'_, '_>,
     rows: Span,
 ) -> Result<Option<(i128, usize)>, String> {
+    fused_conjunction_live(conjuncts, aggregate, rows, None)
+}
+
+/// `fused_conjunction` over the rows `deleted` leaves: bit `r` of `deleted`
+/// marks row `r` of the pages deleted. Deleted rows leave the first
+/// conjunct's matches before any later conjunct or value is read.
+pub fn fused_conjunction_live(
+    conjuncts: &mut [ConjunctPage<'_, '_>],
+    aggregate: &mut FusedAggregate<'_, '_>,
+    rows: Span,
+    deleted: Option<&[u64]>,
+) -> Result<Option<(i128, usize)>, String> {
     struct Test {
         lane: Lane,
         cursor: LaneCursor,
@@ -452,16 +477,29 @@ pub fn fused_conjunction(
     // lane to be read at chosen rows.
     let aligned = rows.start.is_multiple_of(8);
     let (mut total, mut matched) = (0_i128, 0_usize);
+    let mut dead = [0_u64; BATCH_WORDS];
     let mut row = rows.start;
     while row < rows.end {
         let end = (row + BATCH_ROWS).min(rows.end);
         let span = Span::new(row, end)?;
+        let any_dead = deleted.is_some_and(|deleted| bits_at(deleted, row, span.len(), &mut dead));
         positions.clear();
-        // With no conjunct, every row is alive.
+        // With no conjunct, every row that is not deleted is alive.
         let mut alive = 0;
         if order.is_empty() {
-            positions.extend(0..span.len() as u32);
-            alive = span.len();
+            if any_dead {
+                words.clear();
+                words.extend(dead[..span.len().div_ceil(64)].iter().map(|dead| !dead));
+                if let Some(last) = words.last_mut()
+                    && !span.len().is_multiple_of(64)
+                {
+                    *last &= (1 << (span.len() % 64)) - 1;
+                }
+                word_positions(&words, &mut positions);
+            } else {
+                positions.extend(0..span.len() as u32);
+            }
+            alive = positions.len();
         }
         for (rank, &slot) in order.iter().enumerate() {
             let test = &mut tests[slot];
@@ -507,8 +545,13 @@ pub fn fused_conjunction(
             let dense = batch.dense();
             if rank == 0 {
                 // The first conjunct marks its rows 64 at a time; only the
-                // rows it keeps become positions.
+                // rows it keeps, and no deleted row, become positions.
                 hit_words(matcher, &batch, &mut words);
+                if any_dead {
+                    for (word, dead) in words.iter_mut().zip(&dead) {
+                        *word &= !dead;
+                    }
+                }
                 word_positions(&words, &mut positions);
                 alive = positions.len();
             } else {
@@ -718,8 +761,35 @@ pub fn fused_sum_between(
     value: &DecoderIr,
     value_session: &mut ReadSession<'_>,
     rows: Span,
+    bounds: (i64, i64),
+    compare: CodeCompare,
+) -> Result<Option<(i128, usize)>, String> {
+    fused_sum_between_live(
+        selector,
+        selector_session,
+        value,
+        value_session,
+        rows,
+        bounds,
+        compare,
+        None,
+    )
+}
+
+/// `fused_sum_between` over the rows `deleted` leaves: bit `r` of `deleted`
+/// marks row `r` of the pages deleted. A deleted row is cleared from a
+/// batch's matches before any value is read, so it is neither summed nor
+/// counted.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_sum_between_live(
+    selector: &DecoderIr,
+    selector_session: &mut ReadSession<'_>,
+    value: &DecoderIr,
+    value_session: &mut ReadSession<'_>,
+    rows: Span,
     (low, high): (i64, i64),
     compare: CodeCompare,
+    deleted: Option<&[u64]>,
 ) -> Result<Option<(i128, usize)>, String> {
     if low > high {
         return Err("vector BETWEEN bounds are invalid".into());
@@ -765,6 +835,7 @@ pub fn fused_sum_between(
         Vec::with_capacity(BATCH_ROWS),
     );
     let mut scratch = Selective::new();
+    let mut dead = [0_u64; BATCH_WORDS];
     let mut row = rows.start;
     while row < rows.end {
         let end = (row + BATCH_ROWS).min(rows.end);
@@ -782,8 +853,14 @@ pub fn fused_sum_between(
             row = end;
             continue;
         }
+        let any_dead = deleted.is_some_and(|deleted| bits_at(deleted, row, batch.len(), &mut dead));
         if selective {
             hit_words(&matcher, &selector_batch, &mut words);
+            if any_dead {
+                for (word, dead) in words.iter_mut().zip(&dead) {
+                    *word &= !dead;
+                }
+            }
             let hits = words
                 .iter()
                 .map(|word| word.count_ones() as usize)
@@ -808,6 +885,16 @@ pub fn fused_sum_between(
             selected.extend((0..batch.len()).map(|at| words[at / 64] >> (at % 64) & 1));
         } else {
             matcher.test_into(&selector_batch, &mut selected);
+            if any_dead {
+                // Visit only the deleted rows, a set bit at a time.
+                for (index, &word) in dead[..batch.len().div_ceil(64)].iter().enumerate() {
+                    let mut word = word;
+                    while word != 0 {
+                        selected[index * 64 + word.trailing_zeros() as usize] = 0;
+                        word &= word - 1;
+                    }
+                }
+            }
         }
         sums.fill(value_session, &mut value_cursor, batch, &mut value_batch)?;
         let sum = sums.sum_taken(&value_batch, &selected)?;
@@ -1130,6 +1217,28 @@ fn hit_words(matcher: &Matcher, batch: &LaneBatch, words: &mut Vec<u64>) {
         }),
         Matcher::Nothing => words.resize(batch.codes.len().div_ceil(64), 0),
     }
+}
+
+/// Bits `start..start + len` of `bits` into `out`, 64 to a word; bits past
+/// the end of `bits` read as clear. Whether any copied bit is set.
+fn bits_at(bits: &[u64], start: usize, len: usize, out: &mut [u64]) -> bool {
+    let (word, shift) = (start / 64, start % 64);
+    let mut any = 0;
+    for (index, slot) in out.iter_mut().take(len.div_ceil(64)).enumerate() {
+        let low = bits.get(word + index).copied().unwrap_or(0);
+        let mut value = if shift == 0 {
+            low
+        } else {
+            low >> shift | bits.get(word + index + 1).copied().unwrap_or(0) << (64 - shift)
+        };
+        let remaining = len - index * 64;
+        if remaining < 64 {
+            value &= (1 << remaining) - 1;
+        }
+        *slot = value;
+        any |= value;
+    }
+    any != 0
 }
 
 /// The positions of the set bits of `words`, in order.
@@ -1669,22 +1778,65 @@ impl Lane {
         Ok(())
     }
 
+    /// SUM of the non-null values at the selected rows of `hull`. A batch
+    /// that selects at most one row in `SELECTIVE_SHARE` is read only at
+    /// those rows; a denser one is unpacked and summed under its mask.
     fn sum_selection(
         &self,
         session: &mut ReadSession<'_>,
         hull: Span,
         selection: &Selection,
     ) -> Result<i128, String> {
+        if hull.start >= hull.end {
+            return Ok(0);
+        }
+        // Rows are read where they lie only in batches that start at
+        // multiples of 8, so batches start at the multiple of 8 at or before
+        // the hull when the selection covers it; rows before the hull are
+        // not selected.
+        let start = hull.start - hull.start % 8;
+        let (start, aligned) = if start >= selection.rows.start {
+            (start, true)
+        } else {
+            (hull.start, false)
+        };
+        let hull = Span::new(start, hull.end)?;
+        let mut cursor = self.cursor(session, hull.start)?;
+        let mut batch = LaneBatch::default();
+        let mut take = Vec::with_capacity(BATCH_ROWS);
+        let mut words = [0_u64; BATCH_WORDS];
+        let mut positions = Vec::with_capacity(BATCH_ROWS);
+        let mut scratch = Selective::new();
         let mut total = 0_i128;
-        let mut take = Vec::new();
-        self.scan(session, hull, |_, row, batch| {
-            batch.taken(selection, row, &mut take);
-            let sum = self.sum_taken(batch, &take)?;
+        let mut row = hull.start;
+        while row < hull.end {
+            let end = (row + BATCH_ROWS).min(hull.end);
+            let rows = Span::new(row, end)?;
+            let used = rows.len().div_ceil(64);
+            bits_at(
+                &selection.words,
+                row - selection.rows.start,
+                rows.len(),
+                &mut words,
+            );
+            let selected = words[..used]
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>();
+            let sum = if aligned && selected * SELECTIVE_SHARE <= rows.len() {
+                word_positions(&words[..used], &mut positions);
+                self.read_at(session, &mut cursor, rows, &positions, &mut scratch)?;
+                self.sum_read(&scratch)?
+            } else {
+                self.fill(session, &mut cursor, rows, &mut batch)?;
+                batch.taken(selection, row, &mut take);
+                self.sum_taken(&batch, &take)?
+            };
             total = total
                 .checked_add(sum)
                 .ok_or("vector selected SUM overflow")?;
-            Ok(())
-        })?;
+            row = end;
+        }
         Ok(total)
     }
 
@@ -2005,20 +2157,157 @@ pub fn search_monotone(
         return Err("vector monotone search contract is invalid".into());
     }
     validate_rows(decoder, rows)?;
-    let start = boundary(decoder, session, rows, i128::from(low), false, nulls)?;
-    let end = boundary(
-        decoder,
-        session,
-        Span::new(start, rows.end)?,
-        i128::from(high),
-        true,
-        nulls,
-    )?;
+    // A page of runs is searched run by run: a probe reads one run value,
+    // where a row probe walks the run index to find the row's run.
+    let runs = match nulls {
+        NullPlacement::NoNulls => RunSearch::at_root(decoder)?,
+        _ => None,
+    };
+    let (low, high) = (i128::from(low), i128::from(high));
+    let (start, end) = if let Some(runs) = runs {
+        let start = runs.boundary(decoder, session, rows, low, false)?;
+        let end = runs.boundary(decoder, session, Span::new(start, rows.end)?, high, true)?;
+        (start, end)
+    } else {
+        let start = boundary(decoder, session, rows, low, false, nulls)?;
+        let end = boundary(
+            decoder,
+            session,
+            Span::new(start, rows.end)?,
+            high,
+            true,
+            nulls,
+        )?;
+        (start, end)
+    };
     Ok(if start < end {
         vec![Span::new(start, end)?]
     } else {
         Vec::new()
     })
+}
+
+/// A root whose rows repeat run values: run-length codes, or a sorted
+/// dictionary over run-length ids. A non-decreasing page of runs has
+/// non-decreasing run values, so a boundary is found among the runs.
+struct RunSearch {
+    values: NodeId,
+    run_lengths: FieldId,
+    run_index: FieldId,
+    len: usize,
+    runs: usize,
+    index_interval: usize,
+    /// The sorted table that run values index, for a dictionary root.
+    table: Option<(FieldId, usize)>,
+}
+
+impl RunSearch {
+    fn at_root(decoder: &DecoderIr) -> Result<Option<Self>, String> {
+        let (node, table) = match *decoder.node(decoder.root())? {
+            DecoderNode::Rle { .. } => (decoder.root(), None),
+            DecoderNode::Dictionary {
+                ids,
+                dictionary,
+                entries,
+                sorted_unique: true,
+            } => (ids, Some((dictionary, entries))),
+            _ => return Ok(None),
+        };
+        let DecoderNode::Rle {
+            values,
+            run_lengths,
+            run_index,
+            len,
+            runs,
+            index_interval,
+        } = *decoder.node(node)?
+        else {
+            return Ok(None);
+        };
+        if index_interval == 0 {
+            return Err("RLE index interval must be positive".into());
+        }
+        Ok(Some(Self {
+            values,
+            run_lengths,
+            run_index,
+            len,
+            runs,
+            index_interval,
+            table,
+        }))
+    }
+
+    /// The value every row of run `run` holds.
+    fn value(
+        &self,
+        decoder: &DecoderIr,
+        session: &mut ReadSession<'_>,
+        run: usize,
+    ) -> Result<i128, String> {
+        let stored = get_node(decoder, self.values, session, run)?.ok_or("run value is null")?;
+        match self.table {
+            Some((table, entries)) => table_entry(session, table, entries, stored),
+            None => Ok(stored),
+        }
+    }
+
+    /// The row at which run `run` starts: the run index gives the start of
+    /// its block of runs, and the lengths before it in the block are added.
+    fn start(&self, session: &mut ReadSession<'_>, run: usize) -> Result<usize, String> {
+        if run >= self.runs {
+            return Ok(self.len);
+        }
+        let entry = run / self.index_interval;
+        let mut row = session.read_u32(self.run_index, entry * 2)? as usize;
+        let first = session.read_u32(self.run_index, entry * 2 + 1)? as usize;
+        if first != entry * self.index_interval {
+            return Err("RLE index entry does not start its block of runs".into());
+        }
+        for at in first..run {
+            row = row
+                .checked_add(session.read_u32(self.run_lengths, at)? as usize)
+                .ok_or("RLE row overflow")?;
+        }
+        if row > self.len {
+            return Err("RLE run starts past the rows it encodes".into());
+        }
+        Ok(row)
+    }
+
+    /// `boundary` among the runs: the first row of `rows` whose value is at
+    /// least `bound`, or above it when `inclusive`; `rows.end` if none is.
+    fn boundary(
+        &self,
+        decoder: &DecoderIr,
+        session: &mut ReadSession<'_>,
+        rows: Span,
+        bound: i128,
+        inclusive: bool,
+    ) -> Result<usize, String> {
+        let (mut left, mut right) = (0, self.runs);
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let value = self.value(decoder, session, mid)?;
+            if value < bound || (inclusive && value == bound) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        Ok(self.start(session, left)?.clamp(rows.start, rows.end))
+    }
+}
+
+/// How many entries of a sorted table lie below `bound`: the code of the
+/// first entry at or above it, found by one binary search.
+pub fn entries_below(
+    session: &mut ReadSession<'_>,
+    table: FieldId,
+    entries: usize,
+    bound: i64,
+) -> Result<usize, String> {
+    table_bound(session, table, entries, bound, false)
 }
 
 /// `search_monotone` within each block of `max_rows` rows: the shape a
