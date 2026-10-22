@@ -111,7 +111,9 @@ These constraints are part of the result.
   (`access_compiler::floats`), with -0.0 folded into 0.0 and NaN stored as
   null; strings through sorted per-page dictionaries
   (`access_compiler::strings`), whose order is checked evidence from the
-  writer. Pattern predicates other than prefixes are not planned.
+  writer: a string dictionary is built and checked in memory by the column
+  that holds it, and the reader-side order check below covers integer
+  dictionaries in page bytes, including the ids' own pages. Pattern predicates other than prefixes are not planned.
 - It does not derive bounded disorder, cross-column dependencies,
   approximate facts, or arbitrary decoder programs.
 - The paged cold-read study (`paged_cold_study`) evicts the OS page cache
@@ -126,16 +128,29 @@ These constraints are part of the result.
   translation, the rows or entries on either side of what it found; it does
   not re-prove what the writer attests. The attested-fault study
   (`paged_study/attested_faults.csv`) forges one attestation on one selector
-  page in eight: a forged order flag or dictionary order passes every check,
-  because a binary search over unordered values still reads neighbours that
-  bear its result out, and plans that trust it answer wrongly; page ends
-  moved inside the true ones only stop queries, at the column certificate's
-  confirming reads; and sealing would refuse each forged dictionary, which
-  the study installs after the seal.
+  page in eight. A forged order flag passes every check, because a binary
+  search over unordered values still reads neighbours that bear its result
+  out, and plans that trust it answer wrongly; page ends moved inside the
+  true ones only stop queries, at the column certificate's confirming reads.
+  A forged dictionary order, which sealing would refuse and the study
+  installs after the seal, no longer reaches a plan: the reader verifies a
+  sorted dictionary's order the first time a planner that consults facts
+  relies on it, scans the page when it is false (counted in the study's
+  `unverified` column), and the study fails if such a forgery changes an
+  answer planned from facts, with or without stored statistics. A footer of
+  bounds the writer derived from the forged table still misleads the footer
+  planner on pages it skips or accepts without reading them.
+- What stays on the writer's word: the order and null-placement flags of a
+  page's descriptor (a forged non-decreasing flag on a frame-of-reference
+  page is not caught), the ends behind the column certificate, and that
+  every dictionary id lies inside its table. A full check of the ids costs a
+  decode of the page, so it is made once, at sealing, and not by the reader;
+  a forged order moves no id outside its table.
 - The codec tree (codecs, widths, fields, dictionary sizes) travels beside a
   page in memory rather than inside its bytes, so a paged file is read with
   the column it was written from. Dictionary order is verified against the
-  page's bytes when the page is sealed.
+  page's bytes when the page is sealed, and again by the reader, once per
+  page for as long as it holds the column, before a plan relies on it.
 - Planning in place from a file reads a dictionary it must search in one
   request rather than one request per probe. That issues fewer requests but
   reads every entry of a large dictionary; fetching only small tables whole and
