@@ -4150,6 +4150,14 @@ fn distribution_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             &format!("WitPaged{name}WithinFive"),
             &format!("{:.1}", within as f64 * 100.0 / ratios.len() as f64),
         );
+        // The facts median is defined with the headline ratios.
+        if name != "Facts" {
+            define(
+                out,
+                &format!("WitPaged{name}OverZonemapMedian"),
+                &format!("{:.2}", median(&ratios)),
+            );
+        }
     }
     Ok(())
 }
