@@ -161,7 +161,13 @@ sealed. Appending seals new pages and never rewrites existing ones.
 
 A predicate is planned page by page. Every action cites the fact that
 licenses it and, for a bound, the interval it read; `check_between` and
-`check_sum` re-verify both before execution.
+`check_sum` re-verify both before execution. A search or a translation is
+also checked on what it finds: `check_search` and `check_translation` read
+the rows or table entries on either side of its two boundaries, at most four,
+before any row is selected, so an executor that moves a boundary by a row or
+a code is stopped. They confirm the boundaries, not the order the licence
+cites: a binary search reads those same neighbours on any page, ordered or
+not.
 
 | Page evidence | Action |
 |---|---|

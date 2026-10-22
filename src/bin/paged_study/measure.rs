@@ -25,7 +25,7 @@ use crate::common::{
 };
 use crate::corpus::{self, Pair};
 use crate::workload::predicates;
-use crate::{checker, deletes, faults};
+use crate::{attested_faults, checker, deletes, faults};
 
 const DEFAULT_RESULT_DIR: &str = "experiments/results/paged_study";
 const SCALING_PAIRS: usize = 12;
@@ -125,6 +125,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let layouts = parallel(columns.len(), |index| {
         encode_layouts(&columns[index], page_rows)
     })?;
+    // The checker's mutations and the two fault studies compare answers and
+    // time nothing, so they can be run on their own, without the timed study.
+    if std::env::args().any(|argument| argument == "--correctness-only") {
+        checker::run(&result_dir, &columns, &pairs, &layouts)?;
+        faults::run(&result_dir, &columns, &pairs, &layouts)?;
+        attested_faults::run(&result_dir, &columns, &pairs, &layouts)?;
+        eprintln!("correctness studies finished in {:.0?}", started.elapsed());
+        return Ok(());
+    }
     let parquet = parallel(pairs.len(), |index| {
         let pair = &pairs[index];
         let (selector, value) = (&columns[pair.selector].values, &columns[pair.value].values);
@@ -232,6 +241,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         scaling(&result_dir, &columns, &pairs, &layouts)?;
         checker::run(&result_dir, &columns, &pairs, &layouts)?;
         faults::run(&result_dir, &columns, &pairs, &layouts)?;
+        attested_faults::run(&result_dir, &columns, &pairs, &layouts)?;
         deletes::run(&result_dir, &columns, &pairs, &layouts)?;
     }
     fs::write(

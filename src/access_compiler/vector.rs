@@ -246,28 +246,45 @@ pub fn dictionary_selection(
     low: i64,
     high: i64,
 ) -> Result<Selection, String> {
+    let (dictionary, entries) = sorted_root_table(decoder)
+        .map_err(|_| "dictionary selection needs a sorted dictionary root")?;
+    let codes = dictionary_codes(session, dictionary, entries, low, high)?;
+    dictionary_code_selection(decoder, session, rows, codes)
+}
+
+/// `dictionary_selection` for the rows whose id lies in `[low_id, high_id)`,
+/// a code range already translated from the value range.
+pub fn dictionary_code_selection(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    rows: Span,
+    (low_id, high_id): (usize, usize),
+) -> Result<Selection, String> {
     let &DecoderNode::Dictionary {
         ids,
-        dictionary,
         entries,
         sorted_unique: true,
+        ..
     } = decoder.node(decoder.root())?
     else {
         return Err("dictionary selection needs a sorted dictionary root".into());
     };
-    if low > high {
-        return Err("vector dictionary range bounds are invalid".into());
+    if high_id > entries {
+        return Err("dictionary code range lies outside its table".into());
     }
     validate_rows(decoder, rows)?;
     let mut selection = Selection::empty(rows);
-    let low_id = table_bound(session, dictionary, entries, low, false)?;
-    let high_id = table_bound(session, dictionary, entries, high, true)?;
+    let codes = CodeCompare::CodeRange {
+        first: low_id,
+        end: high_id,
+    };
+    // A code range stands in for the predicate's values.
     if let Some(SelectorLane {
         lane,
         matcher,
         entries,
         ..
-    }) = selector_lane(decoder, session, low, high, CodeCompare::SortedDictionary)?
+    }) = selector_lane(decoder, session, 0, 0, codes)?
     {
         // Ids are read even when none can match, to confirm that every one
         // lies inside the table, as a decode would.
@@ -747,6 +764,13 @@ pub fn selection_by_table(
 pub enum CodeCompare {
     Offset,
     SortedDictionary,
+    /// Ids into a sorted dictionary compared with `[first, end)`, a code
+    /// range the caller translated from the predicate and checked; the
+    /// predicate's values are not read.
+    CodeRange {
+        first: usize,
+        end: usize,
+    },
 }
 
 /// SUM and count of `value` over the rows in `rows` whose `selector` value
@@ -1937,8 +1961,9 @@ struct SelectorLane {
 /// Offset codes compare with the predicate shifted by the base. Under
 /// `CodeCompare::Offset` a dictionary page is scanned by testing each entry
 /// once, which needs no order; `SortedDictionary` compares ids with the
-/// predicate's id range, which a translation licence permits. `None` when
-/// the page is not codes in either form.
+/// predicate's id range, which a translation licence permits, and
+/// `CodeRange` with the id range it carries. `None` when the page is not
+/// codes in either form.
 fn selector_lane(
     decoder: &DecoderIr,
     session: &mut ReadSession<'_>,
@@ -1990,8 +2015,13 @@ fn selector_lane(
         return Ok(None);
     };
     let (table, entries) = lane.dictionary.ok_or("dictionary lane lacks its table")?;
-    let first = table_bound(session, table, entries, low as i64, false)?;
-    let end = table_bound(session, table, entries, high as i64, true)?;
+    let (first, end) = match compare {
+        CodeCompare::CodeRange { first, end } if end <= entries => (first, end),
+        CodeCompare::CodeRange { .. } => {
+            return Err("dictionary code range lies outside its table".into());
+        }
+        _ => dictionary_codes(session, table, entries, low as i64, high as i64)?,
+    };
     let matcher = if first < end {
         Matcher::Range {
             first: first as u64,
@@ -2161,6 +2191,26 @@ pub fn search_monotone(
     high: i64,
     nulls: NullPlacement,
 ) -> Result<Vec<Span>, String> {
+    let (start, end) = monotone_bounds(decoder, session, rows, low, high, nulls)?;
+    Ok(if start < end {
+        vec![Span::new(start, end)?]
+    } else {
+        Vec::new()
+    })
+}
+
+/// The two boundaries `search_monotone` finds: the first row of `rows` not
+/// below `low`, and the first row from there above `high`. The matching
+/// rows are those in between; where none match, the two are equal, and
+/// say where a matching row would have been.
+pub fn monotone_bounds(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    rows: Span,
+    low: i64,
+    high: i64,
+    nulls: NullPlacement,
+) -> Result<(usize, usize), String> {
     if low > high || nulls == NullPlacement::Arbitrary {
         return Err("vector monotone search contract is invalid".into());
     }
@@ -2172,10 +2222,10 @@ pub fn search_monotone(
         _ => None,
     };
     let (low, high) = (i128::from(low), i128::from(high));
-    let (start, end) = if let Some(runs) = runs {
+    if let Some(runs) = runs {
         let start = runs.boundary(decoder, session, rows, low, false)?;
         let end = runs.boundary(decoder, session, Span::new(start, rows.end)?, high, true)?;
-        (start, end)
+        Ok((start, end))
     } else {
         let start = boundary(decoder, session, rows, low, false, nulls)?;
         let end = boundary(
@@ -2186,13 +2236,8 @@ pub fn search_monotone(
             true,
             nulls,
         )?;
-        (start, end)
-    };
-    Ok(if start < end {
-        vec![Span::new(start, end)?]
-    } else {
-        Vec::new()
-    })
+        Ok((start, end))
+    }
 }
 
 /// A root whose rows repeat run values: run-length codes, or a sorted
@@ -2387,21 +2432,50 @@ pub fn dictionary_range(
     low: i64,
     high: i64,
 ) -> Result<Vec<Span>, String> {
+    let (dictionary, entries) = sorted_root_table(decoder)?;
+    let codes = dictionary_codes(session, dictionary, entries, low, high)?;
+    dictionary_code_range(decoder, session, rows, codes)
+}
+
+/// The ids `[first, end)` of a sorted table whose entries lie in
+/// `[low, high]`, by two searches of the table: the code range a
+/// translation compares ids with.
+pub fn dictionary_codes(
+    session: &mut ReadSession<'_>,
+    table: FieldId,
+    entries: usize,
+    low: i64,
+    high: i64,
+) -> Result<(usize, usize), String> {
+    if low > high {
+        return Err("vector dictionary range bounds are invalid".into());
+    }
+    let first = table_bound(session, table, entries, low, false)?;
+    let end = table_bound(session, table, entries, high, true)?;
+    Ok((first, end))
+}
+
+/// `dictionary_range` for the rows whose id lies in `[low_id, high_id)`, a
+/// code range already translated from the value range.
+pub fn dictionary_code_range(
+    decoder: &DecoderIr,
+    session: &mut ReadSession<'_>,
+    rows: Span,
+    (low_id, high_id): (usize, usize),
+) -> Result<Vec<Span>, String> {
     let &DecoderNode::Dictionary {
         ids,
-        dictionary,
         entries,
         sorted_unique: true,
+        ..
     } = decoder.node(decoder.root())?
     else {
         return Err("dictionary range needs a sorted dictionary root".into());
     };
-    if low > high {
-        return Err("vector dictionary range bounds are invalid".into());
+    if high_id > entries {
+        return Err("dictionary code range lies outside its table".into());
     }
     validate_rows(decoder, rows)?;
-    let low_id = table_bound(session, dictionary, entries, low, false)?;
-    let high_id = table_bound(session, dictionary, entries, high, true)?;
     let mut ranges = Vec::new();
     if low_id < high_id {
         let (low_id, last_id) = (low_id as i128, high_id as i128 - 1);
@@ -2434,6 +2508,19 @@ pub fn dictionary_range(
         )?;
     }
     Ok(ranges)
+}
+
+/// The table and entry count of the sorted dictionary at the root.
+fn sorted_root_table(decoder: &DecoderIr) -> Result<(FieldId, usize), String> {
+    match *decoder.node(decoder.root())? {
+        DecoderNode::Dictionary {
+            dictionary,
+            entries,
+            sorted_unique: true,
+            ..
+        } => Ok((dictionary, entries)),
+        _ => Err("dictionary range needs a sorted dictionary root".into()),
+    }
 }
 
 fn scan_node<'p>(

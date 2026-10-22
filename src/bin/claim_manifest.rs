@@ -867,6 +867,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     cold_claims(&mut out)?;
     ablation_claims(&mut out)?;
     fault_claims(&mut out)?;
+    attested_fault_claims(&mut out)?;
     delete_claims(&mut out)?;
     page_fact_claims(&mut out)?;
     distribution_claims(&mut out)?;
@@ -2123,7 +2124,13 @@ fn separation_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         ("foreign_page", "a neighbouring page's action"),
         ("stale_plan", "another predicate's action"),
         ("forged_statistics", "forged statistics"),
+        ("result_shift", "a moved search or translation result"),
     ] {
+        // Results are moved by the run that also writes the attested-fault
+        // study; a checker study from before that run has no such family.
+        if family == "result_shift" && !families.contains_key(family) && !attested_faults_run() {
+            continue;
+        }
         let [mutants, harmful, rejected, harmless_rejected, accepted] = families
             .get(family)
             .copied()
@@ -3813,6 +3820,94 @@ fn fault_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         out,
         "WitFaultQueries",
         &group_digits(&get("neighbour", "zonemap")?[0].to_string()),
+    );
+    Ok(())
+}
+
+/// Whether the paged study that wrote these results also ran the study of
+/// forged attestations; results from before that study lack its file.
+fn attested_faults_run() -> bool {
+    std::path::Path::new(&format!("{PAGED}/attested_faults.csv")).exists()
+}
+
+/// Attestations that are wrong: for each forged attestation, how many paged
+/// queries each planner answered wrongly, and how many the checker or
+/// another error stopped. Defined once the paged study has written its file.
+fn attested_fault_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    if !attested_faults_run() {
+        println!("no attested-fault study in {PAGED}; its claims are not defined");
+        return Ok(());
+    }
+    let faults = read_csv(&format!("{PAGED}/attested_faults.csv"))?;
+    // queries, affected, correct, wrong, stopped
+    let mut cells = BTreeMap::<(String, String), [usize; 5]>::new();
+    for row in &faults {
+        let cell = cells
+            .entry((faults.field(row, "fault")?, faults.field(row, "planner")?))
+            .or_default();
+        for (slot, name) in ["queries", "affected", "correct", "wrong", "stopped"]
+            .into_iter()
+            .enumerate()
+        {
+            cell[slot] += faults.field(row, name)?.parse::<usize>()?;
+        }
+    }
+    let get = |fault: &str, planner: &str| {
+        cells
+            .get(&(fault.to_string(), planner.to_string()))
+            .copied()
+            .ok_or_else(|| format!("attested-fault study lacks {fault} under {planner}"))
+    };
+    let mut table = String::new();
+    for (fault, label, suffix) in [
+        ("order", "order", "Order"),
+        ("dictionary_unsorted", "an unsorted dictionary", "Unsorted"),
+        ("ends", "page ends", "Ends"),
+        ("null_placement", "null placement", "Nulls"),
+        ("dictionary_unsigned", "an unsigned comparator", "Unsigned"),
+        ("dictionary_reversed", "a reversed comparator", "Reversed"),
+    ] {
+        let mut row = vec![group_digits(&get(fault, "facts")?[1].to_string())];
+        for (planner, name) in [
+            ("facts", "Facts"),
+            ("zonemap", "Zonemap"),
+            ("zonemapplus", "ZonemapPlus"),
+            ("footer", "Footer"),
+        ] {
+            let [queries, _, correct, wrong, stopped] = get(fault, planner)?;
+            if queries != correct + wrong + stopped {
+                return Err(
+                    format!("attested fault {fault} under {planner} does not add up").into(),
+                );
+            }
+            if planner == "zonemap" && wrong + stopped != 0 {
+                return Err(
+                    "a forged attestation changed an answer planned from a zone map".into(),
+                );
+            }
+            define(
+                out,
+                &format!("WitAttested{suffix}{name}Wrong"),
+                &group_digits(&wrong.to_string()),
+            );
+            define(
+                out,
+                &format!("WitAttested{suffix}{name}Stopped"),
+                &group_digits(&stopped.to_string()),
+            );
+            if planner != "zonemap" {
+                row.push(group_digits(&wrong.to_string()));
+                row.push(group_digits(&stopped.to_string()));
+            }
+        }
+        define(out, &format!("WitAttested{suffix}Affected"), &row[0]);
+        writeln!(table, "{label} & {} \\\\", row.join(" & "))?;
+    }
+    define(out, "WitAttestedFaultRows", table.trim_end());
+    define(
+        out,
+        "WitAttestedFaultQueries",
+        &group_digits(&get("order", "facts")?[0].to_string()),
     );
     Ok(())
 }

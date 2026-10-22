@@ -136,6 +136,11 @@ name = "strings"
 path = "tests/strings.rs"
 required-features = ["experiment"]
 
+[[test]]
+name = "result_checks"
+path = "tests/result_checks.rs"
+required-features = ["experiment"]
+
 [[bin]]
 name = "generate_access_compiler"
 path = "src/bin/generate_access_compiler.rs"

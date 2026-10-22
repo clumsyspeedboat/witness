@@ -65,6 +65,8 @@ printf '4/8 physical access and storage schedules\n'
 ./experiments/run_real_access.sh
 
 printf '5/8 paged queries, page sizes, scaling, conjunctions, floats, strings, cold reads, Parquet facts, DuckDB, and repeats\n'
+# The main run also writes the checker mutations and the two fault studies,
+# of stored statistics (faults.csv) and of attestations (attested_faults.csv).
 cargo run --locked --release --features experiment --bin paged_study
 for rows in 4096 65536; do
   WITNESS_PAGE_ROWS=$rows cargo run --locked --release --features experiment --bin paged_study

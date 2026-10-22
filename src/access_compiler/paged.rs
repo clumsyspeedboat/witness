@@ -1088,8 +1088,132 @@ pub fn check_between(
     }
 }
 
-/// Matching rows of one page, as page-local spans.
+/// Confirms the rows `[start, end)` a search found for `low <= value <=
+/// high` on a page whose order, with nulls placed as `nulls` says, its
+/// checked licence proves. At most four reads, one on either side of each
+/// boundary, show that the row before `start` lies below the range, the row
+/// at `end` above it, and the first and last rows found inside it; order
+/// then puts every row before `start` below, every row from `end` on above,
+/// and every row between inside. A null sorts before every value when nulls
+/// come first and after every value when they come last.
+pub fn check_search(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    nulls: NullPlacement,
+    low: i64,
+    high: i64,
+    (start, end): (usize, usize),
+) -> Result<(), String> {
+    if nulls == NullPlacement::Arbitrary {
+        return Err("page search result cites no null placement".into());
+    }
+    if start > end || end > page.rows() {
+        return Err("page search found rows outside the page".into());
+    }
+    let (low, high) = (i128::from(low), i128::from(high));
+    let decoder = &page.column.decoder;
+    let fits = (start == 0
+        || match vector::get(decoder, session, start - 1)? {
+            Some(value) => value < low,
+            None => nulls == NullPlacement::First,
+        })
+        && (start == end
+            || vector::get(decoder, session, start)?.is_some_and(|value| low <= value))
+        && (start == end
+            || vector::get(decoder, session, end - 1)?.is_some_and(|value| value <= high))
+        && (end == page.rows()
+            || match vector::get(decoder, session, end)? {
+                Some(value) => value > high,
+                None => nulls == NullPlacement::Last,
+            });
+    if fits {
+        Ok(())
+    } else {
+        Err("page search found rows its boundaries do not bear out".into())
+    }
+}
+
+/// Confirms the code range `[first, end)` a translation found for `low <=
+/// value <= high` on a page whose root is a sorted dictionary: the entry
+/// before `first` lies below the range, the entry at `end` above it, and the
+/// first and last entries of the range inside it. The table is sorted, so
+/// these at most four reads show that the range holds exactly the entries in
+/// the predicate.
+pub fn check_translation(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    low: i64,
+    high: i64,
+    (first, end): (usize, usize),
+) -> Result<(), String> {
+    let dictionary = sorted_dictionary(&page.column.decoder)
+        .filter(|dictionary| dictionary.node == page.root())
+        .ok_or("translation result cites no sorted dictionary at the page's root")?;
+    if first > end || end > dictionary.entries {
+        return Err("translation found a code range outside its table".into());
+    }
+    let table = dictionary.table;
+    let fits = (first == 0 || session.read_i64(table, first - 1)? < low)
+        && (first == end || session.read_i64(table, first)? >= low)
+        && (first == end || session.read_i64(table, end - 1)? <= high)
+        && (end == dictionary.entries || session.read_i64(table, end)? > high);
+    if fits {
+        Ok(())
+    } else {
+        Err("translation found a code range its table does not bear out".into())
+    }
+}
+
+/// The code range a translation compares ids with: `[low, high]` translated
+/// by two searches of the page's sorted table, and checked before any id is
+/// compared with it.
+fn translate(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    low: i64,
+    high: i64,
+) -> Result<(usize, usize), String> {
+    let dictionary = sorted_dictionary(&page.column.decoder)
+        .filter(|dictionary| dictionary.node == page.root())
+        .ok_or("translation needs a sorted dictionary at the page's root")?;
+    let codes = vector::dictionary_codes(session, dictionary.table, dictionary.entries, low, high)?;
+    check_translation(page, session, low, high, codes)?;
+    Ok(codes)
+}
+
+/// Matching rows of one page, as page-local spans. A search or translation
+/// is checked on what it found before any row is selected.
 pub fn execute_between(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    action: &PageAction,
+    low: i64,
+    high: i64,
+) -> Result<Vec<Span>, String> {
+    let decoder = &page.column.decoder;
+    let all = Span::new(0, page.rows())?;
+    match action {
+        PageAction::Search { nulls, .. } => {
+            let found = vector::monotone_bounds(decoder, session, all, low, high, *nulls)?;
+            check_search(page, session, *nulls, low, high, found)?;
+            let (start, end) = found;
+            Ok(if start < end {
+                vec![Span::new(start, end)?]
+            } else {
+                Vec::new()
+            })
+        }
+        PageAction::Translate(_) => {
+            let codes = translate(page, session, low, high)?;
+            vector::dictionary_code_range(decoder, session, all, codes)
+        }
+        _ => execute_between_unchecked(page, session, action, low, high),
+    }
+}
+
+/// `execute_between` without checking what a search or translation found,
+/// to see what a wrong plan would answer. No query runs it.
+pub fn execute_between_unchecked(
     page: &Page,
     session: &mut ReadSession<'_>,
     action: &PageAction,
@@ -1217,7 +1341,10 @@ pub fn execute_between_selection(
     let decoder = &page.column.decoder;
     let all = Span::new(0, page.rows())?;
     match action {
-        PageAction::Translate(_) => vector::dictionary_selection(decoder, session, all, low, high),
+        PageAction::Translate(_) => {
+            let codes = translate(page, session, low, high)?;
+            vector::dictionary_code_selection(decoder, session, all, codes)
+        }
         PageAction::Scan => vector::between_selection(decoder, session, all, low, high),
         _ => {
             let mut selection = vector::Selection::empty(all);
@@ -1613,7 +1740,10 @@ fn execute_page(
     // pass over both pages.
     let compare = match action {
         PageAction::Scan => Some(vector::CodeCompare::Offset),
-        PageAction::Translate(_) => Some(vector::CodeCompare::SortedDictionary),
+        PageAction::Translate(_) => {
+            let (first, end) = translate(selector_page, &mut session, low, high)?;
+            Some(vector::CodeCompare::CodeRange { first, end })
+        }
         _ => None,
     };
     if let Some(compare) = compare {
@@ -1901,19 +2031,23 @@ fn aggregate_where_with(
                 .map(|(conjunct_slot, action)| {
                     let conjunct = &conjuncts[*conjunct_slot];
                     let page = &conjunct.column.pages[*index];
-                    vector::ConjunctPage {
+                    let mut session = untracked(page);
+                    let compare = if matches!(action, PageAction::Translate(_)) {
+                        let (first, end) =
+                            translate(page, &mut session, conjunct.low, conjunct.high)?;
+                        vector::CodeCompare::CodeRange { first, end }
+                    } else {
+                        vector::CodeCompare::Offset
+                    };
+                    Ok(vector::ConjunctPage {
                         decoder: &page.column.decoder,
-                        session: untracked(page),
+                        session,
                         low: conjunct.low,
                         high: conjunct.high,
-                        compare: if matches!(action, PageAction::Translate(_)) {
-                            vector::CodeCompare::SortedDictionary
-                        } else {
-                            vector::CodeCompare::Offset
-                        },
-                    }
+                        compare,
+                    })
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, String>>()?;
             let mut fused = match aggregate {
                 Aggregate::Count => vector::FusedAggregate::Count,
                 Aggregate::Sum(column) => {
@@ -2251,6 +2385,184 @@ fn reread(
         return Err("page bound changed between planning and checking".into());
     }
     Ok(interval)
+}
+
+// Forged attestations, for fault studies only. A writer attests some of what
+// a page's planner trusts: the order and null placement in the page's
+// descriptor, the sortedness of its dictionaries, and the ends from which
+// the column certificate is built. Each function below makes one of these
+// wrong on a sealed page, as `replace_statistics` does for a zone map, so a
+// study can see which wrong attestations the checker stops. No query path
+// calls them.
+impl PagedColumn {
+    /// Seals page `index` again as though its writer had attested `checked`
+    /// in the page's descriptor: its facts are derived under those flags, its
+    /// ends re-read if it now claims order, and the column certificate is
+    /// rebuilt. Whether the page's facts changed.
+    pub fn forge_descriptor(
+        &mut self,
+        index: usize,
+        checked: super::CheckedInvariants,
+    ) -> Result<bool, String> {
+        let page = self.pages.get(index).ok_or("no such page")?;
+        let column = page.column.clone();
+        let facts = derive_invariants(&column.decoder, column.page.layout(), checked)?;
+        let changed = facts != page.facts;
+        self.reseal(index, column, facts)?;
+        Ok(changed)
+    }
+
+    /// Overwrites the ends page `index` recorded when it was sealed, and
+    /// rebuilds the column certificate from them as `append` would have.
+    /// Whether the ends changed.
+    pub fn forge_ends(&mut self, index: usize, ends: Option<(i128, i128)>) -> Result<bool, String> {
+        let page = self.pages.get_mut(index).ok_or("no such page")?;
+        let changed = page.ends != ends;
+        page.ends = ends;
+        self.recertify();
+        Ok(changed)
+    }
+
+    /// Replaces page `index` with a page of the same values whose dictionary
+    /// lists them in the order of `table`, a permutation of the page's
+    /// distinct values, and still claims to be sorted and unique: what a
+    /// writer that sorted with the wrong comparator leaves. The page is
+    /// sealed without verifying its dictionary, under the descriptor its
+    /// values earn, so the forged order reaches the planner. A page without
+    /// a dictionary becomes a dictionary page. Whether `table` is out of
+    /// order, and so the page was forged.
+    pub fn forge_dictionary(&mut self, index: usize, table: &[i64]) -> Result<bool, String> {
+        let page = self.pages.get(index).ok_or("no such page")?;
+        let mut sorted = table.to_vec();
+        sorted.sort_unstable();
+        let mut distinct = page
+            .column
+            .truth
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if sorted != distinct {
+            return Err("a forged dictionary must list the page's values once each".into());
+        }
+        if table == distinct.as_slice() {
+            return Ok(false);
+        }
+        // The page is encoded over each value's position in `table`, so its
+        // ids are those positions, and its table, holding the positions in
+        // order, is then overwritten with `table` itself.
+        let position = table
+            .iter()
+            .enumerate()
+            .map(|(at, &value)| (value, at as i64))
+            .collect::<BTreeMap<_, _>>();
+        let positions = page
+            .column
+            .truth
+            .iter()
+            .map(|value| value.map(|value| position[&value]))
+            .collect::<Vec<_>>();
+        let recipe = dictionary_recipe(&page.column.recipe, page.non_null < page.rows());
+        let encoded = encode(&recipe, InputColumn::nullable(positions))?;
+        let dictionary = sorted_dictionary(&encoded.decoder)
+            .filter(|dictionary| dictionary.entries == table.len())
+            .ok_or("forged page lacks its dictionary")?;
+        let super::FieldLocation::Direct { offset } =
+            encoded.page.layout().fields[dictionary.table.0].location
+        else {
+            return Err("forged dictionary is not directly addressable".into());
+        };
+        let mut bytes = encoded.page.bytes().to_vec();
+        for (at, value) in table.iter().enumerate() {
+            bytes[offset + 8 * at..offset + 8 * (at + 1)].copy_from_slice(&value.to_le_bytes());
+        }
+        let column = EncodedColumn {
+            recipe,
+            decoder: encoded.decoder,
+            page: super::SerializedPage::parse(bytes)?,
+            truth: page.column.truth.clone(),
+        };
+        let facts = derive_invariants(
+            &column.decoder,
+            column.page.layout(),
+            page.column.page.invariants(),
+        )?;
+        self.reseal(index, column, facts)?;
+        Ok(true)
+    }
+
+    /// Replaces page `index`'s encoding and facts as `append` seals a page,
+    /// without verifying its dictionaries, and rebuilds the certificate.
+    fn reseal(
+        &mut self,
+        index: usize,
+        column: EncodedColumn,
+        facts: InvariantSet,
+    ) -> Result<(), String> {
+        let ends = if facts.contains(
+            column.decoder.root(),
+            FactScope::AllRows,
+            Property::Value(ValueInvariant::NonDecreasing),
+        ) {
+            let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+            let first = vector::get(&column.decoder, &mut session, 0)?;
+            let last = vector::get(&column.decoder, &mut session, column.truth.len() - 1)?;
+            first.zip(last)
+        } else {
+            None
+        };
+        let plan = RootFacts::gather(&column, &facts)?;
+        let page = &mut self.pages[index];
+        page.column = column;
+        page.facts = facts;
+        page.ends = ends;
+        page.plan = plan;
+        self.recertify();
+        Ok(())
+    }
+
+    /// The leading pages whose ends never decrease, page to page, as
+    /// `append` counts them.
+    fn recertify(&mut self) {
+        let mut previous: Option<(i128, i128)> = None;
+        self.ordered_pages = self
+            .pages
+            .iter()
+            .take_while(|page| {
+                let extends = page
+                    .ends
+                    .is_some_and(|(first, _)| previous.is_none_or(|(_, last)| last <= first));
+                previous = page.ends;
+                extends
+            })
+            .count();
+    }
+}
+
+/// `recipe` with a dictionary at its root, under its nulls if `nullable`:
+/// the recipe itself when it has one.
+fn dictionary_recipe(recipe: &Recipe, nullable: bool) -> Recipe {
+    let (rank_interval, values) = match recipe {
+        Recipe::Nullable {
+            rank_interval,
+            values,
+        } => (*rank_interval, values.as_ref()),
+        values => (256, values),
+    };
+    let values = match values {
+        Recipe::Dictionary(_) => values.clone(),
+        _ => Recipe::Dictionary(Box::new(Recipe::BitPack)),
+    };
+    if nullable {
+        Recipe::Nullable {
+            rank_interval,
+            values: Box::new(values),
+        }
+    } else {
+        values
+    }
 }
 
 #[cfg(test)]

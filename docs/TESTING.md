@@ -223,7 +223,7 @@ The full pipeline invokes these scripts after verifying input hashes.
 | `run_predicate_pipeline.sh` | at least 30 selector/value pairs, at least 60 logical columns, two kernels per column, exact answer agreement across four known-selection and ten complete-query arms, and all expected physical files |
 | `run_certificate_study.sh` | at least 1,700 cells, five plan classes, four query classes, and no non-scan candidate set larger than the scan domain |
 | `run_real_access.sh` | 14 columns, 178 candidates, 336 query cells, 72 storage scans, policy/query consistency, cross-policy checksum equality, and storage-counter sanity |
-| `paged_study` | exact answers across facts, zone-map (plain, with shortcuts, with a dictionary filter), scan, and Parquet arms; no harmful checker mutant accepted |
+| `paged_study` | exact answers across facts, zone-map (plain, with shortcuts, with a dictionary filter), scan, and Parquet arms; no harmful checker mutant accepted; no forged attestation changes a zone-map answer |
 | `paged_scale_study` | exact answers against a row-wise oracle across requested thread counts |
 | `duckdb_baseline.py` | exact sum and row-count agreement with exported paged workloads before timing |
 | `claim_manifest` | fixed-seed source bootstrap, claim extraction from canonical CSV cells, and no hand-entered scalar values |

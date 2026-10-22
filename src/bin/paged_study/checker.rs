@@ -3,7 +3,8 @@
 //! it, and each mutant goes to the checker. Every mutant, accepted or not,
 //! is then executed and compared with the page's true answer, so the study
 //! shows both that no accepted mutant answers wrongly and how many rejected
-//! mutants would have.
+//! mutants would have. What a search or translation finds is mutated as an
+//! executor bug would move it, and goes to the checker of results.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -11,7 +12,8 @@ use std::io::Write;
 
 use witness::access_compiler::paged::{self, Licence, Page, PageAction, Planning};
 use witness::access_compiler::{
-    Authorization, ClosureMode, FactScope, NullPlacement, ReadSession, Span, push_range,
+    Authorization, ClosureMode, DecoderNode, FactScope, NullPlacement, ReadSession, Span,
+    push_range, vector,
 };
 use witness::experiment::types::Column;
 
@@ -35,6 +37,8 @@ enum Family {
     StalePlan,
     /// A skip or accept cites stored statistics the page does not store.
     ForgedStatistics,
+    /// A boundary a search or translation found is moved by one row or code.
+    ResultShift,
 }
 
 impl Family {
@@ -45,6 +49,7 @@ impl Family {
             Self::ForeignPage => "foreign_page",
             Self::StalePlan => "stale_plan",
             Self::ForgedStatistics => "forged_statistics",
+            Self::ResultShift => "result_shift",
         }
     }
 }
@@ -232,16 +237,106 @@ fn mutate_pair(pages: &[Page], selector: &Column) -> Result<(Tally, Actions), St
                     continue;
                 }
                 let accepted = paged::check_between(page, &mut session, &mutant, low, high).is_ok();
-                let outcome = match paged::execute_between(page, &mut session, &mutant, low, high) {
+                let executed =
+                    paged::execute_between_unchecked(page, &mut session, &mutant, low, high);
+                let outcome = match executed {
                     Ok(spans) if spans == truth => Outcome::Correct,
                     Ok(_) => Outcome::Wrong,
                     Err(_) => Outcome::Error,
                 };
                 *tally.entry((family, accepted, outcome)).or_default() += 1;
             }
+            for (accepted, outcome) in shifted_results(page, original, low, high, &truth)? {
+                *tally
+                    .entry((Family::ResultShift, accepted, outcome))
+                    .or_default() += 1;
+            }
         }
     }
     Ok((tally, actions))
+}
+
+/// Moves each boundary of what a search or translation found by one row or
+/// code either way, as an executor bug would, and returns for every move
+/// whether the checker of results accepts it and how the moved result
+/// answers. The unmoved result must be accepted.
+fn shifted_results(
+    page: &Page,
+    action: &PageAction,
+    low: i64,
+    high: i64,
+    truth: &[Span],
+) -> Result<Vec<(bool, Outcome)>, String> {
+    let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+    let decoder = &page.column.decoder;
+    let all = Span::new(0, page.rows())?;
+    let (found, limit) = match action {
+        PageAction::Search { nulls, .. } => (
+            vector::monotone_bounds(decoder, &mut session, all, low, high, *nulls)?,
+            page.rows(),
+        ),
+        PageAction::Translate(_) => {
+            let &DecoderNode::Dictionary {
+                dictionary,
+                entries,
+                ..
+            } = decoder.node(decoder.root())?
+            else {
+                return Err("a translated page has no dictionary at its root".into());
+            };
+            (
+                vector::dictionary_codes(&mut session, dictionary, entries, low, high)?,
+                entries,
+            )
+        }
+        _ => return Ok(Vec::new()),
+    };
+    let mut check = |(first, end): (usize, usize)| match action {
+        PageAction::Search { nulls, .. } => {
+            paged::check_search(page, &mut session, *nulls, low, high, (first, end))
+        }
+        _ => paged::check_translation(page, &mut session, low, high, (first, end)),
+    };
+    if check(found).is_err() {
+        return Err("the checker rejects a search or translation result".into());
+    }
+    let (first, end) = found;
+    let mut moved = Vec::new();
+    for (first, end) in [
+        (first.checked_sub(1), Some(end)),
+        (Some(first + 1), Some(end)),
+        (Some(first), end.checked_sub(1)),
+        (Some(first), Some(end + 1)),
+    ] {
+        let (Some(first), Some(end)) = (first, end) else {
+            continue;
+        };
+        if first > limit || end > limit {
+            continue;
+        }
+        let accepted = check((first, end)).is_ok();
+        let executed = match action {
+            PageAction::Search { .. } if first <= end => Ok(if first < end {
+                vec![Span::new(first, end)?]
+            } else {
+                Vec::new()
+            }),
+            PageAction::Search { .. } => Err("a search found an inverted span".to_string()),
+            _ => vector::dictionary_code_range(
+                decoder,
+                &mut ReadSession::new_untracked(&page.column.page, ClosureMode::Selective),
+                all,
+                (first, end),
+            ),
+        };
+        let outcome = match executed {
+            Ok(spans) if spans == truth => Outcome::Correct,
+            Ok(_) => Outcome::Wrong,
+            Err(_) => Outcome::Error,
+        };
+        moved.push((accepted, outcome));
+    }
+    Ok(moved)
 }
 
 fn licence_of(action: &PageAction) -> Option<&Licence> {

@@ -19,7 +19,7 @@ use crate::measure::{Layouts, parallel};
 use crate::workload::predicates;
 
 /// One page in this many gets a faulty summary.
-const FAULT_EVERY: usize = 8;
+pub const FAULT_EVERY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Fault {

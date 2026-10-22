@@ -2,6 +2,8 @@
 #[path = "predicate_pipeline/workload.rs"]
 mod workload;
 
+#[path = "paged_study/attested_faults.rs"]
+mod attested_faults;
 #[path = "paged_study/checker.rs"]
 mod checker;
 #[path = "paged_study/common.rs"]

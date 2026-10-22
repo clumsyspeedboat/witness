@@ -122,6 +122,16 @@ These constraints are part of the result.
   checksum, which covers the page header only; the data fields are not
   checksummed. The checksum detects accidental or test tampering; it is not a
   cryptographic trust system.
+- The checker confirms the fact an action cites and, for a search or a code
+  translation, the rows or entries on either side of what it found; it does
+  not re-prove what the writer attests. The attested-fault study
+  (`paged_study/attested_faults.csv`) forges one attestation on one selector
+  page in eight: a forged order flag or dictionary order passes every check,
+  because a binary search over unordered values still reads neighbours that
+  bear its result out, and plans that trust it answer wrongly; page ends
+  moved inside the true ones only stop queries, at the column certificate's
+  confirming reads; and sealing would refuse each forged dictionary, which
+  the study installs after the seal.
 - The codec tree (codecs, widths, fields, dictionary sizes) travels beside a
   page in memory rather than inside its bytes, so a paged file is read with
   the column it was written from. Dictionary order is verified against the
