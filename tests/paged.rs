@@ -552,3 +552,43 @@ fn a_derived_footer_is_checked_on_every_page_the_query_reads() {
     .unwrap();
     assert_ne!((sum, rows), truth(query_low, query_high));
 }
+
+#[test]
+fn a_patching_menu_patches_outliers_and_keeps_answers_exact() {
+    let bitpack = || Box::new(Recipe::BitPack);
+    let patching = PagePolicy::smallest(vec![
+        Recipe::For(bitpack()),
+        Recipe::Patch {
+            index_interval: 32,
+            values: Box::new(Recipe::For(bitpack())),
+        },
+    ]);
+    // Narrow pages with a few far outliers, every other page with nulls.
+    let values = (0..8 * PAGE)
+        .map(|row| match row % 997 {
+            0 => Some(1_i64 << 40),
+            500 => Some(-(1_i64 << 40)),
+            _ if row / PAGE % 2 == 1 && row % 11 == 0 => None,
+            _ => Some((row % 200) as i64),
+        })
+        .collect::<Vec<_>>();
+    let column = PagedColumn::from_values(&values, PAGE, &patching).unwrap();
+    let patched = column
+        .pages()
+        .iter()
+        .filter(|page| page.column.recipe.patches())
+        .count();
+    assert!(
+        patched >= column.pages().len() / 2,
+        "{patched} patched pages"
+    );
+    for page in column.pages() {
+        let (lower, upper) = paged::derived_bounds(page).unwrap().unwrap();
+        let (minimum, maximum) = page.stats.unwrap();
+        assert!(lower <= minimum && maximum <= upper, "{page:?}");
+    }
+    for (low, high) in [(0, 99), (1 << 40, 1 << 40), (-5, -1), (300, 400)] {
+        let (ranges, _) = paged::between(&column, low, high, Planning::Facts, 1).unwrap();
+        assert_eq!(ranges, truth_ranges(&values, low, high), "{low}..={high}");
+    }
+}

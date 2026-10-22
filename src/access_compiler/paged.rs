@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use super::{
     Authorization, ClosureMode, DecoderNode, EncodedColumn, FactScope, InputColumn, InvariantSet,
     MappingInvariant, NullPlacement, Property, ReadSession, Recipe, Span, ValueInvariant,
-    bound_interval, derive_invariants, encode, push_range, vector,
+    bound_interval, derive_invariants, encode, patch_outliers, push_range, vector,
 };
 
 /// One page of a paged column.
@@ -203,9 +203,17 @@ impl PagePolicy {
                 values: Box::new(Recipe::BitPack),
             });
         }
+        // A patched recipe patches the page's outliers; other recipes ignore
+        // the rows, so they are chosen once, and only for a menu that patches.
+        let patch_rows = if self.menu.iter().any(Recipe::patches) {
+            patch_outliers(values)
+        } else {
+            Default::default()
+        };
         let mut best: Option<EncodedColumn> = None;
         for recipe in candidates {
-            let Ok(encoded) = encode(&recipe, InputColumn::nullable(values.to_vec())) else {
+            let input = InputColumn::nullable(values.to_vec()).with_patch_rows(patch_rows.clone());
+            let Ok(encoded) = encode(&recipe, input) else {
                 continue;
             };
             if best

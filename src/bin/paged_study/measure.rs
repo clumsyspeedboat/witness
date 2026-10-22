@@ -25,7 +25,7 @@ use crate::common::{
 };
 use crate::corpus::{self, Pair};
 use crate::workload::predicates;
-use crate::{attested_faults, checker, deletes, faults};
+use crate::{attested_faults, checker, deletes, faults, menus};
 
 const DEFAULT_RESULT_DIR: &str = "experiments/results/paged_study";
 const SCALING_PAIRS: usize = 12;
@@ -121,6 +121,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let (columns, pairs) = corpus::pairs()?;
     if pairs.len() < 100 {
         return Err(format!("paged corpus is unexpectedly small: {} pairs", pairs.len()).into());
+    }
+    // The menu study encodes the columns under its own menus, plans every
+    // query without timing it, and stands apart from the timed study.
+    if std::env::args().any(|argument| argument == "--menus") {
+        menus::run(&result_dir, &columns, &pairs, page_rows)?;
+        eprintln!("menu study finished in {:.0?}", started.elapsed());
+        return Ok(());
     }
     let layouts = parallel(columns.len(), |index| {
         encode_layouts(&columns[index], page_rows)

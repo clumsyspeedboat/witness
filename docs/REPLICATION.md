@@ -46,7 +46,7 @@ The eight stages are:
 | 2 | paired 16,384/131,072-row predicate studies |
 | 3 | Bloom, min/max, and sparse-fence controls |
 | 4 | logical, delivered, and transferred access measurements |
-| 5 | paged queries (facts, zone map, scan) against Parquet and DuckDB, checker and attestation fault injection, 4 Ki and 64 Ki page sizes, and 60 M-row thread scaling |
+| 5 | paged queries (facts, zone map, scan) against Parquet and DuckDB, checker and attestation fault injection, the untimed direct against byte-optimised menu study, 4 Ki and 64 Ki page sizes, and 60 M-row thread scaling |
 | 6 | auxiliary-plan measurements and neutral claim manifest |
 | 7 | generated kernels, physical toy artifacts, and walkthrough |
 | 8 | host provenance and input/output checksums |
@@ -103,6 +103,7 @@ uses 16,384.
 | `certificate_study/*.csv` | Bloom/min-max/fence controls |
 | `real_access/*.csv` | selected layouts and storage schedules |
 | `paged_study/*.csv` and `paged_study_rows*/*.csv` | page planning, checker mutations, statistics and attestation faults, bounds, and page-size controls |
+| `paged_study/menus.csv` | untimed menu study: per pair, under the direct and the byte-optimised menu, the compositions chosen, selector pages with a derived bound and with order from their bytes or from the writer, page actions under facts and a zone map, and bytes against Zstd Parquet |
 | `paged_scale/*.csv` | large-column queries and thread scaling |
 | `duckdb/*.csv` | checked DuckDB answers, timings, scan counts, and version |
 | `experiments/generated/` | frozen generated Rust kernels |

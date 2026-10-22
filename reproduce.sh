@@ -68,6 +68,9 @@ printf '5/8 paged queries, page sizes, scaling, conjunctions, floats, strings, c
 # The main run also writes the checker mutations and the two fault studies,
 # of stored statistics (faults.csv) and of attestations (attested_faults.csv).
 cargo run --locked --release --features experiment --bin paged_study
+# The menu study plans the same queries over pages chosen from the direct and
+# a byte-optimised menu, untimed, and writes menus.csv beside the main run.
+cargo run --locked --release --features experiment --bin paged_study -- --menus
 for rows in 4096 65536; do
   WITNESS_PAGE_ROWS=$rows cargo run --locked --release --features experiment --bin paged_study
 done

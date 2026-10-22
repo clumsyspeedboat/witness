@@ -69,7 +69,16 @@ conflate:
   with the assumption of the parent's own mapping added.
 - Nulls-first and nulls-last contracts can preserve boundary search. Arbitrary
   null placement cannot.
-- Patch structure does not inherit order when an exception can break it.
+- Patch structure does not inherit order when an exception can break it,
+  even over a child that proves order from its bytes. It does keep a bound:
+  the hull of the child's frame-of-reference or dictionary bound and the
+  stored exceptions, with the child's assumptions; a patch over an unbounded
+  child derives none. A property test patches random rows of random columns
+  with arbitrary `i64` outliers, under frame-of-reference, dictionary,
+  run-length, framed, and nullable compositions, decodes the bytes, and
+  checks that every derived bound encloses every decoded value.
+  `tests/paged.rs` checks that a patching menu patches outliers and still
+  answers exactly.
 - RLE run structure may authorize count-by-run; the same count on an
   unstructured stream falls back to value inspection.
 - Extreme `i64` spans exercise widened arithmetic.
@@ -228,6 +237,7 @@ The full pipeline invokes these scripts after verifying input hashes.
 | `run_certificate_study.sh` | at least 1,700 cells, five plan classes, four query classes, and no non-scan candidate set larger than the scan domain |
 | `run_real_access.sh` | 14 columns, 178 candidates, 336 query cells, 72 storage scans, policy/query consistency, cross-policy checksum equality, and storage-counter sanity |
 | `paged_study` | exact answers across facts, zone-map (plain, with shortcuts, with a dictionary filter), scan, and Parquet arms; no harmful checker mutant accepted; no forged attestation changes a zone-map answer |
+| `paged_study -- --menus` | untimed: every paged query, planned from facts and from a zone map over pages chosen from the direct menu and from the byte-optimised menu, answers exactly against brute force |
 | `paged_scale_study` | exact answers against a row-wise oracle across requested thread counts |
 | `duckdb_baseline.py` | exact sum and row-count agreement with exported paged workloads before timing |
 | `claim_manifest` | fixed-seed source bootstrap, claim extraction from canonical CSV cells, and no hand-entered scalar values |

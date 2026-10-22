@@ -868,6 +868,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ablation_claims(&mut out)?;
     fault_claims(&mut out)?;
     attested_fault_claims(&mut out)?;
+    menu_claims(&mut out)?;
     delete_claims(&mut out)?;
     page_fact_claims(&mut out)?;
     distribution_claims(&mut out)?;
@@ -3909,6 +3910,103 @@ fn attested_fault_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> 
         "WitAttestedFaultQueries",
         &group_digits(&get("order", "facts")?[0].to_string()),
     );
+    Ok(())
+}
+
+/// Whether the paged study's untimed menu study has written its file;
+/// results from before that study lack it.
+fn menus_run() -> bool {
+    std::path::Path::new(&format!("{PAGED}/menus.csv")).exists()
+}
+
+/// The direct menu against the byte-optimised one, from planning alone: the
+/// compositions each chose, the selector pages proving a bound and knowing
+/// their order from their bytes or from the writer, the page actions under
+/// facts and under a zone map, and the bytes stored. Defined once the menu
+/// study has written its file.
+fn menu_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    if !menus_run() {
+        println!("no menu study in {PAGED}; its claims are not defined");
+        return Ok(());
+    }
+    let menus = read_csv(&format!("{PAGED}/menus.csv"))?;
+    let total = |menu: &str, name: &str| {
+        menus
+            .iter()
+            .filter(|row| menus.field(row, "menu").is_ok_and(|field| field == menu))
+            .map(|row| Ok(menus.field(row, name)?.parse::<usize>()?))
+            .sum::<Result<usize, Box<dyn Error>>>()
+    };
+    let queries = total("direct", "queries")?;
+    if queries == 0 || queries != total("byte", "queries")? {
+        return Err("the menu study planned different queries under its two menus".into());
+    }
+    define(out, "WitMenuQueries", &group_digits(&queries.to_string()));
+    let zstd = total("direct", "parquet_zstd_bytes")? as f64;
+    let direct_bytes = total("direct", "bytes")? as f64;
+    for (menu, suffix) in [("direct", "Direct"), ("byte", "Byte")] {
+        let mut compositions = BTreeSet::new();
+        for row in menus
+            .iter()
+            .filter(|row| menus.field(row, "menu").is_ok_and(|field| field == menu))
+        {
+            for name in ["selector_recipes", "value_recipes"] {
+                for entry in menus.field(row, name)?.split(';') {
+                    let (recipe, _) = entry
+                        .rsplit_once(':')
+                        .ok_or_else(|| format!("malformed recipe count {entry:?}"))?;
+                    compositions.insert(recipe.to_string());
+                }
+            }
+        }
+        define(
+            out,
+            &format!("WitMenu{suffix}Compositions"),
+            &compositions.len().to_string(),
+        );
+        let pages = total(menu, "pages")? as f64;
+        for (column, name) in [
+            ("bounded_pages", "BoundPercent"),
+            ("structural_order_pages", "StructuralOrderPercent"),
+            ("piecewise_order_pages", "PiecewiseOrderPercent"),
+            ("attested_order_pages", "AttestedOrderPercent"),
+        ] {
+            define(
+                out,
+                &format!("WitMenu{suffix}{name}"),
+                &format!("{:.1}", total(menu, column)? as f64 / pages * 100.0),
+            );
+        }
+        for (column, name) in [
+            ("facts_skipped", "Skips"),
+            ("facts_accepted", "Accepts"),
+            ("facts_searched", "Searches"),
+            ("facts_translated", "Translations"),
+            ("facts_scanned", "Scans"),
+            ("zonemap_skipped", "ZonemapSkips"),
+            ("zonemap_accepted", "ZonemapAccepts"),
+            ("zonemap_scanned", "ZonemapScans"),
+        ] {
+            define(
+                out,
+                &format!("WitMenu{suffix}{name}"),
+                &group_digits(&total(menu, column)?.to_string()),
+            );
+        }
+        let bytes = total(menu, "bytes")? as f64;
+        define(
+            out,
+            &format!("WitMenu{suffix}OverZstdBytes"),
+            &format!("{:.2}", bytes / zstd),
+        );
+        if menu != "direct" {
+            define(
+                out,
+                &format!("WitMenu{suffix}OverDirectBytes"),
+                &format!("{:.2}", bytes / direct_bytes),
+            );
+        }
+    }
     Ok(())
 }
 

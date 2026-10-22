@@ -16,6 +16,8 @@ mod deletes;
 mod faults;
 #[path = "paged_study/measure.rs"]
 mod measure;
+#[path = "paged_study/menus.rs"]
+mod menus;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     measure::run()

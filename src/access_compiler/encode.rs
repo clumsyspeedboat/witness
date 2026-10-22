@@ -61,6 +61,71 @@ impl Recipe {
             } => format!("ChunkedFrame{}K({})", chunk_bytes / 1024, values.name()),
         }
     }
+
+    /// Whether the recipe patches exceptions, so that a writer must choose
+    /// which rows to patch.
+    pub fn patches(&self) -> bool {
+        match self {
+            Self::BitPack => false,
+            Self::Patch { .. } => true,
+            Self::Dictionary(values) | Self::For(values) | Self::Frame(values) => values.patches(),
+            Self::Rle { values, .. }
+            | Self::Nullable { values, .. }
+            | Self::ChunkedFrame { values, .. } => values.patches(),
+            Self::Delta { deltas, .. } | Self::UnsignedDelta { deltas, .. } => deltas.patches(),
+        }
+    }
+}
+
+/// Bytes a patch stores per exception: its position and its value.
+const PATCH_BYTES: usize = 4 + 8;
+
+/// The rows a writer patches under a frame of reference: the outliers whose
+/// removal narrows the bit width of the rest by more than storing them costs.
+/// At most one row in sixteen is patched, so a patch list stays short. Nulls
+/// are never patched.
+pub fn patch_outliers(values: &[Option<i64>]) -> BTreeSet<usize> {
+    let mut sorted = values.iter().flatten().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let (Some(&first), Some(&last)) = (sorted.first(), sorted.last()) else {
+        return BTreeSet::new();
+    };
+    let width = |span: i128| (u128::BITS - (span as u128).leading_zeros()) as usize;
+    let rows = sorted.len();
+    let most = rows / 16;
+    let mut best = (rows * width(i128::from(last) - i128::from(first)), None);
+    // A width that needs more than `most` exceptions rules out every
+    // narrower width as well, so the search stops there.
+    for bits in (0..width(i128::from(last) - i128::from(first))).rev() {
+        let reach = (1_i128 << bits) - 1;
+        // The window `[low, low + reach]` keeping the most values, among
+        // those that leave at most `most` values below.
+        let (kept, low) = (0..=most.min(rows - 1))
+            .map(|start| {
+                let low = i128::from(sorted[start]);
+                let end = sorted.partition_point(|&value| i128::from(value) <= low + reach);
+                (end - start, low)
+            })
+            .max_by_key(|&(kept, _)| kept)
+            .unwrap();
+        let exceptions = rows - kept;
+        if exceptions > most {
+            break;
+        }
+        let cost = rows * bits + exceptions * PATCH_BYTES * 8;
+        if cost < best.0 {
+            best = (cost, Some((low, low + reach)));
+        }
+    }
+    let Some((low, high)) = best.1 else {
+        return BTreeSet::new();
+    };
+    values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_some_and(|value| !(low..=high).contains(&i128::from(value))))
+        .map(|(row, _)| row)
+        .collect()
 }
 
 #[derive(Clone, Debug)]

@@ -52,6 +52,37 @@ pub fn compact_menu() -> Vec<Recipe> {
     menu
 }
 
+/// The direct menu plus every codec whose facts the direct menu never
+/// exercises: unsigned delta chains with restart anchors every 256 rows and
+/// with one anchor per page of `page_rows`, which prove order from their
+/// encoded deltas; a signed delta chain; a patch over a frame of reference;
+/// and each of these in one Zstd frame per page. The smallest pages the
+/// codec set can produce, for the menu study only: no timed arm uses it.
+pub fn byte_menu(page_rows: usize) -> Vec<Recipe> {
+    let bitpack = || Box::new(Recipe::BitPack);
+    let mut menu = direct_menu();
+    menu.push(Recipe::Delta {
+        restart_interval: 256,
+        deltas: bitpack(),
+    });
+    for restart_interval in [256, page_rows.next_multiple_of(128)] {
+        menu.push(Recipe::UnsignedDelta {
+            restart_interval,
+            deltas: bitpack(),
+        });
+    }
+    menu.push(Recipe::Patch {
+        index_interval: 32,
+        values: Box::new(Recipe::For(bitpack())),
+    });
+    let framed = menu
+        .iter()
+        .map(|recipe| Recipe::Frame(Box::new(recipe.clone())))
+        .collect::<Vec<_>>();
+    menu.extend(framed);
+    menu
+}
+
 /// p25, median, and p75 of five calibrated repetitions, each long enough to
 /// take at least `TARGET_NS`.
 pub fn benchmark<T, F>(run: F) -> Result<(f64, f64, f64), String>
