@@ -870,6 +870,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     delete_claims(&mut out)?;
     page_fact_claims(&mut out)?;
     distribution_claims(&mut out)?;
+    breakdown_claims(&mut out)?;
 
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
@@ -4025,6 +4026,610 @@ fn distribution_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             &format!("{:.1}", within as f64 * 100.0 / ratios.len() as f64),
         );
     }
+    Ok(())
+}
+
+/// Where the headline ratios come from: the paged queries split by the
+/// shortcut the facts planner took, by corpus and by tail; the census's
+/// beyond-a-zone-map share split by fact; the scale study against the zone
+/// map; the actions by the evidence they rest on; what verifying
+/// dictionaries, the checker and the cold audit cost or catch; DuckDB by
+/// query time; and the stored bytes in total.
+fn breakdown_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    paged_category_claims(out)?;
+    paged_spread_claims(out)?;
+    census_split_claims(out)?;
+    scale_zonemap_claims(out)?;
+    evidence_class_claims(out)?;
+    verify_cost_claims(out)?;
+    checker_mechanism_claims(out)?;
+    cold_audit_ratio_claims(out)?;
+    duck_strata_claims(out)?;
+    byte_total_claims(out)?;
+    Ok(())
+}
+
+/// The value at quantile `quantile` of `values`, by the nearest rank the
+/// distribution plot uses.
+fn quantile(values: &[f64], quantile: f64) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[((sorted.len() - 1) as f64 * quantile).round() as usize]
+}
+
+/// The paged queries split by the shortcut the facts planner took, each
+/// with facts over the zone map. The four categories partition the queries;
+/// a query falls in the first that applies:
+///
+/// 1. `Gap`: some page was skipped because its sorted dictionary holds no
+///    value in the range (`code_skipped > 0`);
+/// 2. `Search`: some page was searched, or the column's order certificate
+///    skipped pages that derived bounds alone did not. The counters fold
+///    the certificate's skips into `skipped`, so they show as facts
+///    skipping more pages, besides dictionary gaps, than the planner with
+///    derived bounds only;
+/// 3. `Translate`: some page's range was translated into codes;
+/// 4. `None`: every page was skipped or accepted by a bound, or scanned.
+fn paged_category_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let queries = read_csv(&format!("{PAGED}/queries.csv"))?;
+    // Counters of the facts and derived-bounds planners per query.
+    let mut counters = BTreeMap::<(String, String), [usize; 5]>::new();
+    for row in &queries {
+        let arm = queries.field(row, "arm")?;
+        let slots: &[(usize, &str)] = match arm.as_str() {
+            "witness_direct_facts" => &[
+                (0, "code_skipped"),
+                (1, "searched"),
+                (2, "translated"),
+                (3, "skipped"),
+            ],
+            "witness_direct_factbounds" => &[(4, "skipped")],
+            _ => continue,
+        };
+        let cell = counters
+            .entry((
+                queries.field(row, "pair")?,
+                queries.field(row, "predicate")?,
+            ))
+            .or_default();
+        for (slot, name) in slots {
+            cell[*slot] = queries.field(row, name)?.parse()?;
+        }
+    }
+    let latency = paged_latency(PAGED)?;
+    let mut categories = BTreeMap::<&str, Vec<f64>>::new();
+    for (cell, arms) in &latency {
+        let [code_skipped, searched, translated, skipped, bound_skipped] = counters
+            .get(cell)
+            .copied()
+            .ok_or("paged query lacks the facts planner's counters")?;
+        let category = if code_skipped > 0 {
+            "Gap"
+        } else if searched > 0 || skipped - code_skipped > bound_skipped {
+            "Search"
+        } else if translated > 0 {
+            "Translate"
+        } else {
+            "None"
+        };
+        let ratio = arms
+            .get("witness_direct_facts")
+            .zip(arms.get("witness_direct_zonemap"))
+            .map(|(facts, zone_map)| facts / zone_map)
+            .ok_or("paged query lacks the facts or zone-map time")?;
+        categories.entry(category).or_default().push(ratio);
+    }
+    for category in ["Gap", "Search", "Translate", "None"] {
+        let ratios = categories.get(category).cloned().unwrap_or_default();
+        define(
+            out,
+            &format!("WitPagedCategory{category}Queries"),
+            &group_digits(&ratios.len().to_string()),
+        );
+        if ratios.is_empty() {
+            continue;
+        }
+        define(
+            out,
+            &format!("WitPagedCategory{category}Geo"),
+            &format!("{:.2}", geometric_mean(&ratios)),
+        );
+        define(
+            out,
+            &format!("WitPagedCategory{category}Median"),
+            &format!("{:.2}", median(&ratios)),
+        );
+    }
+    Ok(())
+}
+
+/// Corpus groups of the paged study and the suffixes of their claims.
+const GROUP_SUFFIXES: [(&str, &str); 7] = [
+    ("publicbi", "PublicBi"),
+    ("tpcds", "TpcDs"),
+    ("tpch", "TpcH"),
+    ("clickbench", "ClickBench"),
+    ("nab", "Nab"),
+    ("household", "Household"),
+    ("large", "NycTaxi"),
+];
+
+/// How facts over the zone map spread across the paged queries: in total
+/// time, per source table, against the zone map with shortcuts, where the
+/// zone map decides some page or none, per corpus group, and at the tails.
+fn paged_spread_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let latency = paged_latency(PAGED)?;
+    let (facts, zone_map) = ("witness_direct_facts", "witness_direct_zonemap");
+    let totals = latency
+        .values()
+        .filter_map(|arms| Some((arms.get(facts)?, arms.get(zone_map)?)))
+        .fold((0.0, 0.0), |sum, (top, bottom)| {
+            (sum.0 + top, sum.1 + bottom)
+        });
+    define(
+        out,
+        "WitPagedFactsOverZonemapTotal",
+        &format!("{:.2}", totals.0 / totals.1),
+    );
+
+    let tables = table_ratios(&latency, PAGED, facts, zone_map)?
+        .iter()
+        .map(|ratios| geometric_mean(ratios))
+        .collect::<Vec<_>>();
+    define(
+        out,
+        "WitPagedFactsOverZonemapTableGeoMedian",
+        &format!("{:.2}", median(&tables)),
+    );
+    define(
+        out,
+        "WitPagedFactsSlowerTables",
+        &tables
+            .iter()
+            .filter(|ratio| **ratio > 1.0)
+            .count()
+            .to_string(),
+    );
+
+    let plus = arm_ratios(&latency, facts, "witness_direct_zonemapplus", None);
+    define(
+        out,
+        "WitPagedFactsOverZonemapPlusGeo",
+        &format!("{:.2}", geometric_mean(&plus)),
+    );
+    define(
+        out,
+        "WitPagedFactsOverZonemapPlusMedian",
+        &format!("{:.2}", median(&plus)),
+    );
+
+    // Queries in which the zone map skips or accepts some page, and the
+    // rest, where it scans every page.
+    let queries = read_csv(&format!("{PAGED}/queries.csv"))?;
+    let mut decided = BTreeSet::new();
+    for row in &queries {
+        if queries.field(row, "arm")? == zone_map
+            && queries.field(row, "skipped")?.parse::<usize>()?
+                + queries.field(row, "accepted")?.parse::<usize>()?
+                > 0
+        {
+            decided.insert((
+                queries.field(row, "pair")?,
+                queries.field(row, "predicate")?,
+            ));
+        }
+    }
+    for (name, keep) in [("Pruned", true), ("Unpruned", false)] {
+        let ratios = latency
+            .iter()
+            .filter(|(cell, _)| decided.contains(*cell) == keep)
+            .filter_map(|(_, arms)| Some(arms.get(facts)? / arms.get(zone_map)?))
+            .collect::<Vec<_>>();
+        define(
+            out,
+            &format!("WitPagedFactsOverZonemap{name}Queries"),
+            &group_digits(&ratios.len().to_string()),
+        );
+        define(
+            out,
+            &format!("WitPagedFactsOverZonemap{name}Geo"),
+            &format!("{:.2}", geometric_mean(&ratios)),
+        );
+    }
+
+    let pairs = read_csv(&format!("{PAGED}/pairs.csv"))?;
+    let group_of = pairs
+        .iter()
+        .map(|row| Ok((pairs.field(row, "pair")?, pairs.field(row, "group")?)))
+        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+    for (group, suffix) in GROUP_SUFFIXES {
+        let ratios = latency
+            .iter()
+            .filter(|((pair, _), _)| group_of.get(pair).is_some_and(|name| name == group))
+            .filter_map(|(_, arms)| Some(arms.get(facts)? / arms.get(zone_map)?))
+            .collect::<Vec<_>>();
+        if ratios.is_empty() {
+            continue;
+        }
+        define(
+            out,
+            &format!("WitPagedFactsOverZonemap{suffix}Queries"),
+            &group_digits(&ratios.len().to_string()),
+        );
+        define(
+            out,
+            &format!("WitPagedFactsOverZonemap{suffix}Geo"),
+            &format!("{:.2}", geometric_mean(&ratios)),
+        );
+    }
+
+    let all = arm_ratios(&latency, facts, zone_map, None);
+    define(
+        out,
+        "WitPagedFactsOverZonemapPTen",
+        &format!("{:.2}", quantile(&all, 0.1)),
+    );
+    define(
+        out,
+        "WitPagedFactsOverZonemapPNinety",
+        &format!("{:.2}", quantile(&all, 0.9)),
+    );
+    Ok(())
+}
+
+/// The census's 16,384-row pages whose facts license an action a zone map
+/// cannot, split so the parts add up to `WitPageFactsHOneLarge`: pages
+/// licensed to search (whole or per block), and pages licensed only to
+/// translate into codes. A skip for a dictionary gap depends on the query's
+/// range, not on the page alone, so the census does not record it.
+fn census_split_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let facts = read_csv(&format!("{CENSUS}/page_facts.csv"))?;
+    // pages with more than one value, search, translate only
+    let mut tally = [0_usize; 3];
+    for row in &facts {
+        if facts.field(row, "page_size")? != "16384" || facts.field(row, "state")? != "values" {
+            continue;
+        }
+        let search =
+            facts.field(row, "search")? == "true" || facts.field(row, "piecewise")? == "true";
+        let translate = facts.field(row, "translate")? == "true";
+        tally[0] += 1;
+        tally[1] += usize::from(search);
+        tally[2] += usize::from(translate && !search);
+    }
+    let percent = |part: usize| format!("{:.1}", part as f64 * 100.0 / tally[0] as f64);
+    define(out, "WitPageFactsHOneSearchLarge", &percent(tally[1]));
+    define(
+        out,
+        "WitPageFactsHOneTranslateOnlyLarge",
+        &percent(tally[2]),
+    );
+    Ok(())
+}
+
+/// Facts over the zone map on SF10 lineitem, one thread.
+fn scale_zonemap_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let scale = read_csv(&format!("{PAGED_SCALE}/scaling.csv"))?;
+    let mut times = BTreeMap::<(String, String), BTreeMap<String, f64>>::new();
+    for row in &scale {
+        if scale.field(row, "threads")? != "1" {
+            continue;
+        }
+        times
+            .entry((
+                scale.field(row, "selector")?,
+                scale.field(row, "predicate")?,
+            ))
+            .or_default()
+            .insert(
+                scale.field(row, "arm")?,
+                scale.field(row, "median_ns")?.parse()?,
+            );
+    }
+    let ratios = times
+        .values()
+        .filter_map(|arms| {
+            Some(arms.get("witness_direct_facts")? / arms.get("witness_direct_zonemap")?)
+        })
+        .collect::<Vec<_>>();
+    define(
+        out,
+        "WitScaleFactsOverZonemapQueries",
+        &ratios.len().to_string(),
+    );
+    define(
+        out,
+        "WitScaleFactsOverZonemapGeo",
+        &format!("{:.2}", geometric_mean(&ratios)),
+    );
+    define(
+        out,
+        "WitScaleFactsOverZonemapMedian",
+        &format!("{:.2}", median(&ratios)),
+    );
+    define(
+        out,
+        "WitScaleFactsOverZonemapMin",
+        &format!("{:.2}", ratios.iter().copied().fold(f64::MAX, f64::min)),
+    );
+    Ok(())
+}
+
+/// The pages the facts planner did not scan, by the evidence their action
+/// rests on:
+///
+/// - `Structural`: a skip or acceptance on a page without a dictionary,
+///   from its frame-of-reference bounds, a constant run, or its being all
+///   null;
+/// - `Dictionary`: a skip or acceptance by the ends of a page's sorted
+///   dictionary, a skip for a gap in it, or a translation into codes, all
+///   resting on the dictionary verified when the page was sealed;
+/// - `Order`: a search, whole or per block, resting on the order the writer
+///   attested.
+///
+/// A skip on a nullable dictionary page is counted as a dictionary bound,
+/// though an all-null page would cite its nulls; the writer stores an
+/// all-null page without a dictionary. The column's order certificate acts
+/// before pages are planned and is not among these actions.
+fn evidence_class_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let actions = read_csv(&format!("{PAGED}/actions.csv"))?;
+    let mut classes = BTreeMap::<&str, f64>::new();
+    for row in &actions {
+        let recipe = actions.field(row, "recipe")?;
+        let class = match actions.field(row, "action")?.as_str() {
+            "scan" => continue,
+            "search" | "search_piecewise" => "Order",
+            "skip_codes" | "translate" => "Dictionary",
+            "skip" | "accept" if recipe.contains("Dictionary") => "Dictionary",
+            "skip" | "accept" => "Structural",
+            other => return Err(format!("unclassified page action {other}").into()),
+        };
+        *classes.entry(class).or_default() += actions.field(row, "pages")?.parse::<f64>()?;
+    }
+    let total = classes.values().sum::<f64>();
+    define(out, "WitActionPages", &group_digits(&format!("{total:.0}")));
+    for class in ["Structural", "Dictionary", "Order"] {
+        define(
+            out,
+            &format!("WitAction{class}Percent"),
+            &format!(
+                "{:.1}",
+                classes.get(class).copied().unwrap_or(0.0) * 100.0 / total
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Verifying a page's dictionaries when it is sealed, per page, over the
+/// pairs: the median is `WitPagedVerifyNsPerPage`; here the 90th percentile
+/// and the most, and the time against one scan of the pair.
+fn verify_cost_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let costs = read_csv(&format!("{PAGED}/costs.csv"))?;
+    let mut per_page = Vec::new();
+    let mut over_scan = Vec::new();
+    for row in &costs {
+        let verify = costs.field(row, "verify_ns")?.parse::<f64>()?;
+        per_page.push(verify / costs.field(row, "pages")?.parse::<f64>()?);
+        over_scan.push(verify / costs.field(row, "scan_ns")?.parse::<f64>()?);
+    }
+    define(
+        out,
+        "WitPagedVerifyNsPerPageNinety",
+        &format!("{:.0}", quantile(&per_page, 0.9)),
+    );
+    define(
+        out,
+        "WitPagedVerifyNsPerPageMax",
+        &format!("{:.0}", per_page.iter().copied().fold(0.0, f64::max)),
+    );
+    define(
+        out,
+        "WitPagedVerifyOverScanPercent",
+        &format!("{:.1}", median(&over_scan) * 100.0),
+    );
+    define(
+        out,
+        "WitPagedVerifyOverScanPercentNinety",
+        &format!("{:.1}", quantile(&over_scan, 0.9) * 100.0),
+    );
+    Ok(())
+}
+
+/// The checker's mutants by the mechanism that rejects them: forged
+/// statistics never name a fact and are rejected by construction; another
+/// action kind is not licensed by the cited fact; a neighbouring page's or
+/// another predicate's action fails the semantic re-check against this
+/// page and range; a moved bound is never harmful. Harmful mutants are
+/// split into wrong answers and executor errors.
+fn checker_mechanism_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let checker = read_csv(&format!("{PAGED}/checker.csv"))?;
+    // wrong, error, harmless rejected
+    let mut mechanisms = BTreeMap::<&str, [usize; 3]>::new();
+    for row in &checker {
+        let mechanism = match checker.field(row, "family")?.as_str() {
+            "forged_statistics" => "Forged",
+            "kind" => "Kind",
+            "foreign_page" | "stale_plan" => "Recheck",
+            "evidence" => "MovedBound",
+            other => return Err(format!("unclassified mutation family {other}").into()),
+        };
+        let counts = mechanisms.entry(mechanism).or_default();
+        let mutants = checker.field(row, "mutants")?.parse::<usize>()?;
+        let rejected = checker.field(row, "checker")? == "rejected";
+        match checker.field(row, "outcome")?.as_str() {
+            "wrong" => counts[0] += mutants,
+            "error" => counts[1] += mutants,
+            "correct" if rejected => counts[2] += mutants,
+            _ => {}
+        }
+    }
+    let mut totals = [0_usize; 2];
+    for mechanism in ["Forged", "Kind", "Recheck", "MovedBound"] {
+        let [wrong, error, harmless] = mechanisms.get(mechanism).copied().unwrap_or_default();
+        totals[0] += wrong;
+        totals[1] += error;
+        for (name, value) in [
+            ("Harmful", wrong + error),
+            ("Wrong", wrong),
+            ("Error", error),
+            ("HarmlessRejected", harmless),
+        ] {
+            define(
+                out,
+                &format!("WitChecker{mechanism}{name}"),
+                &group_digits(&value.to_string()),
+            );
+        }
+    }
+    define(
+        out,
+        "WitCheckerHarmfulWrong",
+        &group_digits(&totals[0].to_string()),
+    );
+    define(
+        out,
+        "WitCheckerHarmfulError",
+        &group_digits(&totals[1].to_string()),
+    );
+    Ok(())
+}
+
+/// The cold audit per column: the time to audit derived bounds over the
+/// time to recompute the zone map, on one thread and on the most threads.
+fn cold_audit_ratio_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let audits = read_csv(&format!("{COLD}/audit.csv"))?;
+    let mut times = BTreeMap::<(String, String), BTreeMap<String, f64>>::new();
+    for row in &audits {
+        times
+            .entry((
+                audits.field(row, "threads")?,
+                audits.field(row, "selector")?,
+            ))
+            .or_default()
+            .insert(
+                audits.field(row, "summary")?,
+                audits.field(row, "ns")?.parse()?,
+            );
+    }
+    let most = times
+        .keys()
+        .map(|(threads, _)| threads.parse::<usize>())
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .into_iter()
+        .next_back()
+        .filter(|threads| *threads != 1)
+        .ok_or("cold audit ran on one thread only")?
+        .to_string();
+    for (threads, suffix) in [("1".to_string(), ""), (most, "Threaded")] {
+        let ratios = times
+            .iter()
+            .filter(|((count, _), _)| *count == threads)
+            .map(|(_, summaries)| {
+                Ok(summaries
+                    .get("derived_bounds")
+                    .zip(summaries.get("zone_map"))
+                    .map(|(bounds, zone_map)| bounds / zone_map)
+                    .ok_or("cold audit lacks a summary for a column")?)
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        for (name, value) in [
+            ("Min", ratios.iter().copied().fold(f64::MAX, f64::min)),
+            ("Median", median(&ratios)),
+            ("Max", ratios.iter().copied().fold(f64::MIN, f64::max)),
+        ] {
+            define(
+                out,
+                &format!("WitColdAuditBoundsOverZone{name}{suffix}"),
+                &format!("{value:.2}"),
+            );
+        }
+        define(
+            out,
+            &format!("WitColdAuditBoundsSlower{suffix}"),
+            &ratios
+                .iter()
+                .filter(|ratio| **ratio > 1.0)
+                .count()
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Facts over DuckDB's native engine by how long Witness takes (under
+/// 0.2 ms, 0.2 to 1 ms, over 1 ms), and over DuckDB's time less the
+/// measured cost of a client round trip that does no work.
+fn duck_strata_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let latency = paged_latency_with_duckdb(PAGED, DUCKDB)?;
+    let freeze = read_csv(&format!("{DUCKDB}/freeze.csv"))?;
+    let floor = freeze
+        .field(&freeze[0], "client_floor_ns")?
+        .parse::<f64>()?;
+    let mut strata = BTreeMap::<&str, Vec<f64>>::new();
+    let mut floorless = Vec::new();
+    for arms in latency.values() {
+        let (Some(witness), Some(duck)) = (arms.get("witness_direct_facts"), arms.get("duckdb"))
+        else {
+            continue;
+        };
+        let stratum = if *witness < 0.2e6 {
+            "Short"
+        } else if *witness <= 1e6 {
+            "Middle"
+        } else {
+            "Long"
+        };
+        strata.entry(stratum).or_default().push(witness / duck);
+        if *duck <= floor {
+            return Err("a DuckDB query took no longer than its client floor".into());
+        }
+        floorless.push(witness / (duck - floor));
+    }
+    for stratum in ["Short", "Middle", "Long"] {
+        let ratios = strata.get(stratum).cloned().unwrap_or_default();
+        define(
+            out,
+            &format!("WitDuckNative{stratum}Queries"),
+            &group_digits(&ratios.len().to_string()),
+        );
+        if !ratios.is_empty() {
+            define(
+                out,
+                &format!("WitDuckNative{stratum}Median"),
+                &format!("{:.2}", median(&ratios)),
+            );
+        }
+    }
+    define(
+        out,
+        "WitDuckNativeFloorlessMedian",
+        &format!("{:.2}", median(&floorless)),
+    );
+    Ok(())
+}
+
+/// Bytes stored over all paged pairs, by each Witness layout over Zstd
+/// Parquet.
+fn byte_total_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    let pairs = read_csv(&format!("{PAGED}/pairs.csv"))?;
+    let total = |name: &str| {
+        pairs
+            .iter()
+            .map(|row| Ok(pairs.field(row, name)?.parse::<f64>()?))
+            .sum::<Result<f64, Box<dyn Error>>>()
+    };
+    let zstd = total("parquet_zstd_bytes")?;
+    define(
+        out,
+        "WitPagedDirectOverZstdBytesTotal",
+        &format!("{:.2}", total("witness_direct_bytes")? / zstd),
+    );
+    define(
+        out,
+        "WitPagedCompactOverZstdBytesTotal",
+        &format!("{:.2}", total("witness_compact_bytes")? / zstd),
+    );
     Ok(())
 }
 
