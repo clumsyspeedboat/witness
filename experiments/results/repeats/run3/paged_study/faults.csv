@@ -2,12 +2,15 @@ fault,planner,queries,affected,correct,wrong,failed
 neighbour,facts,1166,1024,1166,0,0
 neighbour,footer,1166,954,255,25,886
 neighbour,zonemap,1166,1024,1078,88,0
+neighbour,zonemapdict,1166,1024,1078,88,0
 neighbour,zonemapplus,1166,1024,1078,88,0
 truncated,facts,1166,1106,1166,0,0
 truncated,footer,1166,1106,116,532,518
 truncated,zonemap,1166,1106,521,645,0
+truncated,zonemapdict,1166,1106,521,645,0
 truncated,zonemapplus,1166,1106,521,645,0
 absent,facts,1166,1159,1166,0,0
 absent,footer,1166,1159,7,0,1159
 absent,zonemap,1166,1159,1166,0,0
+absent,zonemapdict,1166,1159,1166,0,0
 absent,zonemapplus,1166,1159,1166,0,0

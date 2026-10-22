@@ -13,3 +13,5 @@ stale_plan,rejected,wrong,6598
 stale_plan,accepted,correct,4085
 forged_statistics,rejected,correct,18197
 forged_statistics,rejected,wrong,209333
+result_shift,rejected,wrong,57073
+result_shift,rejected,error,32
