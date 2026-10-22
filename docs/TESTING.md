@@ -34,8 +34,8 @@ Use `cargo test --locked --all-features -- --list` for the current test inventor
 | interpreted execution | `tests/access_compiler_exec.rs` | brute-force answers and malformed-input behavior |
 | vector execution | `tests/vector.rs`, `tests/vector_validation.rs` | decoded answers, code-lane equivalence, and malformed-selection rejection |
 | paged execution | `tests/paged.rs`, `tests/paged_edge_cases.rs` | row-wise answers, checked licences, append certificates, and serial/parallel equivalence |
-| paged planners | `tests/paged_differential.rs`, `tests/paged_deletes.rs`, `tests/dictionary_skips.rs`, `tests/selective_kernels.rs`, `tests/strings.rs` | every planner, from facts to a zone map with a dictionary filter, against a scan of the rows; dictionary skips the checker re-reads |
-| result checks | `tests/result_checks.rs` | search and translation boundaries moved by one rejected; forged attestations against each planner |
+| paged planners | `tests/paged_differential.rs`, `tests/paged_deletes.rs`, `tests/dictionary_skips.rs`, `tests/selective_kernels.rs`, `tests/strings.rs` | every planner, from facts to a zone map with a dictionary filter, against a scan of the rows; dictionary skips the checker re-reads; translations on nullable dictionary pages |
+| result checks | `tests/result_checks.rs` | search and translation boundaries moved by one rejected, on dense and nullable pages; forged attestations against each planner |
 | chunked frames | `tests/chunked_frames.rs` | exact answers, chunk-level reads, and corruption handling |
 | generated execution | `tests/access_compiler_generated.rs` | interpreter, monomorphized control, and frozen generated Rust |
 | sidecar certificates | `tests/certificate_plans.rs` | brute-force membership with candidate refinement |
@@ -63,7 +63,10 @@ conflate:
 - Multiple restart anchors establish piecewise order, not global order across
   restart seams.
 - A sorted dictionary establishes an order-preserving value-to-code mapping;
-  it does not establish row order in the ID stream.
+  it does not establish row order in the ID stream. Under a nullable parent
+  the mapping holds on the non-null rows only.
+- A fact passed through a parent keeps the child's evidence and assumptions,
+  with the assumption of the parent's own mapping added.
 - Nulls-first and nulls-last contracts can preserve boundary search. Arbitrary
   null placement cannot.
 - Patch structure does not inherit order when an exception can break it.

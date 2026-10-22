@@ -246,9 +246,8 @@ pub fn dictionary_selection(
     low: i64,
     high: i64,
 ) -> Result<Selection, String> {
-    let (dictionary, entries) = sorted_root_table(decoder)
-        .map_err(|_| "dictionary selection needs a sorted dictionary root")?;
-    let codes = dictionary_codes(session, dictionary, entries, low, high)?;
+    let sorted = SortedTable::at_root(decoder)?;
+    let codes = dictionary_codes(session, sorted.table, sorted.entries, low, high)?;
     dictionary_code_selection(decoder, session, rows, codes)
 }
 
@@ -260,15 +259,8 @@ pub fn dictionary_code_selection(
     rows: Span,
     (low_id, high_id): (usize, usize),
 ) -> Result<Selection, String> {
-    let &DecoderNode::Dictionary {
-        ids,
-        entries,
-        sorted_unique: true,
-        ..
-    } = decoder.node(decoder.root())?
-    else {
-        return Err("dictionary selection needs a sorted dictionary root".into());
-    };
+    let sorted = SortedTable::at_root(decoder)?;
+    let entries = sorted.entries;
     if high_id > entries {
         return Err("dictionary code range lies outside its table".into());
     }
@@ -293,27 +285,18 @@ pub fn dictionary_code_selection(
     }
     if low_id < high_id {
         let (low_id, last_id) = (low_id as i128, high_id as i128 - 1);
-        scan_node(
-            decoder,
-            ids,
-            session,
-            rows.start,
-            rows.end,
-            &mut |_, row, chunk| {
-                let out_of_table = match &chunk {
-                    Chunk::Values(codes) => {
-                        codes.iter().any(|&id| !(0..entries as i128).contains(&id))
-                    }
-                    Chunk::Run { value, .. } => !(0..entries as i128).contains(value),
-                    Chunk::Nulls { .. } => false,
-                };
-                if out_of_table {
-                    return Err("dictionary id is outside table".into());
-                }
-                select_chunk(&mut selection, row, chunk, low_id, last_id);
-                Ok(())
-            },
-        )?;
+        sorted.scan_ids(decoder, session, rows, &mut |_, row, chunk| {
+            let out_of_table = match &chunk {
+                Chunk::Values(codes) => codes.iter().any(|&id| !(0..entries as i128).contains(&id)),
+                Chunk::Run { value, .. } => !(0..entries as i128).contains(value),
+                Chunk::Nulls { .. } => false,
+            };
+            if out_of_table {
+                return Err("dictionary id is outside table".into());
+            }
+            select_chunk(&mut selection, row, chunk, low_id, last_id);
+            Ok(())
+        })?;
     }
     Ok(selection)
 }
@@ -2422,9 +2405,10 @@ pub fn search_piecewise(
     Ok(ranges)
 }
 
-/// Rows whose value lies in `[low, high]` for a column whose root is a sorted
-/// dictionary: the value range becomes a code range by two searches of the
-/// table, and only the codes are scanned.
+/// Rows whose value lies in `[low, high]` for a column whose values a sorted
+/// dictionary holds, at its root or under a nullable root: the value range
+/// becomes a code range by two searches of the table, and only the codes of
+/// rows with values are scanned.
 pub fn dictionary_range(
     decoder: &DecoderIr,
     session: &mut ReadSession<'_>,
@@ -2432,8 +2416,8 @@ pub fn dictionary_range(
     low: i64,
     high: i64,
 ) -> Result<Vec<Span>, String> {
-    let (dictionary, entries) = sorted_root_table(decoder)?;
-    let codes = dictionary_codes(session, dictionary, entries, low, high)?;
+    let sorted = SortedTable::at_root(decoder)?;
+    let codes = dictionary_codes(session, sorted.table, sorted.entries, low, high)?;
     dictionary_code_range(decoder, session, rows, codes)
 }
 
@@ -2463,15 +2447,8 @@ pub fn dictionary_code_range(
     rows: Span,
     (low_id, high_id): (usize, usize),
 ) -> Result<Vec<Span>, String> {
-    let &DecoderNode::Dictionary {
-        ids,
-        entries,
-        sorted_unique: true,
-        ..
-    } = decoder.node(decoder.root())?
-    else {
-        return Err("dictionary range needs a sorted dictionary root".into());
-    };
+    let sorted = SortedTable::at_root(decoder)?;
+    let entries = sorted.entries;
     if high_id > entries {
         return Err("dictionary code range lies outside its table".into());
     }
@@ -2479,47 +2456,86 @@ pub fn dictionary_code_range(
     let mut ranges = Vec::new();
     if low_id < high_id {
         let (low_id, last_id) = (low_id as i128, high_id as i128 - 1);
-        scan_node(
-            decoder,
-            ids,
-            session,
-            rows.start,
-            rows.end,
-            &mut |_, row, chunk| {
-                match chunk {
-                    Chunk::Values(codes) => {
-                        if codes.iter().any(|&id| !(0..entries as i128).contains(&id)) {
-                            return Err("dictionary id is outside table".into());
-                        }
-                        push_batch_matches(&mut ranges, codes, row, low_id, last_id);
+        sorted.scan_ids(decoder, session, rows, &mut |_, row, chunk| {
+            match chunk {
+                Chunk::Values(codes) => {
+                    if codes.iter().any(|&id| !(0..entries as i128).contains(&id)) {
+                        return Err("dictionary id is outside table".into());
                     }
-                    Chunk::Run { value, len } => {
-                        if !(0..entries as i128).contains(&value) {
-                            return Err("dictionary id is outside table".into());
-                        }
-                        if low_id <= value && value <= last_id {
-                            push_range(&mut ranges, row, row + len);
-                        }
-                    }
-                    Chunk::Nulls { .. } => {}
+                    push_batch_matches(&mut ranges, codes, row, low_id, last_id);
                 }
-                Ok(())
-            },
-        )?;
+                Chunk::Run { value, len } => {
+                    if !(0..entries as i128).contains(&value) {
+                        return Err("dictionary id is outside table".into());
+                    }
+                    if low_id <= value && value <= last_id {
+                        push_range(&mut ranges, row, row + len);
+                    }
+                }
+                Chunk::Nulls { .. } => {}
+            }
+            Ok(())
+        })?;
     }
     Ok(ranges)
 }
 
-/// The table and entry count of the sorted dictionary at the root.
-fn sorted_root_table(decoder: &DecoderIr) -> Result<(FieldId, usize), String> {
-    match *decoder.node(decoder.root())? {
-        DecoderNode::Dictionary {
-            dictionary,
-            entries,
-            sorted_unique: true,
-            ..
-        } => Ok((dictionary, entries)),
-        _ => Err("dictionary range needs a sorted dictionary root".into()),
+/// The table and entry count of the sorted dictionary holding a column's
+/// values, at its root or under a nullable root: the table a translation
+/// searches.
+pub fn sorted_table(decoder: &DecoderIr) -> Result<(FieldId, usize), String> {
+    let sorted = SortedTable::at_root(decoder)?;
+    Ok((sorted.table, sorted.entries))
+}
+
+/// A sorted dictionary holding a column's values, at its root or under a
+/// nullable root, whose ids a code range is compared with.
+struct SortedTable {
+    /// The nullable root over the dictionary, if any.
+    nullable: Option<NodeId>,
+    ids: NodeId,
+    table: FieldId,
+    entries: usize,
+}
+
+impl SortedTable {
+    fn at_root(decoder: &DecoderIr) -> Result<Self, String> {
+        let root = decoder.root();
+        let (nullable, node) = match *decoder.node(root)? {
+            DecoderNode::Nullable { values, .. } => (Some(root), values),
+            _ => (None, root),
+        };
+        match *decoder.node(node)? {
+            DecoderNode::Dictionary {
+                ids,
+                dictionary,
+                entries,
+                sorted_unique: true,
+            } => Ok(Self {
+                nullable,
+                ids,
+                table: dictionary,
+                entries,
+            }),
+            _ => Err("dictionary range needs a sorted dictionary holding the values".into()),
+        }
+    }
+
+    /// Streams the ids of `rows` to `sink` in row order, a null row as
+    /// `Chunk::Nulls`, which holds no id and matches no code range.
+    fn scan_ids<'p>(
+        &self,
+        decoder: &DecoderIr,
+        session: &mut ReadSession<'p>,
+        rows: Span,
+        sink: &mut Sink<'_, 'p>,
+    ) -> Result<(), String> {
+        match self.nullable {
+            Some(nullable) => scan_nullable(
+                decoder, nullable, self.ids, session, rows.start, rows.end, sink,
+            ),
+            None => scan_node(decoder, self.ids, session, rows.start, rows.end, sink),
+        }
     }
 }
 
@@ -2834,96 +2850,117 @@ fn scan_node<'p>(
                 },
             )
         }
-        DecoderNode::Nullable {
-            validity,
-            rank_index,
-            values,
-            logical_len,
-            rank_interval,
-            ..
-        } => {
-            if end > logical_len {
-                return Err("nullable scan exceeds its column".into());
-            }
-            let compact =
-                nullable_prefix_rank(session, validity, rank_index, start, rank_interval)?;
-            let first_byte = start / 8;
-            let bits = session
-                .read_range(validity, Span::new(first_byte, (end - 1) / 8 + 1)?)?
-                .to_vec();
-            let valid = |row: usize| bits[row / 8 - first_byte] >> (row % 8) & 1 == 1;
-            let present = (start..end).filter(|&row| valid(row)).count();
-            // The stored values are scanned once, and each chunk is laid over
-            // the next valid rows, with the null runs between them emitted
-            // as they are reached.
-            let mut logical = start;
-            let emit_nulls = |session: &mut ReadSession<'p>,
-                              logical: &mut usize,
-                              sink: &mut Sink<'_, 'p>|
-             -> Result<(), String> {
-                let null_start = *logical;
-                while *logical < end && !valid(*logical) {
-                    *logical += 1;
-                }
-                if *logical > null_start {
-                    sink(
-                        session,
-                        null_start,
-                        Chunk::Nulls {
-                            len: *logical - null_start,
-                        },
-                    )?;
-                }
-                Ok(())
-            };
-            scan_node(
-                decoder,
-                values,
-                session,
-                compact,
-                compact + present,
-                &mut |session, _, chunk| {
-                    let mut remaining = chunk.len();
-                    let mut offset = 0;
-                    let mut chunk = chunk;
-                    while remaining > 0 {
-                        emit_nulls(session, &mut logical, sink)?;
-                        let run_start = logical;
-                        while logical < end && valid(logical) && logical - run_start < remaining {
-                            logical += 1;
-                        }
-                        let len = logical - run_start;
-                        if len == 0 {
-                            return Err("nullable values outrun their validity".into());
-                        }
-                        match &mut chunk {
-                            Chunk::Values(values) => {
-                                sink(
-                                    session,
-                                    run_start,
-                                    Chunk::Values(&mut values[offset..offset + len]),
-                                )?;
-                            }
-                            Chunk::Run { value, .. } => {
-                                sink(session, run_start, Chunk::Run { value: *value, len })?;
-                            }
-                            Chunk::Nulls { .. } => {
-                                sink(session, run_start, Chunk::Nulls { len })?;
-                            }
-                        }
-                        offset += len;
-                        remaining -= len;
-                    }
-                    Ok(())
-                },
-            )?;
-            emit_nulls(session, &mut logical, sink)?;
-            if logical != end {
-                return Err("nullable values end before their validity".into());
-            }
-            Ok(())
+        DecoderNode::Nullable { values, .. } => {
+            scan_nullable(decoder, node, values, session, start, end, sink)
         }
     }
+}
+
+/// Scans rows `[start, end)` of the nullable node `node`, laying the stored
+/// rows of `values` over the rows its validity marks. `values` is the node's
+/// child, or a node holding one row for each of the child's, as a sorted
+/// dictionary's ids do; null rows come as `Chunk::Nulls`.
+fn scan_nullable<'p>(
+    decoder: &DecoderIr,
+    node: NodeId,
+    values: NodeId,
+    session: &mut ReadSession<'p>,
+    start: usize,
+    end: usize,
+    sink: &mut Sink<'_, 'p>,
+) -> Result<(), String> {
+    let DecoderNode::Nullable {
+        validity,
+        rank_index,
+        logical_len,
+        rank_interval,
+        ..
+    } = *decoder.node(node)?
+    else {
+        return Err("nullable scan needs a nullable node".into());
+    };
+    if start >= end {
+        return Ok(());
+    }
+    if end > logical_len {
+        return Err("nullable scan exceeds its column".into());
+    }
+    let compact = nullable_prefix_rank(session, validity, rank_index, start, rank_interval)?;
+    let first_byte = start / 8;
+    let bits = session
+        .read_range(validity, Span::new(first_byte, (end - 1) / 8 + 1)?)?
+        .to_vec();
+    let valid = |row: usize| bits[row / 8 - first_byte] >> (row % 8) & 1 == 1;
+    let present = (start..end).filter(|&row| valid(row)).count();
+    // The stored values are scanned once, and each chunk is laid over
+    // the next valid rows, with the null runs between them emitted
+    // as they are reached.
+    let mut logical = start;
+    let emit_nulls = |session: &mut ReadSession<'p>,
+                      logical: &mut usize,
+                      sink: &mut Sink<'_, 'p>|
+     -> Result<(), String> {
+        let null_start = *logical;
+        while *logical < end && !valid(*logical) {
+            *logical += 1;
+        }
+        if *logical > null_start {
+            sink(
+                session,
+                null_start,
+                Chunk::Nulls {
+                    len: *logical - null_start,
+                },
+            )?;
+        }
+        Ok(())
+    };
+    scan_node(
+        decoder,
+        values,
+        session,
+        compact,
+        compact + present,
+        &mut |session, _, chunk| {
+            let mut remaining = chunk.len();
+            let mut offset = 0;
+            let mut chunk = chunk;
+            while remaining > 0 {
+                emit_nulls(session, &mut logical, sink)?;
+                let run_start = logical;
+                while logical < end && valid(logical) && logical - run_start < remaining {
+                    logical += 1;
+                }
+                let len = logical - run_start;
+                if len == 0 {
+                    return Err("nullable values outrun their validity".into());
+                }
+                match &mut chunk {
+                    Chunk::Values(values) => {
+                        sink(
+                            session,
+                            run_start,
+                            Chunk::Values(&mut values[offset..offset + len]),
+                        )?;
+                    }
+                    Chunk::Run { value, .. } => {
+                        sink(session, run_start, Chunk::Run { value: *value, len })?;
+                    }
+                    Chunk::Nulls { .. } => {
+                        sink(session, run_start, Chunk::Nulls { len })?;
+                    }
+                }
+                offset += len;
+                remaining -= len;
+            }
+            Ok(())
+        },
+    )?;
+    emit_nulls(session, &mut logical, sink)?;
+    if logical != end {
+        return Err("nullable values end before their validity".into());
+    }
+    Ok(())
 }
 
 fn get_node(

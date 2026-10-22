@@ -137,7 +137,11 @@ Every fact carries evidence:
 
 It also carries assumptions such as checked arithmetic or a sorted unique
 dictionary. Facts pass through a parent only when the parent preserves the
-relevant property.
+relevant property, and a fact passed through keeps the child's evidence and
+assumptions; a parent that maps values in order adds the assumption its own
+mapping rests on. A nullable parent stores its child's values unchanged at
+the rows that hold one, so it carries its child's mappings to those rows,
+in scope `NonNullRows`.
 
 Unsigned delta is the key precision example. One restart segment structurally
 proves global monotonicity. Multiple independent restart anchors prove only
@@ -179,6 +183,13 @@ not.
 | piecewise non-decreasing | search inside each block |
 | order-preserving sorted dictionary | translate to a code range |
 | none | scan |
+
+A translation needs the order-preserving mapping of a sorted dictionary
+holding the page's values. At a dictionary root the licence cites the
+root's mapping; at a nullable root, the mapping the root carries to its
+non-null rows. Ids are compared with the code range on those rows, and a
+null row holds no id, so it matches no range. `check_translation` reads the
+same table either way.
 
 A sorted dictionary lists every value its page holds, at the root or under a
 nullable root. When the predicate lies strictly inside its first and last

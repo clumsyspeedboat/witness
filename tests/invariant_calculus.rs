@@ -1,8 +1,8 @@
 use proptest::prelude::*;
 use witness::access_compiler::{
-    AccessInvariant, Answer, Authorization, CheckedInvariants, ClosureMode, DecoderIr, DecoderNode,
-    DeltaCoding, Evidence, FactScope, InputColumn, MappingInvariant, NullPlacement, PlanOp,
-    Predicate, Property, Query, Recipe, ValueInvariant, compile, derive_invariants, encode,
+    AccessInvariant, Answer, Assumption, Authorization, CheckedInvariants, ClosureMode, DecoderIr,
+    DecoderNode, DeltaCoding, Evidence, FactScope, InputColumn, MappingInvariant, NullPlacement,
+    PlanOp, Predicate, Property, Query, Recipe, ValueInvariant, compile, derive_invariants, encode,
     execute_interpreted,
 };
 
@@ -45,6 +45,67 @@ fn unsigned_delta_is_a_structural_monotonicity_proof() {
             ..
         }
     ));
+}
+
+/// A fact passed up through a parent keeps the child's evidence and
+/// assumptions, and adds the assumption of the parent's own order-preserving
+/// map; a nullable parent carries its child's mappings to its non-null rows.
+#[test]
+fn transferred_facts_keep_the_child_evidence_and_assumptions() {
+    let recipe = Recipe::Nullable {
+        rank_interval: 64,
+        values: Box::new(Recipe::Dictionary(Box::new(unsigned_delta()))),
+    };
+    let values = (0..600_i64)
+        .map(|row| (row % 5 != 0).then_some(row / 4 * 3))
+        .collect::<Vec<_>>();
+    let column = encode(&recipe, InputColumn::nullable(values)).unwrap();
+    let facts = derive_invariants(
+        &column.decoder,
+        column.page.layout(),
+        CheckedInvariants::default(),
+    )
+    .unwrap();
+    let root = column.decoder.root();
+    let DecoderNode::Nullable {
+        values: dictionary, ..
+    } = *column.decoder.node(root).unwrap()
+    else {
+        panic!("expected a nullable root");
+    };
+    let fact = |node, scope, property| {
+        facts
+            .iter()
+            .find(|fact| fact.node == node && fact.scope == scope && fact.property == property)
+            .unwrap_or_else(|| panic!("no {property:?} in {scope:?} at {node:?}"))
+            .clone()
+    };
+    let order = Property::Value(ValueInvariant::NonDecreasing);
+    let ids = fact(dictionary, FactScope::AllRows, order);
+    assert_eq!(
+        ids.evidence,
+        Evidence::Structural("unsigned_delta_segments")
+    );
+    assert_eq!(
+        ids.assumptions.iter().copied().collect::<Vec<_>>(),
+        [
+            Assumption::CheckedArithmetic,
+            Assumption::SortedUniqueDictionary
+        ]
+    );
+    let rows = fact(root, FactScope::NonNullRows, order);
+    assert_eq!(
+        (rows.evidence, rows.assumptions),
+        (ids.evidence, ids.assumptions)
+    );
+    let mapping = Property::Mapping(MappingInvariant::OrderPreserving);
+    let own = fact(dictionary, FactScope::Mapping, mapping);
+    let carried = fact(root, FactScope::NonNullRows, mapping);
+    assert_eq!(
+        (carried.evidence, carried.assumptions),
+        (own.evidence, own.assumptions)
+    );
+    assert!(!facts.contains(root, FactScope::Mapping, mapping));
 }
 
 #[test]

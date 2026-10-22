@@ -12,8 +12,7 @@ use std::io::Write;
 
 use witness::access_compiler::paged::{self, Licence, Page, PageAction, Planning};
 use witness::access_compiler::{
-    Authorization, ClosureMode, DecoderNode, FactScope, NullPlacement, ReadSession, Span,
-    push_range, vector,
+    Authorization, ClosureMode, FactScope, NullPlacement, ReadSession, Span, push_range, vector,
 };
 use witness::experiment::types::Column;
 
@@ -276,14 +275,7 @@ fn shifted_results(
             page.rows(),
         ),
         PageAction::Translate(_) => {
-            let &DecoderNode::Dictionary {
-                dictionary,
-                entries,
-                ..
-            } = decoder.node(decoder.root())?
-            else {
-                return Err("a translated page has no dictionary at its root".into());
-            };
+            let (dictionary, entries) = vector::sorted_table(decoder)?;
             (
                 vector::dictionary_codes(&mut session, dictionary, entries, low, high)?,
                 entries,

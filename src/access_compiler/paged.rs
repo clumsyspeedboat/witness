@@ -45,6 +45,11 @@ impl Page {
     fn root(&self) -> super::NodeId {
         self.column.decoder.root()
     }
+
+    /// Whether the page's facts let a value range become a code range.
+    pub fn translates(&self) -> bool {
+        self.plan.translate.is_some()
+    }
 }
 
 /// The facts a planner consults at a page's root, gathered from the page's
@@ -58,9 +63,13 @@ struct RootFacts {
     /// Null placement of a non-decreasing root, unless nulls may be anywhere.
     monotone_nulls: Option<NullPlacement>,
     piecewise_rows: Option<usize>,
-    /// The root is an order-preserving sorted dictionary, so a value range
-    /// becomes a code range.
-    translate: bool,
+    /// The scope in which the root proves the order-preserving mapping of a
+    /// sorted dictionary holding its values, so a value range becomes a code
+    /// range: every row at a dictionary root, the non-null rows at a
+    /// nullable root that carries its dictionary's mapping. The licence is
+    /// the derived fact; only the table it is translated with is found by
+    /// the tree's shape, as for a dictionary skip.
+    translate: Option<FactScope>,
     /// A sorted dictionary holding the page's non-null values, with a gap
     /// between entries that a predicate could fall into.
     dictionary: Option<RootDictionary>,
@@ -116,8 +125,11 @@ impl RootFacts {
                 .root_monotone_nulls(root)
                 .filter(|nulls| *nulls != NullPlacement::Arbitrary),
             piecewise_rows: facts.root_piecewise_monotone_rows(root),
-            translate: sorted_dictionary(decoder).is_some_and(|dictionary| dictionary.node == root)
-                && facts.contains(root, FactScope::Mapping, order),
+            translate: sorted_dictionary(decoder).and_then(|_| {
+                [FactScope::Mapping, FactScope::NonNullRows]
+                    .into_iter()
+                    .find(|&scope| facts.contains(root, scope, order))
+            }),
             dictionary,
             listed: root_dictionary(decoder, false),
         })
@@ -920,8 +932,15 @@ fn choose_between(
             max_rows,
         });
     }
-    if facts.translate {
-        return Ok(PageAction::Translate(dictionary_licence(root, None)));
+    if let Some(scope) = facts.translate {
+        return Ok(PageAction::Translate(Licence {
+            fact: Authorization::Fact {
+                node: root,
+                scope,
+                property: Property::Mapping(MappingInvariant::OrderPreserving),
+            },
+            evidence: None,
+        }));
     }
     Ok(PageAction::Scan)
 }
@@ -1068,18 +1087,18 @@ pub fn check_between(
             }
             _ => Err("piecewise search cites no matching piecewise order".into()),
         },
+        // The page's root proves the order-preserving mapping of the sorted
+        // dictionary holding its values: on every row at a dictionary root,
+        // on the non-null rows at a nullable root, where a null row matches
+        // no range and the ids compared are those of the rows with values.
         PageAction::Translate(licence) => match licence.fact {
             Authorization::Fact {
                 node,
-                scope: FactScope::Mapping,
-                property: Property::Mapping(MappingInvariant::OrderPreserving),
+                scope: scope @ (FactScope::Mapping | FactScope::NonNullRows),
+                property: property @ Property::Mapping(MappingInvariant::OrderPreserving),
             } if node == page.root()
-                && sorted_dictionary_root(page)
-                && page.facts.contains(
-                    node,
-                    FactScope::Mapping,
-                    Property::Mapping(MappingInvariant::OrderPreserving),
-                ) =>
+                && sorted_dictionary(&page.column.decoder).is_some()
+                && page.facts.contains(node, scope, property) =>
             {
                 Ok(())
             }
@@ -1134,11 +1153,12 @@ pub fn check_search(
 }
 
 /// Confirms the code range `[first, end)` a translation found for `low <=
-/// value <= high` on a page whose root is a sorted dictionary: the entry
-/// before `first` lies below the range, the entry at `end` above it, and the
-/// first and last entries of the range inside it. The table is sorted, so
-/// these at most four reads show that the range holds exactly the entries in
-/// the predicate.
+/// value <= high` on a page whose values a sorted dictionary holds, at its
+/// root or under a nullable root: the entry before `first` lies below the
+/// range, the entry at `end` above it, and the first and last entries of the
+/// range inside it. The table is sorted, so these at most four reads show
+/// that the range holds exactly the entries in the predicate; a null row
+/// holds no id and matches no range.
 pub fn check_translation(
     page: &Page,
     session: &mut ReadSession<'_>,
@@ -1147,8 +1167,7 @@ pub fn check_translation(
     (first, end): (usize, usize),
 ) -> Result<(), String> {
     let dictionary = sorted_dictionary(&page.column.decoder)
-        .filter(|dictionary| dictionary.node == page.root())
-        .ok_or("translation result cites no sorted dictionary at the page's root")?;
+        .ok_or("translation result cites no sorted dictionary of the page")?;
     if first > end || end > dictionary.entries {
         return Err("translation found a code range outside its table".into());
     }
@@ -1174,8 +1193,7 @@ fn translate(
     high: i64,
 ) -> Result<(usize, usize), String> {
     let dictionary = sorted_dictionary(&page.column.decoder)
-        .filter(|dictionary| dictionary.node == page.root())
-        .ok_or("translation needs a sorted dictionary at the page's root")?;
+        .ok_or("translation needs a sorted dictionary holding the page's values")?;
     let codes = vector::dictionary_codes(session, dictionary.table, dictionary.entries, low, high)?;
     check_translation(page, session, low, high, codes)?;
     Ok(codes)
@@ -2331,16 +2349,6 @@ pub fn derived_bounds_in(
         }));
     }
     Ok(tightest)
-}
-
-fn sorted_dictionary_root(page: &Page) -> bool {
-    matches!(
-        page.column.decoder.node(page.root()),
-        Ok(DecoderNode::Dictionary {
-            sorted_unique: true,
-            ..
-        })
-    )
 }
 
 fn cite(

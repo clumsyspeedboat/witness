@@ -88,7 +88,7 @@ impl Random {
 /// shapes stay ordered across appends.
 fn chunk(random: &mut Random, rows: usize, shape: u8, base: &mut i64) -> Vec<Option<i64>> {
     (0..rows)
-        .map(|row| match shape % 8 {
+        .map(|row| match shape % 9 {
             0 => {
                 *base += (random.next() % 3) as i64;
                 Some(*base)
@@ -99,7 +99,10 @@ fn chunk(random: &mut Random, rows: usize, shape: u8, base: &mut i64) -> Vec<Opt
             4 => Some(random.next() as i64 - (1 << 30)),
             5 => (!random.next().is_multiple_of(3)).then(|| (random.next() % 4_000) as i64),
             6 => None,
-            _ => Some((row % 50) as i64 + (row / 50) as i64),
+            7 => Some((row % 50) as i64 + (row / 50) as i64),
+            // Few distinct values among nulls: a sorted dictionary under
+            // a nullable root, which a range is translated on.
+            _ => (!random.next().is_multiple_of(4)).then(|| (random.next() % 23) as i64 * 11),
         })
         .collect()
 }
@@ -124,7 +127,7 @@ fn table(
     for (step, &rows) in appends.iter().enumerate() {
         for slot in 0..3 {
             // An all-null shape only for some appends, so most pages hold values.
-            let shape = if shapes[slot] % 8 == 6 && step % 2 == 0 {
+            let shape = if shapes[slot] % 9 == 6 && step % 2 == 0 {
                 5
             } else {
                 shapes[slot]
@@ -179,7 +182,8 @@ proptest! {
         seed in any::<u64>(),
         page_rows in prop_oneof![Just(64_usize), Just(100), 1_usize..1_500],
         appends in prop::collection::vec(1_usize..2_000, 1..5),
-        shapes in [0_u8..8, 0_u8..8, 0_u8..8],
+        shapes in (prop_oneof![Just(8_u8), 0_u8..9], 0_u8..9, 0_u8..9)
+            .prop_map(|(selector, value, other)| [selector, value, other]),
         menu_choice in 0_u8..3,
         per_mille in prop_oneof![Just(0_u64), Just(10), Just(300), 0_u64..1_000],
         low_share in 0.0_f64..1.0,

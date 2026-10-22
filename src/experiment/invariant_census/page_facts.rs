@@ -11,9 +11,7 @@ use std::error::Error;
 use std::fs;
 
 use crate::access_compiler::paged::{PagePolicy, PagedColumn, derived_bounds};
-use crate::access_compiler::{
-    DecoderNode, FactScope, MappingInvariant, NullPlacement, Property, Recipe,
-};
+use crate::access_compiler::{NullPlacement, Recipe};
 use crate::experiment::types::Column;
 
 /// Page sizes the census reports per-page facts for.
@@ -78,17 +76,7 @@ pub fn page_facts(id: usize, column: &Column) -> Result<Vec<PageFactRow>, String
                 .root_monotone_nulls(root)
                 .is_some_and(|placement| placement != NullPlacement::Arbitrary);
             let piecewise = page.facts.root_piecewise_monotone_rows(root).is_some();
-            let translate = matches!(
-                page.column.decoder.node(root)?,
-                DecoderNode::Dictionary {
-                    sorted_unique: true,
-                    ..
-                }
-            ) && page.facts.contains(
-                root,
-                FactScope::Mapping,
-                Property::Mapping(MappingInvariant::OrderPreserving),
-            );
+            let translate = page.translates();
             let bound = derived_bounds(page)?;
             let width_ratio = match (bound, page.stats) {
                 (Some((bound_low, bound_high)), Some((low, high))) if low < high => {

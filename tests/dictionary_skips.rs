@@ -143,11 +143,109 @@ fn a_nullable_page_skips_on_the_dictionary_under_its_nulls() {
         "cites the dictionary, not the nulls"
     );
     assert_eq!(evidence, Some((4, 4)));
-    // With an entry in range, the nullable page is scanned as before.
-    assert_eq!(
+    // With an entry in range, the nullable page compares codes instead.
+    assert!(matches!(
         paged::plan_between(page, &mut session, 41, 50, Planning::Facts).unwrap(),
-        PageAction::Scan
-    );
+        PageAction::Translate(_)
+    ));
+}
+
+#[test]
+fn a_nullable_dictionary_page_translates_on_its_non_null_rows() {
+    for ids in [bitpack(), runs_of(bitpack())] {
+        let values = (0..1_000_i64)
+            .map(|row| (row % 7 != 0).then_some((row / 3 % 10 + 1) * 10))
+            .collect::<Vec<_>>();
+        let column =
+            PagedColumn::from_values(&values, 1_000, &only(Recipe::Dictionary(ids))).unwrap();
+        let page = &column.pages()[0];
+        let root = page.column.decoder.root();
+        assert!(page.translates());
+        let mut session = session(page);
+        let action = paged::plan_between(page, &mut session, 25, 55, Planning::Facts).unwrap();
+        // It cites the mapping the nullable root carries from its dictionary
+        // to the rows that hold values.
+        let order = Authorization::Fact {
+            node: root,
+            scope: FactScope::NonNullRows,
+            property: Property::Mapping(MappingInvariant::OrderPreserving),
+        };
+        assert_eq!(
+            action,
+            PageAction::Translate(Licence {
+                fact: order,
+                evidence: None,
+            })
+        );
+        // The same mapping claimed for every row, or cited at the dictionary
+        // under the nulls, is not what the root proves.
+        for fact in [
+            Authorization::Fact {
+                node: root,
+                scope: FactScope::Mapping,
+                property: Property::Mapping(MappingInvariant::OrderPreserving),
+            },
+            Authorization::Fact {
+                node: NodeId(root.0 - 1),
+                scope: FactScope::NonNullRows,
+                property: Property::Mapping(MappingInvariant::OrderPreserving),
+            },
+        ] {
+            let wrong = PageAction::Translate(Licence {
+                fact,
+                evidence: None,
+            });
+            assert!(
+                paged::check_between(page, &mut session, &wrong, 25, 55).is_err(),
+                "{wrong:?}"
+            );
+        }
+        // A page of offsets under nulls carries an order-preserving map too,
+        // but holds no table to translate with.
+        let offsets =
+            PagedColumn::from_values(&values, 1_000, &only(Recipe::For(bitpack()))).unwrap();
+        let other = &offsets.pages()[0];
+        assert!(!other.translates());
+        let foreign = PageAction::Translate(Licence {
+            fact: Authorization::Fact {
+                node: other.column.decoder.root(),
+                scope: FactScope::NonNullRows,
+                property: Property::Mapping(MappingInvariant::OrderPreserving),
+            },
+            evidence: None,
+        });
+        assert!(paged::check_between(other, &mut self::session(other), &foreign, 25, 55).is_err());
+        // Every path answers as the rows do, null rows never matching.
+        for (low, high) in [(25, 55), (10, 10), (0, 1_000), (100, 200), (-5, 5)] {
+            let action =
+                paged::plan_between(page, &mut session, low, high, Planning::Facts).unwrap();
+            let spans = truth_ranges(&values, low, high);
+            assert_eq!(
+                paged::execute_between(page, &mut session, &action, low, high).unwrap(),
+                spans,
+                "{low}..={high}"
+            );
+            assert_eq!(
+                paged::execute_between_unchecked(page, &mut session, &action, low, high).unwrap(),
+                spans
+            );
+            assert_eq!(
+                paged::execute_between_selection(page, &mut session, &action, low, high)
+                    .unwrap()
+                    .ranges(),
+                spans
+            );
+            for threads in [1, 4] {
+                let (sum, rows, _) =
+                    paged::sum_where(&column, &column, low, high, Planning::Facts, threads)
+                        .unwrap();
+                assert_eq!((sum, rows), truth(&values, &values, low, high));
+            }
+        }
+        let (_, _, counts) =
+            paged::sum_where(&column, &column, 25, 55, Planning::Facts, 1).unwrap();
+        assert_eq!((counts.translated, counts.scanned), (1, 0));
+    }
 }
 
 #[test]

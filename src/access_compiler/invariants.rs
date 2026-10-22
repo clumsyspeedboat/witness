@@ -180,10 +180,6 @@ impl InvariantSet {
             assumptions: assumptions.into_iter().collect(),
         });
     }
-
-    fn has_value(&self, node: NodeId, scope: FactScope, property: ValueInvariant) -> bool {
-        self.contains(node, scope, Property::Value(property))
-    }
 }
 
 pub fn derive_invariants(
@@ -310,7 +306,13 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
                 Evidence::Structural("for_checked_affine_shift"),
                 [Assumption::CheckedArithmetic],
             );
-            transfer_monotone(*values, node_id, FactScope::AllRows, output);
+            transfer_monotone(
+                *values,
+                node_id,
+                FactScope::AllRows,
+                [Assumption::CheckedArithmetic],
+                output,
+            );
         }
         DecoderNode::Delta {
             deltas,
@@ -376,7 +378,13 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
                     Evidence::Structural("sorted_unique_dictionary"),
                     [Assumption::SortedUniqueDictionary],
                 );
-                transfer_monotone(*ids, node_id, FactScope::AllRows, output);
+                transfer_monotone(
+                    *ids,
+                    node_id,
+                    FactScope::AllRows,
+                    [Assumption::SortedUniqueDictionary],
+                    output,
+                );
             }
         }
         DecoderNode::Rle {
@@ -384,7 +392,7 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
             index_interval,
             ..
         } => {
-            transfer_monotone(*values, node_id, FactScope::AllRows, output);
+            transfer_monotone(*values, node_id, FactScope::AllRows, [], output);
             transfer_bounds(*values, node_id, FactScope::AllRows, output);
             output.insert(
                 node_id,
@@ -411,8 +419,9 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
             nonnull_len,
             ..
         } => {
-            transfer_monotone(*values, node_id, FactScope::NonNullRows, output);
+            transfer_monotone(*values, node_id, FactScope::NonNullRows, [], output);
             transfer_bounds(*values, node_id, FactScope::NonNullRows, output);
+            transfer_mappings(*values, node_id, output);
             if *nonnull_len == 0 {
                 output.insert(
                     node_id,
@@ -435,25 +444,64 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
     }
 }
 
+/// A parent whose values are an order-preserving image of its child's (an
+/// affine shift, a sorted dictionary) or the child's values selected or
+/// repeated (run-length expansion, null placement) is non-decreasing where
+/// its child is. The fact keeps the child's evidence and assumptions, and
+/// adds `mapping`, the assumptions of the parent's own order-preserving map.
 fn transfer_monotone(
     child: NodeId,
     parent: NodeId,
     parent_scope: FactScope,
+    mapping: impl IntoIterator<Item = Assumption>,
     output: &mut InvariantSet,
 ) {
-    if output.has_value(child, FactScope::AllRows, ValueInvariant::NonDecreasing) {
+    let Some(fact) = output
+        .iter()
+        .find(|fact| {
+            fact.node == child
+                && fact.scope == FactScope::AllRows
+                && fact.property == Property::Value(ValueInvariant::NonDecreasing)
+        })
+        .cloned()
+    else {
+        return;
+    };
+    output.insert(
+        parent,
+        parent_scope,
+        Property::Value(ValueInvariant::NonDecreasing),
+        fact.evidence,
+        fact.assumptions.into_iter().chain(mapping),
+    );
+}
+
+/// A nullable parent stores its child's values unchanged at the rows that
+/// hold one, so every mapping its child proves from codes to values holds on
+/// those rows, with the child's evidence and assumptions. Under a sorted
+/// dictionary, a value range then becomes a code range on the non-null rows,
+/// and a null row lies in no range.
+fn transfer_mappings(child: NodeId, parent: NodeId, output: &mut InvariantSet) {
+    let mappings = output
+        .iter()
+        .filter(|fact| fact.node == child && fact.scope == FactScope::Mapping)
+        .filter(|fact| matches!(fact.property, Property::Mapping(_)))
+        .cloned()
+        .collect::<Vec<_>>();
+    for fact in mappings {
         output.insert(
             parent,
-            parent_scope,
-            Property::Value(ValueInvariant::NonDecreasing),
-            Evidence::Structural("order_preserving_composition"),
-            [Assumption::CheckedArithmetic],
+            FactScope::NonNullRows,
+            fact.property,
+            fact.evidence,
+            fact.assumptions,
         );
     }
 }
 
 /// A parent that only selects or repeats child values (run-length expansion,
-/// null placement) keeps every child bound, with the child's assumptions.
+/// null placement) keeps every child bound, with the child's evidence and
+/// assumptions.
 fn transfer_bounds(
     child: NodeId,
     parent: NodeId,
@@ -465,17 +513,17 @@ fn transfer_bounds(
         .filter(|fact| fact.node == child && fact.scope == FactScope::AllRows)
         .filter_map(|fact| match fact.property {
             Property::Value(ValueInvariant::Bounded(source)) => {
-                Some((source, fact.assumptions.clone()))
+                Some((source, fact.evidence, fact.assumptions.clone()))
             }
             _ => None,
         })
         .collect::<Vec<_>>();
-    for (source, assumptions) in bounds {
+    for (source, evidence, assumptions) in bounds {
         output.insert(
             parent,
             parent_scope,
             Property::Value(ValueInvariant::Bounded(source)),
-            Evidence::Structural("bounded_composition"),
+            evidence,
             assumptions,
         );
     }

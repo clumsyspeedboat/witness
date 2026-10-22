@@ -7,8 +7,7 @@
 use proptest::prelude::*;
 use witness::access_compiler::paged::{self, Page, PageAction, PagePolicy, PagedColumn, Planning};
 use witness::access_compiler::{
-    CheckedInvariants, ClosureMode, DecoderNode, NullPlacement, ReadSession, Recipe, Span,
-    push_range, vector,
+    CheckedInvariants, ClosureMode, NullPlacement, ReadSession, Recipe, Span, push_range, vector,
 };
 
 fn bitpack() -> Box<Recipe> {
@@ -98,14 +97,7 @@ fn translation_shifts_are_rejected(
     let mut session = session(page);
     let decoder = &page.column.decoder;
     let all = Span::new(0, page.rows()).unwrap();
-    let DecoderNode::Dictionary {
-        dictionary,
-        entries,
-        ..
-    } = *decoder.node(decoder.root()).unwrap()
-    else {
-        panic!("expected a dictionary root");
-    };
+    let (dictionary, entries) = vector::sorted_table(decoder).unwrap();
     let found = vector::dictionary_codes(&mut session, dictionary, entries, low, high).unwrap();
     let truth = truth_ranges(values, low, high);
     assert_eq!(
@@ -229,13 +221,12 @@ fn every_translated_code_moved_by_one_is_rejected() {
         let column =
             PagedColumn::from_values(&values, 1_000, &only(Recipe::Dictionary(bitpack()))).unwrap();
         let page = &column.pages()[0];
-        if nulls {
-            // A nullable page is scanned, never translated: its root is not
-            // the dictionary.
-            let mut session = session(page);
-            assert!(paged::check_translation(page, &mut session, 0, 10, (0, 2)).is_err());
-            continue;
-        }
+        // A nullable page is translated through the dictionary under its
+        // nulls, and its result is checked on the same table.
+        assert!(matches!(
+            paged::plan_between(page, &mut session(page), 5, 15, Planning::Facts).unwrap(),
+            PageAction::Translate(_)
+        ));
         let mut harmful = 0;
         for (low, high) in [
             (-5, 5),
