@@ -32,3 +32,6 @@
 *.py[cod]
 *.swp
 .DS_Store
+
+# Local assistant worktrees and state.
+/.claude/
