@@ -1126,6 +1126,9 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
     let mut decisions = [0_usize; 6];
     // Skips and accepts of derived bounds alone, without the shortcuts.
     let mut bound_decisions = [0_usize; 2];
+    // Queries, skips and dictionary skips of the zone map with a dictionary
+    // filter.
+    let mut filter_decisions = [0_usize; 3];
     for row in &queries {
         let cell = (
             queries.field(row, "pair")?,
@@ -1154,6 +1157,12 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         if arm == "witness_direct_factbounds" {
             for (slot, name) in ["skipped", "accepted"].into_iter().enumerate() {
                 bound_decisions[slot] += queries.field(row, name)?.parse::<usize>()?;
+            }
+        }
+        if arm == "witness_direct_zonemapdict" {
+            filter_decisions[0] += 1;
+            for (slot, name) in ["skipped", "code_skipped"].into_iter().enumerate() {
+                filter_decisions[slot + 1] += queries.field(row, name)?.parse::<usize>()?;
             }
         }
     }
@@ -1270,6 +1279,22 @@ fn paged_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         out,
         "WitPagedCodeSkipShare",
         &percent(code_skipped, skipped),
+    );
+    // A zone map with a dictionary filter skips pages whose dictionary
+    // holds no value in the range by testing every entry.
+    let [filter_queries, filter_skipped, filter_code_skipped] = filter_decisions;
+    if filter_queries == 0 {
+        return Err("paged study lacks witness_direct_zonemapdict".into());
+    }
+    define(
+        out,
+        "WitPagedZonemapDictSkips",
+        &group_digits(&filter_skipped.to_string()),
+    );
+    define(
+        out,
+        "WitPagedZonemapDictCodeSkips",
+        &group_digits(&filter_code_skipped.to_string()),
     );
     if skipped < exact_skipped {
         return Err("facts skip fewer pages than an exact zone map".into());
@@ -1682,6 +1707,20 @@ fn arm_ratios(
         .collect()
 }
 
+/// `arm_ratios` over every cell, failing when no cell measured both arms, as
+/// when a study's results predate one of them.
+fn measured_ratios(
+    latency: &Latency,
+    numerator: &str,
+    denominator: &str,
+) -> Result<Vec<f64>, Box<dyn Error>> {
+    let ratios = arm_ratios(latency, numerator, denominator, None);
+    if ratios.is_empty() {
+        return Err(format!("no query measured both {numerator} and {denominator}").into());
+    }
+    Ok(ratios)
+}
+
 fn geometric_mean(values: &[f64]) -> f64 {
     (values.iter().map(|value| value.ln()).sum::<f64>() / values.len() as f64).exp()
 }
@@ -1735,6 +1774,50 @@ fn separation_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
             &format!("{:.2}", median(&selected)),
         );
     }
+    // Against a zone map with a dictionary filter, which skips without
+    // reading ids every page whose dictionary holds no value in the range,
+    // as facts do; a 95% interval resamples pairs.
+    let facts_over_filter = measured_ratios(
+        &latency,
+        "witness_direct_facts",
+        "witness_direct_zonemapdict",
+    )?;
+    define(
+        out,
+        "WitPagedFactsOverZonemapDictGeo",
+        &format!("{:.2}", geometric_mean(&facts_over_filter)),
+    );
+    define(
+        out,
+        "WitPagedFactsOverZonemapDictMedian",
+        &format!("{:.2}", median(&facts_over_filter)),
+    );
+    let clusters = pair_ratios(
+        &latency,
+        "witness_direct_facts",
+        "witness_direct_zonemapdict",
+    );
+    let (low, high) = pair_bootstrap(&clusters, geometric_mean, 2_000);
+    define(
+        out,
+        "WitPagedFactsOverZonemapDictGeoCiLow",
+        &format!("{low:.2}"),
+    );
+    define(
+        out,
+        "WitPagedFactsOverZonemapDictGeoCiHigh",
+        &format!("{high:.2}"),
+    );
+    let filter_over_zonemap = measured_ratios(
+        &latency,
+        "witness_direct_zonemapdict",
+        "witness_direct_zonemap",
+    )?;
+    define(
+        out,
+        "WitPagedZonemapDictOverZonemapGeo",
+        &format!("{:.2}", geometric_mean(&filter_over_zonemap)),
+    );
     let zonemap_over_scan = arm_ratios(
         &latency,
         "witness_direct_zonemap",
@@ -2739,12 +2822,54 @@ fn type_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         let count = zonemap.iter().filter(|ratio| keep(**ratio)).count();
         define(out, name, &group_digits(&count.to_string()));
     }
-    // Dictionary entries each planner reads over all string queries.
+    // The zone map with the encoding's shortcuts (its order-preserving
+    // translation and the skips between entries) and with a dictionary
+    // filter, which attribute what facts gain on strings.
+    for (name, numerator, denominator) in [
+        (
+            "WitStringFactsOverZonemapPlusGeo",
+            "witness_direct_facts",
+            "witness_direct_zonemapplus",
+        ),
+        (
+            "WitStringFactsOverZonemapDictGeo",
+            "witness_direct_facts",
+            "witness_direct_zonemapdict",
+        ),
+        (
+            "WitStringZonemapPlusOverZonemapGeo",
+            "witness_direct_zonemapplus",
+            "witness_direct_zonemap",
+        ),
+        (
+            "WitStringZonemapDictOverZonemapGeo",
+            "witness_direct_zonemapdict",
+            "witness_direct_zonemap",
+        ),
+    ] {
+        let ratios = measured_ratios(&strings, numerator, denominator)?;
+        define(out, name, &format!("{:.2}", geometric_mean(&ratios)));
+    }
+    // Dictionary entries each planner reads, and the pages it skips, over
+    // all string queries.
     let queries = read_csv(&format!("{STRING}/queries.csv"))?;
     let mut probes = BTreeMap::<String, f64>::new();
+    let mut skipped = BTreeMap::<String, usize>::new();
     for row in &queries {
-        *probes.entry(queries.field(row, "arm")?).or_default() +=
-            queries.field(row, "probes")?.parse::<f64>()?;
+        let arm = queries.field(row, "arm")?;
+        *probes.entry(arm.clone()).or_default() += queries.field(row, "probes")?.parse::<f64>()?;
+        *skipped.entry(arm).or_default() += queries.field(row, "skipped")?.parse::<usize>()?;
+    }
+    for (name, arm) in [
+        ("WitStringFactsSkips", "witness_direct_facts"),
+        ("WitStringZonemapSkips", "witness_direct_zonemap"),
+        ("WitStringZonemapPlusSkips", "witness_direct_zonemapplus"),
+        ("WitStringZonemapDictSkips", "witness_direct_zonemapdict"),
+    ] {
+        let pages = skipped
+            .get(arm)
+            .ok_or_else(|| format!("string study lacks {arm}"))?;
+        define(out, name, &group_digits(&pages.to_string()));
     }
     let get = |arm: &str| probes.get(arm).copied().ok_or("string study lacks an arm");
     define(
