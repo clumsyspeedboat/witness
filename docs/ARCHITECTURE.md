@@ -143,6 +143,16 @@ mapping rests on. A nullable parent stores its child's values unchanged at
 the rows that hold one, so it carries its child's mappings to those rows,
 in scope `NonNullRows`.
 
+Who confirms a fact against the bytes differs by class, and the paged
+planners rely on three:
+
+| Fact | Confirmed by | When |
+|---|---|---|
+| frame-of-reference bound, constant run, all-null | the encoding itself | always: no violation is writable |
+| sorted dictionary order (its ends, gaps, code translation) | the writer, then the reader | at sealing, and again the first time a planner relies on it on a page |
+| ids inside their table | the writer | at sealing, by one decode of the page |
+| order and null-placement flags, column certificate | the writer | at sealing; the reader takes them on the writer's word |
+
 Unsigned delta is the key precision example. One restart segment structurally
 proves global monotonicity. Multiple independent restart anchors prove only
 piecewise monotonicity unless the descriptor separately certifies ordered
@@ -205,9 +215,9 @@ low end; if that entry lies above the high end, no entry lies in the
 predicate, even though the page's bounds straddle it. The skip cites the
 dictionary's order-preserving mapping and records the empty code range;
 `check_between` reads the entries on either side of it, which in a sorted
-table show that none lies in the predicate. It is sound because
-`verify_dictionaries` checked every id against its table when the page was
-sealed. Like a search or a translation, it is a shortcut of the encoding:
+table show that none lies in the predicate. It is sound because the reader
+has verified the table's order, as below, and `verify_dictionaries` checked
+every id against its table when the page was sealed. Like a search or a translation, it is a shortcut of the encoding:
 `Planning::FactBounds` scans such a page, and
 `Planning::StoredStatisticsPlus` skips it.
 
@@ -272,6 +282,23 @@ When `PagedColumn::append` seals a page, `verify_dictionaries` reads every
 dictionary the codec tree calls sorted and confirms it is strictly increasing
 (a table that is not loses its order facts), and decodes the page once, which
 rejects any id outside its table.
+
+The reader does not take that order on the writer's word. The first time a
+planner that consults a page's facts (`Facts`, `FactBounds`, and
+`StoredStatisticsPlus` on a page its statistics cannot decide) reaches a
+page whose values pass through a sorted dictionary, it reads the table in
+one request and confirms it is strictly increasing: one pass over its `k`
+entries, whatever the page's rows. Every fact the order gives rests on the
+check: the table's ends as a bound, a gap skip, a code translation, and an
+order the ids carry through the table. A page whose table is out of order
+is scanned, which needs no fact and so answers exactly, and is counted in
+`PageCounts::unverified`; a page in order is planned as before. The answer
+is kept with the page, so it is paid once per page for as long as the reader
+holds the column, not per query or per session; replacing a page's bytes
+clears it. `check_between` refuses any action that rests on an order the
+reader found false. Ids inside their table are not re-checked: a full check
+costs a decode of the page, and stays with the writer at sealing. A forged
+order cannot by itself move an id outside its table.
 
 Rows are deleted through a `DeletionVector`: one bit per row of a table whose
 columns are paged alike, kept beside the pages, so no page and no fact

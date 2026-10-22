@@ -8,6 +8,12 @@
 //! the encoding's shortcuts, and a footer of derived bounds, which the
 //! writer derives from its forged facts. Each answer is compared with the
 //! truth: correct, wrong, or stopped by the checker or another error.
+//!
+//! A forged dictionary order is confirmed by the reader that would use it:
+//! a planner that consults a page's facts checks that its sorted dictionary
+//! is strictly increasing, and scans a page whose is not. The pages scanned
+//! so are counted as unverified. The order and null placement a descriptor
+//! attests, and the ends, are still taken from the writer.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -53,6 +59,11 @@ impl Fault {
             Self::Unsigned => "dictionary_unsigned",
             Self::Reversed => "dictionary_reversed",
         }
+    }
+
+    /// Whether the fault forges the order of a page's dictionary.
+    fn forges_dictionary(self) -> bool {
+        matches!(self, Self::Unsorted | Self::Unsigned | Self::Reversed)
     }
 
     /// Forges page `index` of `column`; whether it changed anything.
@@ -159,6 +170,9 @@ struct Tally {
     /// Queries over a column in which a forged attestation differs from the
     /// true one.
     affected: usize,
+    /// Pages, over all queries, scanned because the reader found their
+    /// sorted dictionary out of order.
+    unverified: usize,
 }
 
 pub fn run(
@@ -185,28 +199,40 @@ pub fn run(
             entry.wrong += part.wrong;
             entry.stopped += part.stopped;
             entry.affected += part.affected;
+            entry.unverified += part.unverified;
         }
     }
     let mut output = csv(format!("{result_dir}/attested_faults.csv"))?;
     writeln!(
         output,
-        "fault,planner,queries,affected,correct,wrong,stopped"
+        "fault,planner,queries,affected,correct,wrong,stopped,unverified"
     )?;
     for ((fault, planner), tally) in &total {
         writeln!(
             output,
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             fault.name(),
             planner,
             tally.queries,
             tally.affected,
             tally.correct,
             tally.wrong,
-            tally.stopped
+            tally.stopped,
+            tally.unverified
         )?;
         if *planner == Planning::StoredStatistics.label() && (tally.wrong > 0 || tally.stopped > 0)
         {
             return Err("a forged attestation changed an answer planned from a zone map".into());
+        }
+        // The reader verifies a dictionary's order before a planner that
+        // consults facts relies on it, and scans the page when it is false.
+        if fault.forges_dictionary()
+            && [Planning::Facts, Planning::StoredStatisticsPlus]
+                .iter()
+                .any(|planning| planning.label() == *planner)
+            && (tally.wrong > 0 || tally.stopped > 0)
+        {
+            return Err("a forged dictionary order changed an answer planned from facts".into());
         }
     }
     output.flush()?;
@@ -250,8 +276,14 @@ fn fault_pair(
                 entry.queries += 1;
                 entry.affected += usize::from(changed);
                 match paged::sum_where(column, value, predicate.low, predicate.high, planning, 1) {
-                    Ok((sum, rows, _)) if (sum, rows) == expected => entry.correct += 1,
-                    Ok(_) => entry.wrong += 1,
+                    Ok((sum, rows, counts)) => {
+                        entry.unverified += counts.unverified;
+                        if (sum, rows) == expected {
+                            entry.correct += 1;
+                        } else {
+                            entry.wrong += 1;
+                        }
+                    }
                     Err(_) => entry.stopped += 1,
                 }
             }

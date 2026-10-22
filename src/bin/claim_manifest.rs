@@ -3545,6 +3545,12 @@ struct Table {
 }
 
 impl Table {
+    /// Whether the producer wrote column `name`: for a column added after
+    /// the committed results were measured, whose claims wait for a rerun.
+    fn has(&self, name: &str) -> bool {
+        self.header.iter().any(|column| column == name)
+    }
+
     fn field(&self, row: &[String], name: &str) -> Result<String, Box<dyn Error>> {
         let index = self
             .header
@@ -3840,14 +3846,18 @@ fn attested_fault_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> 
         return Ok(());
     }
     let faults = read_csv(&format!("{PAGED}/attested_faults.csv"))?;
-    // queries, affected, correct, wrong, stopped
-    let mut cells = BTreeMap::<(String, String), [usize; 5]>::new();
+    // Results measured before the reader verified dictionary order lack the
+    // pages scanned for an order it found false.
+    let unverified = faults.has("unverified");
+    // queries, affected, correct, wrong, stopped, unverified
+    let mut cells = BTreeMap::<(String, String), [usize; 6]>::new();
     for row in &faults {
         let cell = cells
             .entry((faults.field(row, "fault")?, faults.field(row, "planner")?))
             .or_default();
         for (slot, name) in ["queries", "affected", "correct", "wrong", "stopped"]
             .into_iter()
+            .chain(unverified.then_some("unverified"))
             .enumerate()
         {
             cell[slot] += faults.field(row, name)?.parse::<usize>()?;
@@ -3875,7 +3885,7 @@ fn attested_fault_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> 
             ("zonemapplus", "ZonemapPlus"),
             ("footer", "Footer"),
         ] {
-            let [queries, _, correct, wrong, stopped] = get(fault, planner)?;
+            let [queries, _, correct, wrong, stopped, scanned] = get(fault, planner)?;
             if queries != correct + wrong + stopped {
                 return Err(
                     format!("attested fault {fault} under {planner} does not add up").into(),
@@ -3896,6 +3906,15 @@ fn attested_fault_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> 
                 &format!("WitAttested{suffix}{name}Stopped"),
                 &group_digits(&stopped.to_string()),
             );
+            if unverified {
+                // Pages, over every query, scanned because the reader found
+                // their sorted dictionary out of order.
+                define(
+                    out,
+                    &format!("WitAttested{suffix}{name}Unverified"),
+                    &group_digits(&scanned.to_string()),
+                );
+            }
             if planner != "zonemap" {
                 row.push(group_digits(&wrong.to_string()));
                 row.push(group_digits(&stopped.to_string()));
@@ -4689,7 +4708,8 @@ fn scale_zonemap_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
 ///   null;
 /// - `Dictionary`: a skip or acceptance by the ends of a page's sorted
 ///   dictionary, a skip for a gap in it, or a translation into codes, all
-///   resting on the dictionary verified when the page was sealed;
+///   resting on the dictionary verified when the page was sealed, whose
+///   order the reader verifies again before the first of them;
 /// - `Order`: a search, whole or per block, resting on the order the writer
 ///   attested.
 ///
@@ -4758,6 +4778,30 @@ fn verify_cost_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
         out,
         "WitPagedVerifyOverScanPercentNinety",
         &format!("{:.1}", quantile(&over_scan, 0.9) * 100.0),
+    );
+    // Verifying the order of each page's sorted dictionary as the reader
+    // does the first time a planner relies on it, per page, over the pairs.
+    // Results measured before the reader verified that order lack the column.
+    if !costs.has("reader_verify_ns") {
+        println!("no reader verification in {PAGED}/costs.csv; its claims are not defined");
+        return Ok(());
+    }
+    let reader = costs
+        .iter()
+        .map(|row| {
+            Ok(costs.field(row, "reader_verify_ns")?.parse::<f64>()?
+                / costs.field(row, "pages")?.parse::<f64>()?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    define(
+        out,
+        "WitPagedReaderVerifyNsPerPage",
+        &format!("{:.0}", median(&reader)),
+    );
+    define(
+        out,
+        "WitPagedReaderVerifyNsPerPageNinety",
+        &format!("{:.0}", quantile(&reader, 0.9)),
     );
     Ok(())
 }

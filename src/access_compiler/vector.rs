@@ -2373,6 +2373,23 @@ pub fn any_entry_between(
     }))
 }
 
+/// Whether the `entries` of a table are strictly increasing, as a table
+/// claimed sorted and unique must be: one pass over the table, read in one
+/// request, as `any_entry_between` reads it.
+pub fn entries_increasing(
+    session: &mut ReadSession<'_>,
+    table: FieldId,
+    entries: usize,
+) -> Result<bool, String> {
+    if entries < 2 {
+        return Ok(true);
+    }
+    let end = entries.checked_mul(8).ok_or("dictionary offset overflow")?;
+    let bytes = session.read_range(table, Span::new(0, end)?)?;
+    let entry = |at: usize| i64::from_le_bytes(bytes[8 * at..8 * (at + 1)].try_into().unwrap());
+    Ok((1..entries).all(|at| entry(at - 1) < entry(at)))
+}
+
 /// `search_monotone` within each block of `max_rows` rows: the shape a
 /// piecewise order fact licenses.
 pub fn search_piecewise(

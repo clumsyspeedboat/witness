@@ -35,11 +35,22 @@ pub struct Page {
     pub non_null: usize,
     /// The facts the planner consults, gathered from `facts` at sealing.
     plan: RootFacts,
+    /// Whether the reader found the page's sorted dictionary in order, kept
+    /// from the first time a planner relied on that order; see
+    /// `dictionary_order_verified`.
+    order_verified: OnceLock<bool>,
 }
 
 impl Page {
     pub fn rows(&self) -> usize {
         self.column.truth.len()
+    }
+
+    /// What the reader found when it checked the order of the page's sorted
+    /// dictionary: `None` until a planner first relies on it, and for a page
+    /// without one.
+    pub fn dictionary_order(&self) -> Option<bool> {
+        self.order_verified.get().copied()
     }
 
     fn root(&self) -> super::NodeId {
@@ -76,6 +87,11 @@ struct RootFacts {
     /// A dictionary holding the page's non-null values, sorted or not,
     /// whose entries a dictionary filter tests one by one.
     listed: Option<RootDictionary>,
+    /// The sorted dictionary whose order the facts above rest on: its ends
+    /// as a bound, its gaps, a translation into codes, and an order its ids
+    /// carry through it. The reader confirms that order before a planner
+    /// uses any of them.
+    ordered: Option<RootDictionary>,
 }
 
 /// A dictionary whose entries are a page's non-null values: the page's
@@ -95,8 +111,9 @@ impl RootFacts {
         // A dictionary holding every integer from its first entry to its last
         // has no gap, so no predicate can miss all its entries while
         // overlapping their range; such a page is never searched for one.
-        let mut dictionary = sorted_dictionary(decoder)
+        let ordered = sorted_dictionary(decoder)
             .filter(|dictionary| facts.contains(dictionary.node, FactScope::Mapping, order));
+        let mut dictionary = ordered;
         if let Some(found) = dictionary
             && found.entries > 0
         {
@@ -132,6 +149,7 @@ impl RootFacts {
             }),
             dictionary,
             listed: root_dictionary(decoder, false),
+            ordered,
         })
     }
 }
@@ -384,6 +402,7 @@ impl PagedColumn {
                 stats,
                 non_null,
                 plan,
+                order_verified: OnceLock::new(),
             });
             self.rows += chunk.len();
         }
@@ -876,6 +895,13 @@ fn choose_between(
             None,
         )));
     }
+    // Every fact a sorted dictionary gives rests on its order, which the
+    // reader confirms before using any of them. A page whose table is out
+    // of order is scanned, as though it proved none of them: a scan needs
+    // no fact, so the answer stays exact.
+    if facts.ordered.is_some() && !dictionary_order_verified(page, session)? {
+        return Ok(PageAction::Scan);
+    }
     let (low_bound, high_bound) = (i128::from(low), i128::from(high));
     // The first and last entries of a sorted dictionary, read as its bound.
     let mut ends = None;
@@ -953,6 +979,62 @@ fn choose_between(
     Ok(PageAction::Scan)
 }
 
+/// Whether the order of the page's sorted dictionary holds in its bytes:
+/// its entries are strictly increasing. The facts that rest on that order
+/// (the table's ends as a bound, its gaps, a translation into codes, an
+/// order the ids carry through it) are used only once it holds. The writer
+/// checks the same when it seals the page; checking it again here means the
+/// reader that relies on the order does not take it on the writer's word.
+/// A page without a sorted dictionary passes.
+///
+/// The answer is kept with the page, so the check is paid once per page for
+/// as long as the reader holds the column, not once per query or session;
+/// only the forging functions, which replace a page's bytes, clear it. Two
+/// threads planning the same page at once may both check it, and keep the
+/// same answer.
+fn dictionary_order_verified(page: &Page, session: &mut ReadSession<'_>) -> Result<bool, String> {
+    if let Some(verified) = page.dictionary_order() {
+        return Ok(verified);
+    }
+    let verified = verify_dictionary_order(page, session)?;
+    let _ = page.order_verified.set(verified);
+    Ok(verified)
+}
+
+/// The check `dictionary_order_verified` makes once per page, made again
+/// without consulting or keeping its answer, to measure what a reader pays:
+/// one pass over the `k` entries of the page's sorted dictionary, read in
+/// one request, whatever the page's rows.
+pub fn verify_dictionary_order(page: &Page, session: &mut ReadSession<'_>) -> Result<bool, String> {
+    match page.plan.ordered {
+        Some(dictionary) => {
+            vector::entries_increasing(session, dictionary.table, dictionary.entries)
+        }
+        None => Ok(true),
+    }
+}
+
+/// Whether `action` may rest on the order of the page's sorted dictionary:
+/// any action the page's facts license on a page with one, except a skip
+/// of an all-null page. Scans, and actions stored statistics or a
+/// dictionary filter license, assume no order.
+fn rests_on_dictionary_order(page: &Page, action: &PageAction) -> bool {
+    let licence = match action {
+        PageAction::Scan => return false,
+        PageAction::Skip(licence)
+        | PageAction::Accept(licence)
+        | PageAction::Search { licence, .. }
+        | PageAction::SearchPiecewise { licence, .. }
+        | PageAction::Translate(licence) => licence,
+    };
+    page.plan.ordered.is_some()
+        && matches!(
+            licence.fact,
+            Authorization::Fact { property, .. }
+                if property != Property::Value(ValueInvariant::AllNull)
+        )
+}
+
 /// A licence citing the order-preserving mapping of the dictionary at `node`.
 fn dictionary_licence(node: super::NodeId, evidence: Option<(i128, i128)>) -> Licence {
     Licence {
@@ -969,10 +1051,11 @@ fn dictionary_licence(node: super::NodeId, evidence: Option<(i128, i128)>) -> Li
 /// licence cites the page's own sorted dictionary and the order-preserving
 /// mapping the page proves for it, and records an empty code range at a
 /// position where the entry before lies below `low` and the entry at it
-/// above `high`. The table is sorted, so two reads show that no entry lies
-/// in the range; and every dictionary id was checked to lie inside its table
-/// when the page was sealed, so no stored row holds a value the table does
-/// not list.
+/// above `high`. The reader has verified that the table is sorted
+/// (`check_between` confirms it before this check), so two reads show that
+/// no entry lies in the range; and every dictionary id was checked to lie
+/// inside its table when the page was sealed, so no stored row holds a
+/// value the table does not list.
 fn check_dictionary_skip(
     page: &Page,
     session: &mut ReadSession<'_>,
@@ -1024,6 +1107,9 @@ pub fn check_between(
 ) -> Result<(), String> {
     if low > high {
         return Err("BETWEEN needs low <= high".into());
+    }
+    if rests_on_dictionary_order(page, action) && !dictionary_order_verified(page, session)? {
+        return Err("page action rests on a dictionary order the reader found false".into());
     }
     let predicate = (low, high);
     let (low, high) = (i128::from(low), i128::from(high));
@@ -1164,9 +1250,10 @@ pub fn check_search(
 /// value <= high` on a page whose values a sorted dictionary holds, at its
 /// root or under a nullable root: the entry before `first` lies below the
 /// range, the entry at `end` above it, and the first and last entries of the
-/// range inside it. The table is sorted, so these at most four reads show
-/// that the range holds exactly the entries in the predicate; a null row
-/// holds no id and matches no range.
+/// range inside it. The table is sorted, as the reader verified before
+/// planning the translation, so these at most four reads show that the range
+/// holds exactly the entries in the predicate; a null row holds no id and
+/// matches no range.
 pub fn check_translation(
     page: &Page,
     session: &mut ReadSession<'_>,
@@ -1287,7 +1374,7 @@ pub fn plan_sum(
                 continue;
             }
             let (lower, upper) = bound_interval(session, source)?;
-            if lower == upper {
+            if lower == upper && fixes_one_value(source) {
                 let action = SumAction::Constant(cite(
                     page.root(),
                     scope,
@@ -1300,6 +1387,14 @@ pub fn plan_sum(
         }
     }
     Ok(SumAction::Decode)
+}
+
+/// Whether a bound whose ends are equal fixes every value of its page. A
+/// sorted dictionary's ends are equal only when it holds one entry; equal
+/// ends of a longer table show it out of order, and fix nothing, so no
+/// order need be verified to refuse them.
+fn fixes_one_value(source: super::BoundSource) -> bool {
+    !matches!(source, super::BoundSource::TableEnds { entries, .. } if entries > 1)
 }
 
 pub fn check_sum(
@@ -1324,10 +1419,10 @@ pub fn check_sum(
         SumAction::Constant(licence) => match cited(page, licence)? {
             (FactScope::AllRows, ValueInvariant::Bounded(source)) => {
                 let (lower, upper) = reread(session, source, licence)?;
-                if lower == upper {
+                if lower == upper && fixes_one_value(source) {
                     Ok(())
                 } else {
-                    Err("constant SUM cites a bound with distinct ends".into())
+                    Err("constant SUM cites a bound that does not fix one value".into())
                 }
             }
             _ => Err("constant SUM needs a dense bound".into()),
@@ -1412,6 +1507,9 @@ pub struct PageCounts {
     pub searched: usize,
     pub translated: usize,
     pub scanned: usize,
+    /// Of the scanned pages, those scanned because the reader found their
+    /// sorted dictionary out of order, so no fact resting on it was used.
+    pub unverified: usize,
     pub constant_sums: usize,
     /// Positioned reads issued against a file-backed page store, and the
     /// bytes they transferred; zero for pages held in memory.
@@ -1427,7 +1525,14 @@ impl PageCounts {
         self.io_bytes += metrics.transferred_bytes;
     }
 
-    fn record(&mut self, action: &PageAction) {
+    fn record(&mut self, page: &Page, action: &PageAction, planning: Planning) {
+        // A planner that consults a page's facts checks the order of its
+        // sorted dictionary first, and scans the page if it does not hold.
+        self.unverified += usize::from(
+            *action == PageAction::Scan
+                && (planning.uses_bounds() || planning.uses_shortcuts())
+                && page.dictionary_order() == Some(false),
+        );
         match action {
             PageAction::Skip(licence) => {
                 self.skipped += 1;
@@ -1449,6 +1554,7 @@ impl PageCounts {
         self.searched += other.searched;
         self.translated += other.translated;
         self.scanned += other.scanned;
+        self.unverified += other.unverified;
         self.constant_sums += other.constant_sums;
         self.io_operations += other.io_operations;
         self.io_bytes += other.io_bytes;
@@ -1684,7 +1790,7 @@ fn sum_where_with(
             let mut session = selector_store.session(selector_page, index, Access::Execute)?;
             let action = plan_between(selector_page, &mut session, low, high, planning)?;
             let mut page_counts = PageCounts::default();
-            page_counts.record(&action);
+            page_counts.record(selector_page, &action, planning);
             let (sum, rows, executed) = execute_page(
                 (selector_page, session),
                 (&value.pages[index], value_store),
@@ -1718,7 +1824,7 @@ fn sum_where_with(
     })?;
     for (offset, (action, reads)) in actions.into_iter().enumerate() {
         counts.add(&reads);
-        counts.record(&action);
+        counts.record(&selector.pages[first + offset], &action, planning);
         if !matches!(action, PageAction::Skip(_)) {
             work.push((first + offset, action));
         }
@@ -2030,8 +2136,8 @@ fn aggregate_where_with(
             counts.skipped += 1;
             continue;
         };
-        for (_, action) in &actions {
-            counts.record(action);
+        for (slot, action) in &actions {
+            counts.record(&conjuncts[*slot].column.pages[index], action, planning);
         }
         // A dense accepted page selects every row; it constrains nothing.
         actions.retain(|(slot, action)| {
@@ -2277,7 +2383,7 @@ pub fn between(
         let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
         let action = plan_between(page, &mut session, low, high, planning)?;
         let mut counts = PageCounts::default();
-        counts.record(&action);
+        counts.record(page, &action, planning);
         let ranges = execute_between(page, &mut session, &action, low, high)?;
         Ok((ranges, counts))
     })?;
@@ -2408,8 +2514,9 @@ fn reread(
 // descriptor, the sortedness of its dictionaries, and the ends from which
 // the column certificate is built. Each function below makes one of these
 // wrong on a sealed page, as `replace_statistics` does for a zone map, so a
-// study can see which wrong attestations the checker stops. No query path
-// calls them.
+// study can see which wrong attestations the checker stops, and that the
+// reader's check of a dictionary's order catches a forged one. No query
+// path calls them.
 impl PagedColumn {
     /// Seals page `index` again as though its writer had attested `checked`
     /// in the page's descriptor: its facts are derived under those flags, its
@@ -2444,7 +2551,9 @@ impl PagedColumn {
     /// distinct values, and still claims to be sorted and unique: what a
     /// writer that sorted with the wrong comparator leaves. The page is
     /// sealed without verifying its dictionary, under the descriptor its
-    /// values earn, so the forged order reaches the planner. A page without
+    /// values earn, so the forged order reaches the planner, and only the
+    /// reader's own check of the order stands between it and a plan; the
+    /// page's earlier check, if any, is forgotten. A page without
     /// a dictionary becomes a dictionary page. Whether `table` is out of
     /// order, and so the page was forged.
     pub fn forge_dictionary(&mut self, index: usize, table: &[i64]) -> Result<bool, String> {
@@ -2535,6 +2644,7 @@ impl PagedColumn {
         page.facts = facts;
         page.ends = ends;
         page.plan = plan;
+        page.order_verified = OnceLock::new();
         self.recertify();
         Ok(())
     }

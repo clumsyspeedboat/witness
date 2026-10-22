@@ -35,7 +35,7 @@ Use `cargo test --locked --all-features -- --list` for the current test inventor
 | vector execution | `tests/vector.rs`, `tests/vector_validation.rs` | decoded answers, code-lane equivalence, and malformed-selection rejection |
 | paged execution | `tests/paged.rs`, `tests/paged_edge_cases.rs` | row-wise answers, checked licences, append certificates, and serial/parallel equivalence |
 | paged planners | `tests/paged_differential.rs`, `tests/paged_deletes.rs`, `tests/dictionary_skips.rs`, `tests/selective_kernels.rs`, `tests/strings.rs` | every planner, from facts to a zone map with a dictionary filter, against a scan of the rows; dictionary skips the checker re-reads; translations on nullable dictionary pages |
-| result checks | `tests/result_checks.rs` | search and translation boundaries moved by one rejected, on dense and nullable pages; forged attestations against each planner |
+| result checks | `tests/result_checks.rs` | search and translation boundaries moved by one rejected, on dense and nullable pages; forged attestations against each planner; a forged dictionary order, dense or under nulls, answered exactly by every reader, its page scanned and counted, its order verified once per page |
 | chunked frames | `tests/chunked_frames.rs` | exact answers, chunk-level reads, and corruption handling |
 | generated execution | `tests/access_compiler_generated.rs` | interpreter, monomorphized control, and frozen generated Rust |
 | sidecar certificates | `tests/certificate_plans.rs` | brute-force membership with candidate refinement |
@@ -236,7 +236,7 @@ The full pipeline invokes these scripts after verifying input hashes.
 | `run_predicate_pipeline.sh` | at least 30 selector/value pairs, at least 60 logical columns, two kernels per column, exact answer agreement across four known-selection and ten complete-query arms, and all expected physical files |
 | `run_certificate_study.sh` | at least 1,700 cells, five plan classes, four query classes, and no non-scan candidate set larger than the scan domain |
 | `run_real_access.sh` | 14 columns, 178 candidates, 336 query cells, 72 storage scans, policy/query consistency, cross-policy checksum equality, and storage-counter sanity |
-| `paged_study` | exact answers across facts, zone-map (plain, with shortcuts, with a dictionary filter), scan, and Parquet arms; no harmful checker mutant accepted; no forged attestation changes a zone-map answer |
+| `paged_study` | exact answers across facts, zone-map (plain, with shortcuts, with a dictionary filter), scan, and Parquet arms; no harmful checker mutant accepted; no forged attestation changes a zone-map answer; no forged dictionary order changes an answer planned from facts, with or without stored statistics |
 | `paged_study -- --menus` | untimed: every paged query, planned from facts and from a zone map over pages chosen from the direct menu and from the byte-optimised menu, answers exactly against brute force |
 | `paged_scale_study` | exact answers against a row-wise oracle across requested thread counts |
 | `duckdb_baseline.py` | exact sum and row-count agreement with exported paged workloads before timing |

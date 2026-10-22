@@ -2,10 +2,13 @@
 //! row: a few reads on either side of its boundaries confirm the result, so
 //! an executor that moves a boundary by one row or code is stopped. Also the
 //! forged attestations of the fault study, and what the checks can and
-//! cannot stop when a page's order is forged.
+//! cannot stop when a page's order is forged; a dictionary's order, which
+//! the reader verifies before relying on it, is the one it always stops.
 
 use proptest::prelude::*;
-use witness::access_compiler::paged::{self, Page, PageAction, PagePolicy, PagedColumn, Planning};
+use witness::access_compiler::paged::{
+    self, Aggregate, Conjunct, Page, PageAction, PagePolicy, PagedColumn, Planning,
+};
 use witness::access_compiler::{
     CheckedInvariants, ClosureMode, NullPlacement, ReadSession, Recipe, Span, push_range, vector,
 };
@@ -355,7 +358,7 @@ fn a_forged_null_placement_licenses_a_search_the_result_check_can_stop() {
 }
 
 #[test]
-fn a_forged_dictionary_order_reaches_the_planner_but_not_a_seal() {
+fn a_forged_dictionary_order_reaches_the_planner_but_not_a_reader() {
     let values = (0..2_000_i64)
         .map(|row| Some((row * 7 % 40 - 20) * 10))
         .collect::<Vec<_>>();
@@ -367,6 +370,7 @@ fn a_forged_dictionary_order_reaches_the_planner_but_not_a_seal() {
     // The page's own order is no forgery.
     assert!(!column.forge_dictionary(0, &table).unwrap());
     assert!(column.forge_dictionary(0, &table[1..]).is_err());
+    let honest = column.clone();
     table.reverse();
     assert!(column.forge_dictionary(0, &table).unwrap());
     let page = &column.pages()[0];
@@ -385,13 +389,209 @@ fn a_forged_dictionary_order_reaches_the_planner_but_not_a_seal() {
         let (spans, _) = paged::between(&column, low, high, Planning::StoredStatistics, 1).unwrap();
         assert_eq!(spans, truth_ranges(&values, low, high));
     }
-    // The fact planner does. Its bound is the table's first and last entry,
-    // here the largest and the smallest value, so a range inside them is
-    // skipped as though it lay outside; and a search of the table finds
-    // codes whose neighbouring entries, the ones it probed, bear them out.
-    let (spans, _) = paged::between(&column, 0, 0, Planning::Facts, 1).unwrap();
-    assert!(spans.is_empty());
-    assert_ne!(spans, truth_ranges(&values, 0, 0));
+    assert_eq!(page.dictionary_order(), None);
+    // Its bound would be the table's first and last entry, here the largest
+    // and the smallest value, so a range inside them would be skipped as
+    // though it lay outside. The fact planner verifies the order first,
+    // finds it false, and scans the page instead.
+    let (spans, counts) = paged::between(&column, 0, 0, Planning::Facts, 1).unwrap();
+    assert_eq!(spans, truth_ranges(&values, 0, 0));
+    assert_eq!((counts.scanned, counts.unverified), (1, 1));
+    assert_eq!(page.dictionary_order(), Some(false));
+    // A translation planned on the honest page cites the same fact, which
+    // the forged page's facts also hold; the checker stops it there because
+    // the reader found the order false.
+    let honest_page = &honest.pages()[0];
+    let translate = paged::plan_between(
+        honest_page,
+        &mut session(honest_page),
+        0,
+        0,
+        Planning::Facts,
+    )
+    .unwrap();
+    assert!(
+        matches!(translate, PageAction::Translate(_)),
+        "{translate:?}"
+    );
+    assert_eq!(honest_page.dictionary_order(), Some(true));
+    let error = paged::check_between(page, &mut session(page), &translate, 0, 0).unwrap_err();
+    assert!(error.contains("dictionary order"), "{error}");
+}
+
+/// Every planner but the footer, whose bounds the writer derives.
+const READERS: [Planning; 6] = [
+    Planning::Facts,
+    Planning::ScanOnly,
+    Planning::StoredStatistics,
+    Planning::FactBounds,
+    Planning::StoredStatisticsPlus,
+    Planning::StoredStatisticsDictionary,
+];
+
+/// The page's distinct values in an order that is not sorted: reversed, as
+/// unsigned integers when that moves the negative values, or rotated by one.
+fn forged_table(values: &[Option<i64>], kind: u8) -> Vec<i64> {
+    let mut table = values.iter().flatten().copied().collect::<Vec<_>>();
+    table.sort_unstable();
+    table.dedup();
+    match kind % 3 {
+        0 => table.reverse(),
+        1 if table.first().is_some_and(|&first| first < 0)
+            && table.last().is_some_and(|&last| last >= 0) =>
+        {
+            table.sort_by_key(|&value| value as u64);
+        }
+        _ => table.rotate_left(1),
+    }
+    table
+}
+
+/// Every reader answers BETWEEN, SUM WHERE, and a conjunction over
+/// `column`, whose values are `values`, exactly, on one thread and on four.
+fn every_reader_answers_exactly(
+    column: &PagedColumn,
+    values: &[Option<i64>],
+    low: i64,
+    high: i64,
+) -> Result<(), TestCaseError> {
+    let truth = truth_ranges(values, low, high);
+    let matched = truth.iter().map(|span| span.len()).sum::<usize>();
+    let sum = values
+        .iter()
+        .flatten()
+        .filter(|&&value| low <= value && value <= high)
+        .map(|&value| i128::from(value))
+        .sum::<i128>();
+    for planning in READERS {
+        for threads in [1, 4] {
+            let (spans, _) = paged::between(column, low, high, planning, threads).unwrap();
+            prop_assert_eq!(&spans, &truth, "{:?} {}..={}", planning, low, high);
+            let (total, rows, _) =
+                paged::sum_where(column, column, low, high, planning, threads).unwrap();
+            prop_assert_eq!(
+                (total, rows),
+                (sum, matched),
+                "{:?} {}..={}",
+                planning,
+                low,
+                high
+            );
+            let conjunct = Conjunct { column, low, high };
+            let (total, rows, _) = paged::aggregate_where(
+                &[conjunct, conjunct],
+                Aggregate::Sum(column),
+                planning,
+                threads,
+            )
+            .unwrap();
+            prop_assert_eq!(
+                (total, rows),
+                (sum, matched),
+                "{:?} {}..={}",
+                planning,
+                low,
+                high
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_planner_answers_a_forged_dictionary_order_exactly() {
+    // Pages of a few distinct values, the later ones with nulls, every other
+    // one forged in one of three orders.
+    let values = (0..6_000_i64)
+        .map(|row| (row % 11 != 0 || row < 3_000).then_some((row * 7 % 23 - 11) * 5 + row / 1_000))
+        .collect::<Vec<_>>();
+    let policy = PagePolicy::smallest(vec![Recipe::Dictionary(bitpack()), Recipe::For(bitpack())]);
+    let mut column = PagedColumn::from_values(&values, 500, &policy).unwrap();
+    for index in (0..column.pages().len()).step_by(2) {
+        let page = &values[index * 500..(index + 1) * 500];
+        let table = forged_table(page, (index / 2) as u8);
+        assert!(column.forge_dictionary(index, &table).unwrap());
+    }
+    for (low, high) in [
+        (-60, -40),
+        (-55, -55),
+        (0, 0),
+        (1, 4),
+        (-3, 3),
+        (12, 33),
+        (-1_000, 1_000),
+        (60, 70),
+    ] {
+        every_reader_answers_exactly(&column, &values, low, high).unwrap();
+    }
+    // Every forged page was found out of order, and every honest page that
+    // the facts planner relied on, in order.
+    for (index, page) in column.pages().iter().enumerate().step_by(2) {
+        assert_eq!(page.dictionary_order(), Some(false), "page {index}");
+    }
+    // The fact planner scans every forged page it plans, and only those; a
+    // zone map never consults their order.
+    let (_, _, counts) = paged::sum_where(&column, &column, 1, 4, Planning::Facts, 1).unwrap();
+    assert_eq!(counts.unverified, column.pages().len().div_ceil(2));
+    let (_, _, counts) =
+        paged::sum_where(&column, &column, 1, 4, Planning::StoredStatistics, 1).unwrap();
+    assert_eq!(counts.unverified, 0);
+}
+
+#[test]
+fn a_page_dictionary_order_is_verified_once_per_page() {
+    let values = (0..4_000_i64)
+        .map(|row| Some(row * 13 % 200 * 3))
+        .collect::<Vec<_>>();
+    let column =
+        PagedColumn::from_values(&values, 1_000, &only(Recipe::Dictionary(bitpack()))).unwrap();
+    let table_bytes = 200 * 8;
+    let plan_bytes = |page: &Page, low: i64, high: i64| {
+        let mut session = ReadSession::new(&page.column.page, ClosureMode::Selective);
+        paged::plan_between(page, &mut session, low, high, Planning::Facts).unwrap();
+        session.metrics().logical_bytes
+    };
+    for page in column.pages() {
+        assert_eq!(page.dictionary_order(), None);
+        // The first plan reads the whole table to verify its order; every
+        // later plan, in any session, reads only the entries it probes.
+        assert!(plan_bytes(page, 30, 90) >= table_bytes);
+        assert_eq!(page.dictionary_order(), Some(true));
+        for (low, high) in [(30, 90), (0, 0), (1, 2), (-5, 1_000)] {
+            assert!(plan_bytes(page, low, high) < table_bytes);
+        }
+    }
+    // A clone of the column keeps what the reader found.
+    paged::sum_where(&column, &column, 30, 90, Planning::Facts, 4).unwrap();
+    let copy = column.clone();
+    assert!(
+        copy.pages()
+            .iter()
+            .all(|page| page.dictionary_order() == Some(true))
+    );
+    assert!(plan_bytes(&copy.pages()[0], 30, 90) < table_bytes);
+    // Pages without a dictionary have no order to verify.
+    let plain = PagedColumn::from_values(&values, 1_000, &only(Recipe::For(bitpack()))).unwrap();
+    paged::sum_where(&plain, &plain, 30, 90, Planning::Facts, 1).unwrap();
+    assert!(
+        plain
+            .pages()
+            .iter()
+            .all(|page| page.dictionary_order().is_none())
+    );
+    // Forging a page's dictionary replaces its bytes, and with them what
+    // the reader found.
+    let mut forged = column.clone();
+    assert!(
+        forged
+            .forge_dictionary(0, &forged_table(&values[..1_000], 0))
+            .unwrap()
+    );
+    assert_eq!(forged.pages()[0].dictionary_order(), None);
+    assert_eq!(forged.pages()[1].dictionary_order(), Some(true));
+    let (_, _, counts) = paged::sum_where(&forged, &forged, 30, 90, Planning::Facts, 1).unwrap();
+    assert_eq!(counts.unverified, 1);
+    assert_eq!(forged.pages()[0].dictionary_order(), Some(false));
 }
 
 #[test]
@@ -553,6 +753,41 @@ proptest! {
         prop_assert!(
             paged::check_search(page, &mut session, NullPlacement::NoNulls, low, high, found).is_ok()
         );
+    }
+
+    #[test]
+    fn a_forged_dictionary_order_never_misleads_a_reader(
+        seed in any::<u64>(),
+        rows in 2_usize..1_500,
+        page_rows in 64_usize..600,
+        domain in 2_i64..50,
+        low in -300_i64..300,
+        width in 0_i64..300,
+        kind in any::<u8>(),
+        forged_every in 1_usize..4,
+    ) {
+        let mut state = seed;
+        let values = (0..rows)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) % 9 != 0).then_some(((state >> 40) as i64 % domain) * 10 - 100)
+            })
+            .collect::<Vec<_>>();
+        let policy =
+            PagePolicy::smallest(vec![Recipe::Dictionary(bitpack()), Recipe::For(bitpack())]);
+        let mut column = PagedColumn::from_values(&values, page_rows, &policy).unwrap();
+        for index in (0..column.pages().len()).step_by(forged_every) {
+            let start = index * page_rows;
+            let page = &values[start..(start + page_rows).min(rows)];
+            let table = forged_table(page, kind.wrapping_add(index as u8));
+            // A page of fewer than two distinct values has no other order.
+            if table.len() > 1 {
+                prop_assert!(column.forge_dictionary(index, &table).unwrap());
+            }
+        }
+        every_reader_answers_exactly(&column, &values, low, low + width)?;
     }
 
     #[test]

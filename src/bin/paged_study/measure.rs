@@ -392,8 +392,10 @@ fn bounds(result_dir: &str, pairs: &[Pair], layouts: &[Layouts]) -> Result<(), B
 }
 
 /// What consulting facts costs, next to decoding: deriving every page's facts,
-/// planning one query over every page (median over the predicates), and the
-/// bytes that planning reads, against a scan-only pass over the same column.
+/// verifying its dictionaries when it is sealed and their order when a reader
+/// first relies on it, planning one query over every page (median over the
+/// predicates), and the bytes that planning reads, against a scan-only pass
+/// over the same column.
 fn costs(
     result_dir: &str,
     columns: &[Column],
@@ -403,7 +405,7 @@ fn costs(
     let mut output = csv(format!("{result_dir}/costs.csv"))?;
     writeln!(
         output,
-        "pair,pages,rows,derive_ns,verify_ns,plan_ns,plan_unchecked_ns,plan_logical_bytes,scan_ns"
+        "pair,pages,rows,derive_ns,verify_ns,reader_verify_ns,plan_ns,plan_unchecked_ns,plan_logical_bytes,scan_ns"
     )?;
     for (pair_id, pair) in pairs.iter().enumerate() {
         let column = &layouts[pair.selector].direct;
@@ -423,6 +425,19 @@ fn costs(
         let (_, verify_ns, _) = benchmark(|| {
             for page in column.pages() {
                 black_box(paged::check_dictionaries(&page.column)?);
+            }
+            Ok(())
+        })?;
+        // Verifying the order of each page's sorted dictionary as a reader
+        // does the first time a planner relies on it: the work
+        // `plan_between` does once per page, timed without keeping its
+        // answer. The page keeps that answer, so the planning times below,
+        // taken over a column already queried, do not include it.
+        let (_, reader_verify_ns, _) = benchmark(|| {
+            for page in column.pages() {
+                let mut session =
+                    ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
+                black_box(paged::verify_dictionary_order(page, &mut session)?);
             }
             Ok(())
         })?;
@@ -476,7 +491,7 @@ fn costs(
         })?;
         writeln!(
             output,
-            "{pair_id},{},{},{derive_ns:.1},{verify_ns:.1},{:.1},{:.1},{plan_bytes},{scan_ns:.1}",
+            "{pair_id},{},{},{derive_ns:.1},{verify_ns:.1},{reader_verify_ns:.1},{:.1},{:.1},{plan_bytes},{scan_ns:.1}",
             column.pages().len(),
             column.rows(),
             plan_ns[plan_ns.len() / 2],
