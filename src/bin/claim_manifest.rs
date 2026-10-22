@@ -4668,7 +4668,8 @@ fn verify_cost_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
 /// statistics never name a fact and are rejected by construction; another
 /// action kind is not licensed by the cited fact; a neighbouring page's or
 /// another predicate's action fails the semantic re-check against this
-/// page and range; a moved bound is never harmful. Harmful mutants are
+/// page and range; a moved search span or code range fails the result
+/// check; a moved bound is never harmful. Harmful mutants are
 /// split into wrong answers and executor errors.
 fn checker_mechanism_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
     let checker = read_csv(&format!("{PAGED}/checker.csv"))?;
@@ -4680,6 +4681,7 @@ fn checker_mechanism_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error
             "kind" => "Kind",
             "foreign_page" | "stale_plan" => "Recheck",
             "evidence" => "MovedBound",
+            "result_shift" => "Result",
             other => return Err(format!("unclassified mutation family {other}").into()),
         };
         let counts = mechanisms.entry(mechanism).or_default();
@@ -4693,7 +4695,7 @@ fn checker_mechanism_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error
         }
     }
     let mut totals = [0_usize; 2];
-    for mechanism in ["Forged", "Kind", "Recheck", "MovedBound"] {
+    for mechanism in ["Forged", "Kind", "Recheck", "Result", "MovedBound"] {
         let [wrong, error, harmless] = mechanisms.get(mechanism).copied().unwrap_or_default();
         totals[0] += wrong;
         totals[1] += error;
