@@ -35,6 +35,7 @@ Use `cargo test --locked --all-features -- --list` for the current test inventor
 | vector execution | `tests/vector.rs`, `tests/vector_validation.rs` | decoded answers, code-lane equivalence, and malformed-selection rejection |
 | paged execution | `tests/paged.rs`, `tests/paged_edge_cases.rs` | row-wise answers, checked licences, append certificates, and serial/parallel equivalence |
 | paged planners | `tests/paged_differential.rs`, `tests/paged_deletes.rs`, `tests/dictionary_skips.rs`, `tests/selective_kernels.rs`, `tests/strings.rs` | every planner, from facts to a zone map with a dictionary filter, against a scan of the rows; dictionary skips the checker re-reads |
+| result checks | `tests/result_checks.rs` | search and translation boundaries moved by one rejected; forged attestations against each planner |
 | chunked frames | `tests/chunked_frames.rs` | exact answers, chunk-level reads, and corruption handling |
 | generated execution | `tests/access_compiler_generated.rs` | interpreter, monomorphized control, and frozen generated Rust |
 | sidecar certificates | `tests/certificate_plans.rs` | brute-force membership with candidate refinement |
