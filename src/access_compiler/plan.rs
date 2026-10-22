@@ -132,6 +132,13 @@ pub enum Authorization {
     /// minimum and maximum. The reader trusts it without being able to check
     /// it against the encoding; no single-page plan accepts it.
     StoredStatistics,
+    /// Every entry of the dictionary at `node`, which lists a page's
+    /// non-null values, tested against a predicate one by one: none lies in
+    /// it. It needs no order, as a reader filtering on a dictionary page
+    /// would test it; no single-page plan cites it.
+    DictionaryEntries {
+        node: NodeId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +219,11 @@ impl PlanIr {
                 Authorization::StoredStatistics => {
                     return Err(format!(
                         "plan node {id} cites stored statistics, which no single-page plan trusts"
+                    ));
+                }
+                Authorization::DictionaryEntries { .. } => {
+                    return Err(format!(
+                        "plan node {id} cites dictionary entries, which only a page planner tests"
                     ));
                 }
                 Authorization::Unconditional if node.op.skips_scan_work() => {

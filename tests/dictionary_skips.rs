@@ -1,24 +1,27 @@
 //! A sorted dictionary lists every value its page holds, so the planner
 //! skips a page whose table has no entry in the range even when the page's
 //! bounds straddle it, and the checker searches the table again before the
-//! skip runs. Also the boundary search that a page of runs answers run by
-//! run instead of row by row.
+//! skip runs. A zone map with a dictionary filter skips the same pages by
+//! testing every entry, without the order, and the checker tests them all
+//! again. Also the boundary search that a page of runs answers run by run
+//! instead of row by row.
 
 use proptest::prelude::*;
 use witness::access_compiler::paged::{
     self, Licence, PageAction, PagePolicy, PagedColumn, Planning,
 };
 use witness::access_compiler::{
-    Authorization, ClosureMode, FactScope, MappingInvariant, NullPlacement, Property, ReadSession,
-    Recipe, Span, push_range, vector,
+    Authorization, ClosureMode, FactScope, MappingInvariant, NodeId, NullPlacement, Property,
+    ReadSession, Recipe, Span, push_range, vector,
 };
 
-const PLANNERS: [Planning; 5] = [
+const PLANNERS: [Planning; 6] = [
     Planning::Facts,
     Planning::ScanOnly,
     Planning::StoredStatistics,
     Planning::FactBounds,
     Planning::StoredStatisticsPlus,
+    Planning::StoredStatisticsDictionary,
 ];
 
 fn bitpack() -> Box<Recipe> {
@@ -200,6 +203,113 @@ fn the_checker_rejects_a_dictionary_skip_the_table_does_not_bear_out() {
 }
 
 #[test]
+fn a_dictionary_filter_skips_a_page_by_testing_every_entry() {
+    for nulls in [false, true] {
+        let column = tens(nulls);
+        let page = &column.pages()[0];
+        let mut session = session(page);
+        let plan = |session: &mut ReadSession<'_>, low, high, planning| {
+            paged::plan_between(page, session, low, high, planning).unwrap()
+        };
+        let skip = plan(&mut session, 41, 49, Planning::StoredStatisticsDictionary);
+        let PageAction::Skip(licence) = &skip else {
+            panic!("expected a skip, planned {skip:?}");
+        };
+        let Authorization::DictionaryEntries { node } = licence.fact else {
+            panic!("expected the dictionary's entries, cited {licence:?}");
+        };
+        assert_eq!(licence.evidence, None);
+        // It cites the dictionary, under the nulls on a nullable page.
+        assert_eq!(node == page.column.decoder.root(), !nulls);
+        // A range that holds an entry, or that the statistics decide, is
+        // planned as the zone map plans it.
+        for (low, high) in [(41, 50), (0, 5), (10, 100), (0, 1_000), (35, 65)] {
+            assert_eq!(
+                plan(
+                    &mut session,
+                    low,
+                    high,
+                    Planning::StoredStatisticsDictionary
+                ),
+                plan(&mut session, low, high, Planning::StoredStatistics),
+                "{low}..={high}"
+            );
+        }
+        // The checker tests every entry again.
+        assert!(paged::check_between(page, &mut session, &skip, 41, 49).is_ok());
+        assert!(paged::check_between(page, &mut session, &skip, 42, 48).is_ok());
+        for (low, high) in [(41, 50), (40, 49), (0, 1_000)] {
+            assert!(
+                paged::check_between(page, &mut session, &skip, low, high).is_err(),
+                "{low}..={high}"
+            );
+        }
+        // The licence records no evidence, cites the page's own dictionary,
+        // and admits no other action.
+        let wrong = [
+            PageAction::Skip(Licence {
+                evidence: Some((4, 4)),
+                ..licence.clone()
+            }),
+            PageAction::Skip(Licence {
+                fact: Authorization::DictionaryEntries {
+                    node: NodeId(node.0 + 1),
+                },
+                evidence: None,
+            }),
+            PageAction::Accept(licence.clone()),
+            PageAction::Translate(licence.clone()),
+            PageAction::Search {
+                licence: licence.clone(),
+                nulls: NullPlacement::NoNulls,
+            },
+        ];
+        for action in wrong {
+            assert!(
+                paged::check_between(page, &mut session, &action, 41, 49).is_err(),
+                "{action:?}"
+            );
+        }
+        let (sum, rows, counts) = paged::sum_where(
+            &column,
+            &column,
+            41,
+            49,
+            Planning::StoredStatisticsDictionary,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                sum,
+                rows,
+                counts.skipped,
+                counts.code_skipped,
+                counts.scanned
+            ),
+            (0, 0, 1, 1, 0)
+        );
+    }
+    // The licence on a page without a dictionary.
+    let column = tens(false);
+    let page = &column.pages()[0];
+    let skip = paged::plan_between(
+        page,
+        &mut session(page),
+        11,
+        19,
+        Planning::StoredStatisticsDictionary,
+    )
+    .unwrap();
+    let values = (0..1_000_i64)
+        .map(|row| Some((row % 10 + 1) * 10))
+        .collect::<Vec<_>>();
+    let offsets = PagedColumn::from_values(&values, 1_000, &only(Recipe::For(bitpack()))).unwrap();
+    let other = &offsets.pages()[0];
+    assert!(paged::check_between(other, &mut session(other), &skip, 11, 19).is_err());
+}
+
+#[test]
 fn a_page_of_runs_is_searched_run_by_run() {
     // Runs of uneven length over a non-decreasing column, spanning several
     // blocks of the run index, with values that repeat across runs.
@@ -320,15 +430,15 @@ proptest! {
         let value = gapped(seed ^ 0x5eed, rows, 1_000, 3, false, 5);
         let high = low + width;
         let expected = truth(&selector, &value, low, high);
-        for policy in [
-            only(Recipe::Dictionary(bitpack())),
-            only(Recipe::Dictionary(runs_of(bitpack()))),
-            PagePolicy::smallest(vec![
+        for (dictionaries_only, policy) in [
+            (true, only(Recipe::Dictionary(bitpack()))),
+            (true, only(Recipe::Dictionary(runs_of(bitpack())))),
+            (false, PagePolicy::smallest(vec![
                 Recipe::For(bitpack()),
                 Recipe::Dictionary(bitpack()),
                 Recipe::Dictionary(runs_of(bitpack())),
                 *runs_of(Box::new(Recipe::For(bitpack()))),
-            ]),
+            ])),
         ] {
             let selector_pages = PagedColumn::from_values(&selector, page_rows, &policy).unwrap();
             let value_pages = PagedColumn::from_values(&value, page_rows, &policy).unwrap();
@@ -340,7 +450,7 @@ proptest! {
                     ).unwrap();
                     prop_assert_eq!((sum, matched), expected, "{:?} x{}", planning, threads);
                     prop_assert!(counts.code_skipped <= counts.skipped);
-                    if planning != Planning::Facts && planning != Planning::StoredStatisticsPlus {
+                    if !planning.uses_shortcuts() && !planning.uses_dictionary_filter() {
                         prop_assert_eq!(counts.code_skipped, 0);
                     }
                     skipped.push((planning, counts.skipped));
@@ -350,6 +460,15 @@ proptest! {
             let of = |wanted: Planning| skipped.iter().find(|(planning, _)| *planning == wanted).unwrap().1;
             prop_assert!(of(Planning::Facts) >= of(Planning::FactBounds));
             prop_assert!(of(Planning::StoredStatisticsPlus) >= of(Planning::StoredStatistics));
+            prop_assert!(of(Planning::StoredStatisticsDictionary) >= of(Planning::StoredStatistics));
+            // On dictionary pages, testing every entry skips exactly the
+            // pages a search of the sorted table skips.
+            if dictionaries_only {
+                prop_assert_eq!(
+                    of(Planning::StoredStatisticsDictionary),
+                    of(Planning::StoredStatisticsPlus)
+                );
+            }
         }
     }
 

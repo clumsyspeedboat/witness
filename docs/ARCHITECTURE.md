@@ -201,6 +201,27 @@ per-page minimum and maximum recorded when the page is sealed, as a zone map
 would: its licences cite `Authorization::StoredStatistics`, which the checker
 can hold only to the recorded values, never to the bytes.
 
+The planners, with their labels in result files:
+
+| Planner | Skips and accepts by | Shortcuts |
+|---|---|---|
+| `Facts` (`facts`) | derived bounds | search, translation, dictionary skip, column certificate |
+| `FactBounds` (`factbounds`) | derived bounds | none |
+| `StoredStatistics` (`zonemap`) | stored minimum and maximum | none |
+| `StoredStatisticsPlus` (`zonemapplus`) | stored minimum and maximum | those of `Facts` |
+| `StoredStatisticsDictionary` (`zonemapdict`) | stored minimum and maximum | dictionary filter |
+| `DerivedFooter` (`footer`) | derived bounds kept in a footer | none |
+| `ScanOnly` (`scan`) | nothing | none |
+
+`StoredStatisticsDictionary` is a zone map with the dictionary filter
+Parquet readers apply: a page its statistics cannot decide is skipped when no
+entry of its dictionary, sorted or not, lies in the predicate. It tests every
+entry, assumes no order, and cites `Authorization::DictionaryEntries`;
+`check_between` tests every entry again, and the skip rests on the same check
+at sealing as the sorted search does. A plain zone map has no such filter: it
+scans the page, and the scan reads every id even when no entry matches, as a
+decode of the page would. No planner that skips such a page reads its ids.
+
 Pages execute on `vector.rs`, which reads the decoder IR at run time and
 dispatches once per chunk: up to 1,024 decoded values, one run, or a stretch
 of nulls. Scattered matches travel as a one-bit-per-row `Selection` consumed
@@ -252,7 +273,11 @@ non-NaN double to an `i64` key that sorts like the double, so all integer
 codecs, facts, and planners apply to keys. `strings.rs` stores a string page
 as a sorted dictionary and integer ids; a range or prefix predicate becomes a
 skip, an acceptance, or an id range found by two binary searches, and the
-checker re-reads the entries beside the id range's boundaries.
+checker re-reads the entries beside the id range's boundaries. A zone map
+decides from the first and last entries, which equal the stored minimum and
+maximum; with the shortcuts it then searches the dictionary as facts do, and
+with a dictionary filter it tests the entries in turn and skips a page none
+matches, which its checker confirms by testing them all again.
 
 ## Plan IR
 

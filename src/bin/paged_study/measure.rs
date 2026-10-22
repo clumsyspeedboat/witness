@@ -45,7 +45,7 @@ enum Arm {
     ParquetFull { compressed: bool },
 }
 
-const ARMS: [Arm; 10] = [
+const ARMS: [Arm; 11] = [
     Arm::Witness {
         compact: false,
         planning: Planning::Facts,
@@ -65,6 +65,10 @@ const ARMS: [Arm; 10] = [
     Arm::Witness {
         compact: false,
         planning: Planning::StoredStatisticsPlus,
+    },
+    Arm::Witness {
+        compact: false,
+        planning: Planning::StoredStatisticsDictionary,
     },
     Arm::Witness {
         compact: true,

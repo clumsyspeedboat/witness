@@ -1,7 +1,8 @@
 //! Selective SUM over string selectors: every string column of the string
 //! corpus, stored as pages of a sorted dictionary and integer ids, queried
 //! with range and prefix predicates under the facts, zone-map, and scan
-//! planners. Pairs are exported as Parquet with the selector as bytes, so
+//! planners, and the zone map with the encoding's shortcuts or with a
+//! dictionary filter. Pairs are exported as Parquet with the selector as bytes, so
 //! other engines run the same predicates.
 
 #[allow(dead_code)]
@@ -131,6 +132,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for (planning, arm) in [
                     (Planning::Facts, "witness_direct_facts"),
                     (Planning::StoredStatistics, "witness_direct_zonemap"),
+                    (Planning::StoredStatisticsPlus, "witness_direct_zonemapplus"),
+                    (
+                        Planning::StoredStatisticsDictionary,
+                        "witness_direct_zonemapdict",
+                    ),
                     (Planning::ScanOnly, "witness_direct_scan"),
                 ] {
                     let run = || string_sum_where(&column, range, &measure, planning);

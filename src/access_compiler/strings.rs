@@ -219,6 +219,9 @@ pub enum StringAction {
     /// No row can match: the range falls before entry `at` and after the
     /// entry before it.
     SkipAt(u64),
+    /// No row can match: no entry lies in the range, each entry tested in
+    /// turn, which needs no order.
+    SkipEntries,
     /// Every non-null row matches.
     Accept,
     /// Rows match exactly when their id lies in `first..=last`.
@@ -227,11 +230,14 @@ pub enum StringAction {
     Scan,
 }
 
-/// Plans `range` on page `page` and checks the plan. Planners with the
-/// encoding's shortcuts use the dictionary's order; the others use only the
-/// page's smallest and largest string, which a zone map stores and the
-/// dictionary's ends equal; `Planning::ScanOnly` uses nothing. `probes`
-/// counts the dictionary entries read.
+/// Plans `range` on page `page` and checks the plan. `Planning::Facts` uses
+/// the dictionary's order alone. Planners with stored statistics first read
+/// the page's smallest and largest string, which a zone map stores and the
+/// dictionary's ends equal; then `StoredStatisticsPlus` uses the order as
+/// facts do, and `StoredStatisticsDictionary` tests the entries one by one,
+/// as a dictionary filter does. The others use only the smallest and largest
+/// string, and `Planning::ScanOnly` uses nothing. `probes` counts the
+/// dictionary entries read.
 pub fn plan_string(
     column: &StringColumn,
     page: usize,
@@ -243,33 +249,51 @@ pub fn plan_string(
     let entries = dictionary.len();
     // The dictionary's ends are its page's exact minimum and maximum, so
     // derived bounds and a zone map decide alike; only the order fact,
-    // which every shortcut-using planner has, adds the id translation.
+    // which every shortcut-using planner has, adds the id translation and
+    // the skip between entries.
+    let searched = |probes: &mut usize| {
+        let first = dictionary.lower(range.low, probes);
+        let end = dictionary.upper(range.high, probes);
+        if first >= end {
+            StringAction::SkipAt(first as u64)
+        } else if first == 0 && end == entries {
+            StringAction::Accept
+        } else {
+            StringAction::Translate {
+                first: first as u64,
+                last: end as u64 - 1,
+            }
+        }
+    };
     let action = match planning {
         Planning::ScanOnly => StringAction::Scan,
         _ if entries == 0 => StringAction::Skip,
-        _ if !planning.uses_shortcuts() => {
+        _ if planning.uses_shortcuts() && !planning.uses_statistics() => searched(probes),
+        _ => {
             *probes += 2;
             let (smallest, largest) = (dictionary.entry(0), dictionary.entry(entries - 1));
             if above(smallest, range.high) || below(largest, range.low) {
                 StringAction::Skip
             } else if range.contains(smallest) && range.contains(largest) {
                 StringAction::Accept
+            } else if planning.uses_shortcuts() {
+                searched(probes)
+            } else if planning.uses_dictionary_filter() {
+                // Stops at the first entry in the range, which a scan of the
+                // page then tests again with the rest.
+                let mut tested = 0;
+                let any = (0..entries).any(|entry| {
+                    tested += 1;
+                    range.contains(dictionary.entry(entry))
+                });
+                *probes += tested;
+                if any {
+                    StringAction::Scan
+                } else {
+                    StringAction::SkipEntries
+                }
             } else {
                 StringAction::Scan
-            }
-        }
-        _ => {
-            let first = dictionary.lower(range.low, probes);
-            let end = dictionary.upper(range.high, probes);
-            if first >= end {
-                StringAction::SkipAt(first as u64)
-            } else if first == 0 && end == entries {
-                StringAction::Accept
-            } else {
-                StringAction::Translate {
-                    first: first as u64,
-                    last: end as u64 - 1,
-                }
             }
         }
     };
@@ -302,6 +326,17 @@ pub fn check_string(
                 return Err("only dictionary order places a skip between entries".into());
             }
             (at as usize, at as usize)
+        }
+        StringAction::SkipEntries => {
+            if !planning.uses_dictionary_filter() {
+                return Err("only a dictionary filter skips by testing every entry".into());
+            }
+            // Every entry is tested again; no order is assumed.
+            return if (0..entries).any(|index| range.contains(entry(index))) {
+                Err("dictionary filter skip cites a table with an entry in the range".into())
+            } else {
+                Ok(())
+            };
         }
         StringAction::Accept => (0, entries),
         StringAction::Translate { first, last } => {
@@ -353,8 +388,13 @@ pub fn string_sum_where(
         let mut session = ReadSession::new_untracked(&id_page.column.page, ClosureMode::Selective);
         let all = Span::new(0, id_page.rows())?;
         let selection = match action {
-            StringAction::Skip | StringAction::SkipAt(_) => {
+            StringAction::Skip => {
                 counts.skipped += 1;
+                continue;
+            }
+            StringAction::SkipAt(_) | StringAction::SkipEntries => {
+                counts.skipped += 1;
+                counts.code_skipped += 1;
                 continue;
             }
             StringAction::Accept => {

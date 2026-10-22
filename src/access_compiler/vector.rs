@@ -812,7 +812,15 @@ pub fn fused_sum_between_live(
         return Ok(None);
     };
     // With no code in range nothing matches, but dictionary ids are still
-    // read to confirm they lie inside the table, as a decode would.
+    // read to confirm they lie inside the table, as a decode would. Only a
+    // planner without a dictionary filter reaches this: a plain zone map or
+    // derived bounds alone decide from the page's ends, and a page they
+    // cannot decide is scanned like any other, every row read. A planner
+    // with a dictionary filter skips the page instead and reads no id,
+    // trusting alike that ids were checked against their table when the
+    // page was sealed: facts and a zone map with the encoding's shortcuts
+    // search a sorted table, and a zone map with a dictionary filter tests
+    // the entries of any table.
     if matches!(matcher, Matcher::Nothing) && entries.is_none() {
         return Ok(Some((0, 0)));
     }
@@ -2314,6 +2322,27 @@ pub fn entries_below(
     }
     let values = session.read_i64_values(table, 0, entries)?;
     Ok(values.partition_point(|&entry| entry < bound))
+}
+
+/// Whether any of the `entries` of a table lies in `[low, high]`, testing
+/// each in turn, so the table need not be sorted. The table is read in one
+/// request, as `entries_below` reads it from storage.
+pub fn any_entry_between(
+    session: &mut ReadSession<'_>,
+    table: FieldId,
+    entries: usize,
+    low: i64,
+    high: i64,
+) -> Result<bool, String> {
+    if entries == 0 {
+        return Ok(false);
+    }
+    let end = entries.checked_mul(8).ok_or("dictionary offset overflow")?;
+    let bytes = session.read_range(table, Span::new(0, end)?)?;
+    Ok(bytes.chunks_exact(8).any(|entry| {
+        let entry = i64::from_le_bytes(entry.try_into().unwrap());
+        low <= entry && entry <= high
+    }))
 }
 
 /// `search_monotone` within each block of `max_rows` rows: the shape a

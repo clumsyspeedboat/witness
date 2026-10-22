@@ -117,6 +117,7 @@ fn string_predicates_equal_the_truth_under_every_planner() {
             Planning::ScanOnly,
             Planning::FactBounds,
             Planning::StoredStatisticsPlus,
+            Planning::StoredStatisticsDictionary,
             Planning::DerivedFooter,
         ] {
             let (total, rows, _, read) =
@@ -209,5 +210,36 @@ fn the_string_checker_rejects_plans_its_dictionary_does_not_support() {
     let skip = plan_string(&column, 1, gap, Planning::Facts, &mut probes).unwrap();
     assert!(matches!(skip, StringAction::SkipAt(_)), "{skip:?}");
     assert!(check_string(fruit, skip, gap, Planning::StoredStatistics).is_err());
+    // A zone map with the encoding's shortcuts skips the gap as facts do; a
+    // dictionary filter skips it by testing every entry, which only it may
+    // cite, and which a range holding an entry does not bear out.
+    let plus = plan_string(&column, 1, gap, Planning::StoredStatisticsPlus, &mut probes).unwrap();
+    assert_eq!(plus, skip);
+    let filtered = plan_string(
+        &column,
+        1,
+        gap,
+        Planning::StoredStatisticsDictionary,
+        &mut probes,
+    )
+    .unwrap();
+    assert_eq!(filtered, StringAction::SkipEntries);
+    for planning in [Planning::Facts, Planning::StoredStatistics] {
+        assert!(check_string(fruit, filtered, gap, planning).is_err());
+    }
+    let (held_low, held_high) = (b"apricot".to_vec(), b"az".to_vec());
+    let held = StringRange::between(&held_low, &held_high);
+    assert!(check_string(fruit, filtered, held, Planning::StoredStatisticsDictionary).is_err());
+    assert_eq!(
+        plan_string(
+            &column,
+            1,
+            held,
+            Planning::StoredStatisticsDictionary,
+            &mut probes
+        )
+        .unwrap(),
+        StringAction::Scan
+    );
     assert!(strings::prefix_range(b"").1.is_none());
 }

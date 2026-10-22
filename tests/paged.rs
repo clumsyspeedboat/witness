@@ -99,6 +99,7 @@ fn paged_answers_equal_the_truth_with_and_without_facts() {
             Planning::StoredStatistics,
             Planning::FactBounds,
             Planning::StoredStatisticsPlus,
+            Planning::StoredStatisticsDictionary,
         ] {
             for threads in [1, 8] {
                 let (ranges, _) = paged::between(&selector, low, high, planning, threads).unwrap();
@@ -466,6 +467,14 @@ fn ablation_planners_take_only_the_actions_they_are_allowed() {
         // The zone map's skips and accepts, plus shortcuts on the rest.
         assert_eq!((plus.skipped, plus.accepted), (zone.skipped, zone.accepted));
         assert!(plus.scanned <= zone.scanned);
+        // A dictionary filter only turns scans into skips, and takes no
+        // shortcut.
+        let (_, filter) =
+            paged::between(&column, low, high, Planning::StoredStatisticsDictionary, 1).unwrap();
+        assert_eq!(filter.accepted, zone.accepted);
+        assert_eq!(filter.skipped, zone.skipped + filter.code_skipped);
+        assert_eq!(filter.scanned + filter.code_skipped, zone.scanned);
+        assert_eq!((filter.searched, filter.translated), (0, 0));
     }
 }
 

@@ -113,6 +113,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Planning::ScanOnly,
                     Planning::FactBounds,
                     Planning::StoredStatisticsPlus,
+                    Planning::StoredStatisticsDictionary,
                 ] {
                     let arm = format!("witness_direct_{}", planning.label());
                     let run = || {

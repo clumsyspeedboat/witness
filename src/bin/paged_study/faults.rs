@@ -61,9 +61,10 @@ impl Fault {
 const FAULTS: [Fault; 3] = [Fault::Neighbour, Fault::Truncated, Fault::Absent];
 
 /// The planners whose answers a summary can change, and the fact planner.
-const PLANNERS: [Planning; 4] = [
+const PLANNERS: [Planning; 5] = [
     Planning::StoredStatistics,
     Planning::StoredStatisticsPlus,
+    Planning::StoredStatisticsDictionary,
     Planning::DerivedFooter,
     Planning::Facts,
 ];

@@ -12,12 +12,13 @@ use witness::access_compiler::paged::{
 };
 use witness::access_compiler::{Recipe, paged_file, push_range};
 
-const PLANNERS: [Planning; 6] = [
+const PLANNERS: [Planning; 7] = [
     Planning::Facts,
     Planning::ScanOnly,
     Planning::StoredStatistics,
     Planning::FactBounds,
     Planning::StoredStatisticsPlus,
+    Planning::StoredStatisticsDictionary,
     Planning::DerivedFooter,
 ];
 
@@ -272,7 +273,12 @@ proptest! {
                 FileStore { file: &value_file, offsets: value_layout.offsets.clone() },
             )
         };
-        for planning in [Planning::Facts, Planning::StoredStatistics, Planning::ScanOnly] {
+        for planning in [
+            Planning::Facts,
+            Planning::StoredStatistics,
+            Planning::StoredStatisticsDictionary,
+            Planning::ScanOnly,
+        ] {
             for threads in [1, 4] {
                 let (selector_store, value_store) = stores();
                 let stored = paged::sum_where_live_in(

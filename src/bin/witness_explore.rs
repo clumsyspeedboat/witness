@@ -359,6 +359,9 @@ fn plan_json(column: &EncodedColumn, query: Query) -> Result<String, Box<dyn Err
                 witness::access_compiler::Authorization::StoredStatistics => {
                     quote("stored_statistics")
                 }
+                witness::access_compiler::Authorization::DictionaryEntries { .. } => {
+                    quote("dictionary_entries")
+                }
             };
             object(&[
                 ("id", node.id.0.to_string()),

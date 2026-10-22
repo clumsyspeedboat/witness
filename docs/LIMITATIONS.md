@@ -177,6 +177,10 @@ These constraints are part of the result.
 - The Parquet query reference uses the current Arrow/Parquet implementation
   and explicit page-size/configuration controls. It is not every Parquet
   engine.
+- The zone-map planners run on Witness's executor with exact per-page
+  statistics. The zone map with a dictionary filter tests a page's dictionary
+  as Parquet readers test a dictionary page, but per page rather than per row
+  group, and without their Bloom filters.
 - ORC-Rust 0.8.0 does not expose outer compression in the study writer, so the
   ORC arm is labeled RLEv2 without outer compression.
 - FastLanes, BtrBlocks, LeCo, White-box Compression, and Vortex are

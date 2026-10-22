@@ -34,6 +34,7 @@ Use `cargo test --locked --all-features -- --list` for the current test inventor
 | interpreted execution | `tests/access_compiler_exec.rs` | brute-force answers and malformed-input behavior |
 | vector execution | `tests/vector.rs`, `tests/vector_validation.rs` | decoded answers, code-lane equivalence, and malformed-selection rejection |
 | paged execution | `tests/paged.rs`, `tests/paged_edge_cases.rs` | row-wise answers, checked licences, append certificates, and serial/parallel equivalence |
+| paged planners | `tests/paged_differential.rs`, `tests/paged_deletes.rs`, `tests/dictionary_skips.rs`, `tests/selective_kernels.rs`, `tests/strings.rs` | every planner, from facts to a zone map with a dictionary filter, against a scan of the rows; dictionary skips the checker re-reads |
 | chunked frames | `tests/chunked_frames.rs` | exact answers, chunk-level reads, and corruption handling |
 | generated execution | `tests/access_compiler_generated.rs` | interpreter, monomorphized control, and frozen generated Rust |
 | sidecar certificates | `tests/certificate_plans.rs` | brute-force membership with candidate refinement |
@@ -222,7 +223,7 @@ The full pipeline invokes these scripts after verifying input hashes.
 | `run_predicate_pipeline.sh` | at least 30 selector/value pairs, at least 60 logical columns, two kernels per column, exact answer agreement across four known-selection and ten complete-query arms, and all expected physical files |
 | `run_certificate_study.sh` | at least 1,700 cells, five plan classes, four query classes, and no non-scan candidate set larger than the scan domain |
 | `run_real_access.sh` | 14 columns, 178 candidates, 336 query cells, 72 storage scans, policy/query consistency, cross-policy checksum equality, and storage-counter sanity |
-| `paged_study` | exact answers across facts, zone-map, scan, and Parquet arms; no harmful checker mutant accepted |
+| `paged_study` | exact answers across facts, zone-map (plain, with shortcuts, with a dictionary filter), scan, and Parquet arms; no harmful checker mutant accepted |
 | `paged_scale_study` | exact answers against a row-wise oracle across requested thread counts |
 | `duckdb_baseline.py` | exact sum and row-count agreement with exported paged workloads before timing |
 | `claim_manifest` | fixed-seed source bootstrap, claim extraction from canonical CSV cells, and no hand-entered scalar values |

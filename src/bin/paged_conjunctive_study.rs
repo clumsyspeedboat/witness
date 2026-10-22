@@ -26,12 +26,13 @@ use common::{PAGE_ROWS, csv, direct_menu, interleaved};
 const DEFAULT_RESULT_DIR: &str = "experiments/results/paged_conjunctive";
 const THREADS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 /// Every planner, timed in interleaved rounds so drift falls on all alike.
-const PLANNERS: [Planning; 5] = [
+const PLANNERS: [Planning; 6] = [
     Planning::Facts,
     Planning::StoredStatistics,
     Planning::ScanOnly,
     Planning::FactBounds,
     Planning::StoredStatisticsPlus,
+    Planning::StoredStatisticsDictionary,
 ];
 const ROUNDS: usize = 21;
 

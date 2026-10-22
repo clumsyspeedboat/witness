@@ -14,12 +14,13 @@ use witness::access_compiler::{
     Recipe, SerializedPage, Span, encode, vector,
 };
 
-const PLANNERS: [Planning; 6] = [
+const PLANNERS: [Planning; 7] = [
     Planning::Facts,
     Planning::ScanOnly,
     Planning::StoredStatistics,
     Planning::FactBounds,
     Planning::StoredStatisticsPlus,
+    Planning::StoredStatisticsDictionary,
     Planning::DerivedFooter,
 ];
 

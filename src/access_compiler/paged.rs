@@ -63,13 +63,16 @@ struct RootFacts {
     translate: bool,
     /// A sorted dictionary holding the page's non-null values, with a gap
     /// between entries that a predicate could fall into.
-    dictionary: Option<SortedDictionary>,
+    dictionary: Option<RootDictionary>,
+    /// A dictionary holding the page's non-null values, sorted or not,
+    /// whose entries a dictionary filter tests one by one.
+    listed: Option<RootDictionary>,
 }
 
-/// A sorted, deduplicated dictionary whose entries are a page's non-null
-/// values: the page's root, or the values under a nullable root.
+/// A dictionary whose entries are a page's non-null values: the page's
+/// root, or the values under a nullable root.
 #[derive(Clone, Copy, Debug)]
-struct SortedDictionary {
+struct RootDictionary {
     node: super::NodeId,
     table: super::FieldId,
     entries: usize,
@@ -116,12 +119,19 @@ impl RootFacts {
             translate: sorted_dictionary(decoder).is_some_and(|dictionary| dictionary.node == root)
                 && facts.contains(root, FactScope::Mapping, order),
             dictionary,
+            listed: root_dictionary(decoder, false),
         })
     }
 }
 
 /// The sorted dictionary at the root of `decoder`, or under a nullable root.
-fn sorted_dictionary(decoder: &super::DecoderIr) -> Option<SortedDictionary> {
+fn sorted_dictionary(decoder: &super::DecoderIr) -> Option<RootDictionary> {
+    root_dictionary(decoder, true)
+}
+
+/// The dictionary at the root of `decoder`, or under a nullable root; with
+/// `sorted`, only one the codec tree calls sorted and unique.
+fn root_dictionary(decoder: &super::DecoderIr, sorted: bool) -> Option<RootDictionary> {
     let root = decoder.root();
     let node = match decoder.node(root).ok()? {
         DecoderNode::Nullable { values, .. } => *values,
@@ -131,9 +141,9 @@ fn sorted_dictionary(decoder: &super::DecoderIr) -> Option<SortedDictionary> {
         DecoderNode::Dictionary {
             dictionary,
             entries,
-            sorted_unique: true,
+            sorted_unique,
             ..
-        } => Some(SortedDictionary {
+        } if sorted_unique || !sorted => Some(RootDictionary {
             node,
             table: dictionary,
             entries,
@@ -589,6 +599,9 @@ pub enum Planning {
     /// A plain zone map: exact per-page minima and maxima stored by the
     /// writer, used to skip and accept pages and nothing else. It isolates
     /// what stored statistics buy on the same executor as derived facts.
+    /// Having no dictionary filter, it scans a dictionary page its
+    /// statistics cannot decide, and the scan reads the page's ids even
+    /// when no entry lies in the predicate, as any decode of them would.
     StoredStatistics,
     /// Derived bounds alone: facts skip and accept pages, but never search,
     /// translate, or use the column certificate. Against `StoredStatistics`
@@ -598,6 +611,13 @@ pub enum Planning {
     /// `Facts` uses. Against `Facts` it isolates stored against derived
     /// bounds with the shortcuts held equal.
     StoredStatisticsPlus,
+    /// A zone map's skips and accepts plus a dictionary filter, as Parquet
+    /// readers prune by a dictionary page: a page whose dictionary holds no
+    /// entry in the predicate is skipped without its ids being read. Entries
+    /// are tested one by one, so the dictionary need not be sorted, and no
+    /// other encoding fact is used. Against `StoredStatistics` it isolates
+    /// what the filter buys; against `StoredStatisticsPlus`, what order adds.
+    StoredStatisticsDictionary,
     /// Plans from bounds kept in a footer, as a zone map is, where each
     /// page's `stats` hold its derived bounds; every page the query reads
     /// re-derives its bound from those bytes and fails on a mismatch, so only
@@ -614,6 +634,7 @@ impl Planning {
             Self::StoredStatistics => "zonemap",
             Self::FactBounds => "factbounds",
             Self::StoredStatisticsPlus => "zonemapplus",
+            Self::StoredStatisticsDictionary => "zonemapdict",
             Self::DerivedFooter => "footer",
         }
     }
@@ -622,7 +643,10 @@ impl Planning {
     pub fn uses_statistics(self) -> bool {
         matches!(
             self,
-            Self::StoredStatistics | Self::StoredStatisticsPlus | Self::DerivedFooter
+            Self::StoredStatistics
+                | Self::StoredStatisticsPlus
+                | Self::StoredStatisticsDictionary
+                | Self::DerivedFooter
         )
     }
 
@@ -635,6 +659,12 @@ impl Planning {
     /// the column certificate.
     pub fn uses_shortcuts(self) -> bool {
         matches!(self, Self::Facts | Self::StoredStatisticsPlus)
+    }
+
+    /// Whether a page's dictionary entries, tested one by one, may skip a
+    /// page that the statistics cannot decide.
+    pub fn uses_dictionary_filter(self) -> bool {
+        self == Self::StoredStatisticsDictionary
     }
 }
 
@@ -685,6 +715,9 @@ pub fn plan_between_unchecked(
                     PageAction::Scan
                 }
             }
+            PageAction::Scan if planning.uses_dictionary_filter() => {
+                choose_by_entries(page, session, low, high)?
+            }
             action => action,
         }
     } else {
@@ -707,6 +740,61 @@ fn cites_dictionary_order(licence: &Licence) -> bool {
             ..
         }
     )
+}
+
+/// Whether `licence` cites a page's dictionary entries, tested one by one.
+fn cites_dictionary_entries(licence: &Licence) -> bool {
+    matches!(licence.fact, Authorization::DictionaryEntries { .. })
+}
+
+/// A skip when no entry of the page's dictionary lies in `[low, high]`, as
+/// a dictionary filter finds it: every entry is tested, so the table need
+/// not be sorted; otherwise a scan.
+fn choose_by_entries(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    low: i64,
+    high: i64,
+) -> Result<PageAction, String> {
+    if let Some(dictionary) = page.plan.listed
+        && !vector::any_entry_between(session, dictionary.table, dictionary.entries, low, high)?
+    {
+        return Ok(PageAction::Skip(Licence {
+            fact: Authorization::DictionaryEntries {
+                node: dictionary.node,
+            },
+            evidence: None,
+        }));
+    }
+    Ok(PageAction::Scan)
+}
+
+/// Confirms a skip that found no entry of the page's dictionary in `[low,
+/// high]`: the licence cites the dictionary holding the page's non-null
+/// values, and every entry is read and tested again. That needs no order;
+/// it is sound because every id was checked to lie inside its table when
+/// the page was sealed, so no stored row holds a value the table does not
+/// list. The licence records no evidence, since the whole table is re-read.
+fn check_entries_skip(
+    page: &Page,
+    session: &mut ReadSession<'_>,
+    licence: &Licence,
+    low: i64,
+    high: i64,
+) -> Result<(), String> {
+    let Authorization::DictionaryEntries { node } = licence.fact else {
+        return Err("dictionary filter skip cites no dictionary".into());
+    };
+    let dictionary = root_dictionary(&page.column.decoder, false)
+        .filter(|dictionary| dictionary.node == node)
+        .ok_or("dictionary filter skip cites no dictionary of the page")?;
+    if licence.evidence.is_some() {
+        return Err("dictionary filter skip records evidence it does not use".into());
+    }
+    if vector::any_entry_between(session, dictionary.table, dictionary.entries, low, high)? {
+        return Err("dictionary filter skip cites a table with an entry in the predicate".into());
+    }
+    Ok(())
 }
 
 fn choose_by_statistics(page: &Page, low: i128, high: i128) -> PageAction {
@@ -927,6 +1015,9 @@ pub fn check_between(
         }
         PageAction::Skip(licence) if cites_dictionary_order(licence) => {
             check_dictionary_skip(page, session, licence, predicate.0, predicate.1)
+        }
+        PageAction::Skip(licence) if cites_dictionary_entries(licence) => {
+            check_entries_skip(page, session, licence, predicate.0, predicate.1)
         }
         PageAction::Skip(licence) => match cited(page, licence)? {
             (FactScope::AllRows, ValueInvariant::AllNull) => Ok(()),
@@ -1161,8 +1252,8 @@ pub fn execute_sum_selection(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PageCounts {
     pub skipped: usize,
-    /// Of the skipped pages, those whose sorted dictionary holds no value
-    /// in the range although the page's bounds straddle it.
+    /// Of the skipped pages, those whose dictionary holds no value in the
+    /// range although the page's bounds or statistics straddle it.
     pub code_skipped: usize,
     pub accepted: usize,
     pub searched: usize,
@@ -1187,7 +1278,9 @@ impl PageCounts {
         match action {
             PageAction::Skip(licence) => {
                 self.skipped += 1;
-                self.code_skipped += usize::from(cites_dictionary_order(licence));
+                self.code_skipped += usize::from(
+                    cites_dictionary_order(licence) || cites_dictionary_entries(licence),
+                );
             }
             PageAction::Accept(_) => self.accepted += 1,
             PageAction::Search { .. } | PageAction::SearchPiecewise { .. } => self.searched += 1,
