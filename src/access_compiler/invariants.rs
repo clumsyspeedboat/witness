@@ -60,6 +60,33 @@ pub enum BoundSource {
     OffsetFromBase { base: FieldId, width: u8 },
     /// `[table[0], table[entries - 1]]`: a sorted, deduplicated dictionary.
     TableEnds { table: FieldId, entries: usize },
+    /// The hull of the child's interval and the `count` exceptions a patch
+    /// stores in `exceptions`: a patched row takes its stored exception and
+    /// every other row its child's value. The exceptions are read one by
+    /// one; a patch list is short.
+    PatchHull {
+        child: PatchedBound,
+        exceptions: FieldId,
+        count: usize,
+    },
+}
+
+/// The bound of a patch's child, which `BoundSource::PatchHull` widens by
+/// the exceptions. A patch whose child is itself patched derives no bound,
+/// so the hull nests once.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PatchedBound {
+    OffsetFromBase { base: FieldId, width: u8 },
+    TableEnds { table: FieldId, entries: usize },
+}
+
+impl From<PatchedBound> for BoundSource {
+    fn from(bound: PatchedBound) -> Self {
+        match bound {
+            PatchedBound::OffsetFromBase { base, width } => Self::OffsetFromBase { base, width },
+            PatchedBound::TableEnds { table, entries } => Self::TableEnds { table, entries },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -404,15 +431,24 @@ fn derive_node(node_id: NodeId, node: &DecoderNode, output: &mut InvariantSet) {
                 [Assumption::PositiveRunLengths],
             );
         }
-        DecoderNode::Patch { index_interval, .. } => output.insert(
-            node_id,
-            FactScope::Physical,
-            Property::Access(AccessInvariant::PatchIndex {
-                max_exceptions: *index_interval,
-            }),
-            Evidence::Structural("patch_position_index"),
-            [],
-        ),
+        DecoderNode::Patch {
+            values,
+            exceptions,
+            count,
+            index_interval,
+            ..
+        } => {
+            patch_hull(*values, node_id, *exceptions, *count, output);
+            output.insert(
+                node_id,
+                FactScope::Physical,
+                Property::Access(AccessInvariant::PatchIndex {
+                    max_exceptions: *index_interval,
+                }),
+                Evidence::Structural("patch_position_index"),
+                [],
+            );
+        }
         DecoderNode::Nullable {
             values,
             rank_interval,
@@ -524,6 +560,50 @@ fn transfer_bounds(
             parent_scope,
             Property::Value(ValueInvariant::Bounded(source)),
             evidence,
+            assumptions,
+        );
+    }
+}
+
+/// A patched node holds its child's values except at the patched rows,
+/// which hold the stored exceptions; so each child bound, widened to take in
+/// the exceptions, bounds the node, with the child's assumptions. Order does
+/// not survive a patch: an exception may fall anywhere.
+fn patch_hull(
+    child: NodeId,
+    parent: NodeId,
+    exceptions: FieldId,
+    count: usize,
+    output: &mut InvariantSet,
+) {
+    let bounds = output
+        .iter()
+        .filter(|fact| fact.node == child && fact.scope == FactScope::AllRows)
+        .filter_map(|fact| {
+            let bound = match fact.property {
+                Property::Value(ValueInvariant::Bounded(BoundSource::OffsetFromBase {
+                    base,
+                    width,
+                })) => PatchedBound::OffsetFromBase { base, width },
+                Property::Value(ValueInvariant::Bounded(BoundSource::TableEnds {
+                    table,
+                    entries,
+                })) => PatchedBound::TableEnds { table, entries },
+                _ => return None,
+            };
+            Some((bound, fact.assumptions.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (bound, assumptions) in bounds {
+        output.insert(
+            parent,
+            FactScope::AllRows,
+            Property::Value(ValueInvariant::Bounded(BoundSource::PatchHull {
+                child: bound,
+                exceptions,
+                count,
+            })),
+            Evidence::Structural("patch_exception_hull"),
             assumptions,
         );
     }

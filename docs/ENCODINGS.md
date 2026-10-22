@@ -13,7 +13,7 @@ format is legacy and is not the claim-bearing representation.
 | unsigned Delta | restart anchors + unsigned child | prefix sum per restart | segment monotonicity; global only with one segment or checked seams | same restart closure |
 | Dictionary | sorted unique i64 table + ID child | `dictionary[id]` | injective and order-preserving ID mapping | ID bytes + referenced table entries |
 | RLE | run values + u32 lengths + sparse run index | repeat each run value | run span semantics | run index + intersecting lengths + values |
-| Patch | main child + positions/index/exceptions | replace listed rows | exact exception semantics | position index + relevant positions/exceptions + main body |
+| Patch | main child + positions/index/exceptions | replace listed rows | the hull of the child's bound and the stored exceptions; no order | position index + relevant positions/exceptions + main body |
 | Nullable | validity + rank index + compact child | insert nulls around compact values | non-null ordering; full ordering depends on null placement | validity/rank + compact child |
 | Frame | one Zstd frame over child fields | unchanged after frame decode | no new value fact | entire compressed frame |
 

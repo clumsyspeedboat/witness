@@ -1,9 +1,11 @@
 use proptest::prelude::*;
+use witness::access_compiler::vector::{self, Chunk};
 use witness::access_compiler::{
-    AccessInvariant, Answer, Assumption, Authorization, CheckedInvariants, ClosureMode, DecoderIr,
-    DecoderNode, DeltaCoding, Evidence, FactScope, InputColumn, MappingInvariant, NullPlacement,
-    PlanOp, Predicate, Property, Query, Recipe, ValueInvariant, compile, derive_invariants, encode,
-    execute_interpreted,
+    AccessInvariant, Answer, Assumption, Authorization, BoundSource, CheckedInvariants,
+    ClosureMode, DecoderIr, DecoderNode, DeltaCoding, Evidence, FactScope, InputColumn,
+    InvariantFact, MappingInvariant, NullPlacement, PatchedBound, PlanOp, Predicate, Property,
+    Query, ReadSession, Recipe, Span, ValueInvariant, bound_interval, compile, derive_invariants,
+    encode, execute_interpreted,
 };
 
 fn unsigned_delta() -> Recipe {
@@ -635,4 +637,211 @@ fn a_run_index_does_not_license_a_boundary_search() {
         error.contains("does not license"),
         "unexpected error: {error}"
     );
+}
+
+fn patched(values: Recipe) -> Recipe {
+    Recipe::Patch {
+        index_interval: 4,
+        values: Box::new(values),
+    }
+}
+
+/// The root's bound facts, each evaluated from the page's bytes.
+fn root_bound_facts(
+    column: &witness::access_compiler::EncodedColumn,
+    facts: &witness::access_compiler::InvariantSet,
+) -> Vec<(InvariantFact, BoundSource, (i128, i128))> {
+    facts
+        .iter()
+        .filter(|fact| fact.node == column.decoder.root())
+        .filter_map(|fact| match fact.property {
+            Property::Value(ValueInvariant::Bounded(source)) => Some((fact.clone(), source)),
+            _ => None,
+        })
+        .map(|(fact, source)| {
+            let mut session = ReadSession::new(&column.page, ClosureMode::Selective);
+            let interval = bound_interval(&mut session, source).unwrap();
+            (fact, source, interval)
+        })
+        .collect()
+}
+
+/// Every row of the page, decoded from its bytes.
+fn decoded(column: &witness::access_compiler::EncodedColumn) -> Vec<Option<i128>> {
+    let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+    let rows = Span::new(0, column.truth.len()).unwrap();
+    let mut out = Vec::with_capacity(rows.len());
+    vector::scan(&column.decoder, &mut session, rows, &mut |_, _, chunk| {
+        match chunk {
+            Chunk::Values(values) => out.extend(values.iter().map(|&value| Some(value))),
+            Chunk::Run { value, len } => out.extend(std::iter::repeat_n(Some(value), len)),
+            Chunk::Nulls { len } => out.extend(std::iter::repeat_n(None, len)),
+        }
+        Ok(())
+    })
+    .unwrap();
+    out
+}
+
+#[test]
+fn a_patch_widens_a_frame_of_reference_bound_by_its_exceptions() {
+    let mut values = (0..1_024).map(|row| 500 + row % 37).collect::<Vec<i64>>();
+    values[3] = -40_000;
+    values[900] = 70_000;
+    let column = encode(
+        &patched(Recipe::For(Box::new(Recipe::BitPack))),
+        InputColumn::dense(values).with_patch_rows([3, 900]),
+    )
+    .unwrap();
+    let facts = facts_for(&column);
+    let bounds = root_bound_facts(&column, &facts);
+    assert_eq!(bounds.len(), 1);
+    let (fact, source, interval) = &bounds[0];
+    assert_eq!(fact.scope, FactScope::AllRows);
+    assert_eq!(fact.evidence, Evidence::Structural("patch_exception_hull"));
+    assert_eq!(fact.assumptions, [Assumption::CheckedArithmetic].into());
+    assert!(matches!(
+        source,
+        BoundSource::PatchHull {
+            child: PatchedBound::OffsetFromBase { .. },
+            count: 2,
+            ..
+        }
+    ));
+    assert_eq!(*interval, (-40_000, 70_000));
+}
+
+#[test]
+fn a_patch_over_a_sorted_dictionary_widens_its_table_ends() {
+    let mut values = (0..512).map(|row| row % 5).collect::<Vec<i64>>();
+    values[100] = 1_000;
+    let column = encode(
+        &patched(Recipe::Dictionary(Box::new(Recipe::BitPack))),
+        InputColumn::dense(values).with_patch_rows([100]),
+    )
+    .unwrap();
+    let facts = facts_for(&column);
+    let bounds = root_bound_facts(&column, &facts);
+    assert_eq!(bounds.len(), 1);
+    let (fact, source, interval) = &bounds[0];
+    assert_eq!(
+        fact.assumptions,
+        [Assumption::SortedUniqueDictionary].into()
+    );
+    assert!(matches!(
+        source,
+        BoundSource::PatchHull {
+            child: PatchedBound::TableEnds { entries: 5, .. },
+            ..
+        }
+    ));
+    assert_eq!(*interval, (0, 1_000));
+}
+
+#[test]
+fn a_patch_over_an_unbounded_child_derives_no_bound() {
+    let column = encode(
+        &patched(Recipe::BitPack),
+        InputColumn::dense((0..256).collect()).with_patch_rows([7]),
+    )
+    .unwrap();
+    let facts = facts_for(&column);
+    assert!(root_bound_facts(&column, &facts).is_empty());
+}
+
+#[test]
+fn order_does_not_survive_a_patch() {
+    // The child is an unsigned delta chain over the regular values, so it
+    // proves order structurally; the exception breaks it at the root.
+    let mut values = (0..1_024).collect::<Vec<i64>>();
+    values[512] = -1;
+    let column = encode(
+        &patched(unsigned_delta()),
+        InputColumn::dense(values).with_patch_rows([512]),
+    )
+    .unwrap();
+    let facts = derive_invariants(
+        &column.decoder,
+        column.page.layout(),
+        CheckedInvariants::default(),
+    )
+    .unwrap();
+    let root = column.decoder.root();
+    let DecoderNode::Patch { values: child, .. } = *column.decoder.node(root).unwrap() else {
+        panic!("the root is the patch");
+    };
+    assert!(facts.contains(
+        child,
+        FactScope::AllRows,
+        Property::Value(ValueInvariant::NonDecreasing),
+    ));
+    for property in [
+        ValueInvariant::NonDecreasing,
+        ValueInvariant::PiecewiseNonDecreasing { max_rows: 1_024 },
+    ] {
+        for scope in [FactScope::AllRows, FactScope::NonNullRows] {
+            assert!(!facts.contains(root, scope, Property::Value(property)));
+        }
+    }
+}
+
+proptest! {
+    #[test]
+    fn every_patch_bound_encloses_every_decoded_value(
+        values in prop::collection::vec(-1_000_i64..1_000, 1..400),
+        outliers in prop::collection::vec((0_usize..400, any::<i64>()), 0..12),
+        null_stride in 0_usize..7,
+        shape in 0_usize..5,
+    ) {
+        let mut optional = values.iter().copied().map(Some).collect::<Vec<_>>();
+        let mut rows = std::collections::BTreeSet::new();
+        for &(row, value) in &outliers {
+            if row < optional.len() {
+                optional[row] = Some(value);
+                rows.insert(row);
+            }
+        }
+        if null_stride > 1 {
+            for (row, value) in optional.iter_mut().enumerate() {
+                if row % null_stride == 1 {
+                    *value = None;
+                }
+            }
+        }
+        if optional.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        let for_bp = || Recipe::For(Box::new(Recipe::BitPack));
+        let dense = match shape {
+            0 => patched(for_bp()),
+            1 => patched(Recipe::Dictionary(Box::new(Recipe::BitPack))),
+            2 => patched(Recipe::Rle { index_interval: 4, values: Box::new(for_bp()) }),
+            3 => Recipe::Frame(Box::new(patched(for_bp()))),
+            _ => Recipe::Rle { index_interval: 4, values: Box::new(patched(for_bp())) },
+        };
+        let recipe = if optional.iter().any(Option::is_none) {
+            Recipe::Nullable { rank_interval: 16, values: Box::new(dense) }
+        } else {
+            dense
+        };
+        // The exceptions are stored whole, so any outlier encodes.
+        let column = encode(
+            &recipe,
+            InputColumn::nullable(optional.clone()).with_patch_rows(rows),
+        )
+        .unwrap();
+        let decoded = decoded(&column);
+        let truth = optional.iter().map(|value| value.map(i128::from)).collect::<Vec<_>>();
+        prop_assert_eq!(&decoded, &truth);
+        let facts = facts_for(&column);
+        let bounds = root_bound_facts(&column, &facts);
+        if shape != 4 {
+            prop_assert!(!bounds.is_empty(), "a patched page keeps its child's bound");
+        }
+        for (fact, _, (low, high)) in bounds {
+            for value in decoded.iter().flatten() {
+                prop_assert!(low <= *value && *value <= high, "{:?} misses {}", fact, value);
+            }
+        }
+    }
 }

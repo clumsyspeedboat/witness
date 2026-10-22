@@ -30,7 +30,7 @@ pub use codegen::generate_rust_module;
 pub use compiler::compile;
 pub use cost_model::{CostFeatures, CostModel, CostObservation};
 pub use decoder::{DecoderIr, DecoderNode, DeltaCoding};
-pub use encode::{EncodedColumn, InputColumn, Recipe, encode};
+pub use encode::{EncodedColumn, InputColumn, Recipe, encode, patch_outliers};
 pub use format::{CheckedInvariants, SerializedPage};
 pub use heldout::{DataProfile, HeldoutCase, heldout_cases, input_for, primitive_rule_fingerprint};
 pub use ids::{FieldId, FrameId, NodeId, PlanNodeId};
@@ -40,7 +40,7 @@ pub use interpreter::{
 };
 pub use invariants::{
     AccessInvariant, Assumption, BoundSource, Evidence, FactScope, InvariantFact, InvariantSet,
-    MappingInvariant, NullPlacement, Property, ValueInvariant, derive_invariants,
+    MappingInvariant, NullPlacement, PatchedBound, Property, ValueInvariant, derive_invariants,
 };
 pub use layout::{
     AccessSet, ByteClosure, DependencyRule, FieldLayout, FieldLocation, FrameCodec, FrameLayout,

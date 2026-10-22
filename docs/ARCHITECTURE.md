@@ -153,7 +153,14 @@ Value bounds come from fields the decoder already needs. A frame-of-reference
 base over unsigned codes of at most `w` bits bounds every value by
 `[base, base + 2^w - 1]`; a sorted, deduplicated dictionary bounds every value
 by its first and last entries. Run-length and nullable parents keep their
-child's bounds, while patches and deltas derive none. `bound_interval` reads a
+child's bounds. A patched page holds its child's values except at the patched
+rows, which hold the stored exceptions, so the hull of the child's bound and
+the exceptions bounds it (`BoundSource::PatchHull`, evidence
+`patch_exception_hull`, with the child's assumptions); reading it reads the
+child's bound fields and the exception field, which a patch keeps short. A
+patch over an unbounded child, or over another patch, derives no bound, and
+no order passes through a patch: an exception may fall anywhere. Deltas
+derive no bound. `bound_interval` reads a
 bound through the read session, so consulting it is accounted. The census
 re-checks every derived bound against the decoded values.
 

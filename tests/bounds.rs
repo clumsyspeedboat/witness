@@ -120,8 +120,10 @@ fn run_length_and_nullable_parents_keep_child_bounds() {
 }
 
 #[test]
-fn patches_and_deltas_prove_no_bound() {
-    let input = values(10_000, 13);
+fn a_patch_widens_its_child_bound_by_its_exceptions() {
+    let mut input = values(10_000, 13);
+    input[17] = Some(-1_000_000);
+    input[4_000] = Some(9_000_000);
     let patched = encode(
         &Recipe::Patch {
             index_interval: 32,
@@ -130,10 +132,18 @@ fn patches_and_deltas_prove_no_bound() {
         InputColumn::nullable(input.clone()).with_patch_rows([17, 4_000]),
     )
     .unwrap();
-    assert!(
-        root_bounds(&patched).is_empty(),
-        "one exception can escape any bound"
-    );
+    let bounds = root_bounds(&patched);
+    assert_eq!(bounds.len(), 1);
+    let (scope, source, (low, high)) = bounds[0];
+    assert_eq!(scope, FactScope::AllRows);
+    assert!(matches!(source, BoundSource::PatchHull { count: 2, .. }));
+    assert_eq!(low, -1_000_000, "the low exception is the minimum");
+    assert_eq!(high, 9_000_000, "the high exception is the maximum");
+}
+
+#[test]
+fn deltas_prove_no_bound() {
+    let input = values(10_000, 13);
     let delta = encode(
         &Recipe::Delta {
             restart_interval: 256,

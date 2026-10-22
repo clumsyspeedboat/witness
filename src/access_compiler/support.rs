@@ -187,6 +187,20 @@ pub fn bound_interval(
                 i128::from(session.read_i64(table, entries - 1)?),
             ))
         }
+        BoundSource::PatchHull {
+            child,
+            exceptions,
+            count,
+        } => {
+            let (low, high) = bound_interval(session, child.into())?;
+            Ok(session
+                .read_i64_values(exceptions, 0, count)?
+                .into_iter()
+                .map(i128::from)
+                .fold((low, high), |(low, high), value| {
+                    (low.min(value), high.max(value))
+                }))
+        }
     }
 }
 
