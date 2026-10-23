@@ -20,11 +20,11 @@ These constraints are part of the result.
   The separate paged study compares complete queries across multiple pages;
   its medians summarize the fixed workload rather than a population sample.
 - Access-ready Witness versus the Parquet boundary-search path has source
-  median 0.15x with a 95% bootstrap interval [0.08, 0.17]. The interval sits
+  median 0.15x with a 95% bootstrap interval [0.08, 0.16]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
-  (families, then sources within each) gives [0.06, 0.29]. Collapsing each
-  family to a single draw instead gives 0.27x [0.10, 1.15], which spans parity,
+  (families, then sources within each) gives [0.06, 0.27]. Collapsing each
+  family to a single draw instead gives 0.25x [0.09, 1.15], which spans parity,
   but that weights a one-column family like a ten-column one and the singleton
   families are the worst cases. Distribution-free, 9 of the 12 families favour
   the compiled plan: a Wilcoxon signed-rank test on the log ratios gives a
@@ -68,7 +68,7 @@ These constraints are part of the result.
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.30x a full read; coalescing issued 119 calls and reached 1.00x. This is a
+  1.29x a full read; coalescing issued 119 calls and reached 1.00x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is

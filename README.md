@@ -67,7 +67,7 @@ cells over **32** sources at 131,072 rows per column.
 | non-decreasing, constant columns included | **10.4%** of columns |
 | where evidence exists and is reachable | **0.15x** a sortedness-aware Parquet reference |
 | price of keeping that access | **2.10x** the bytes |
-| cold disk, fewest-bytes plan | **1.30x** slower than reading the whole file (1,083 scattered reads against one) |
+| cold disk, fewest-bytes plan | **1.29x** slower than reading the whole file (1,083 scattered reads against one) |
 
 The paged study ([`experiments/results/paged_study/`](experiments/results/paged_study/))
 runs **1,166** selective SUM queries over 364 column pairs paged at 16,384 rows,
@@ -81,17 +81,17 @@ them on TPC-H SF10 lineitem on 1 to 64 threads.
 | | |
 |---|---|
 | paged queries against the faster Parquet read (with or without its page index) | **0.40x** the time (median) |
-| the same queries against DuckDB on its own storage, one thread | **0.58x** the time (median) |
-| planned from facts against an exact stored zone map, same executor | **0.94x** the time (geometric mean) |
+| the same queries against DuckDB on its own storage, one thread | **0.57x** the time (median) |
+| planned from facts against an exact stored zone map, same executor | **0.95x** the time (geometric mean) |
 | string range and prefix predicates against the zone map, same executor | **0.62x** the time (geometric mean) |
-| string and float predicates against DuckDB, one thread | **0.12x** and **0.26x** the time (median) |
-| TPC-H Q6 on SF10 lineitem against DuckDB, one thread | **0.77x** the time (0.71–0.77x across runs) |
+| string and float predicates against DuckDB, one thread | **0.12x** and **0.25x** the time (median) |
+| TPC-H Q6 on SF10 lineitem against DuckDB, one thread | **0.71x** the time (0.71–0.73x across runs) |
 | page skips that bounds read from encodings recover | **96.5%** of what stored min/max allow |
 | pages skipped beyond an exact zone map, where a sorted dictionary holds no value in the range | **25%** more |
 | a tenth of the rows deleted at random, every plan unchanged | **1.04x** the time (median), every answer exact |
 | queries a zone map with a neighbour's or truncated statistics answers wrongly | **88** and **645** of 1,166; planned from facts, none |
-| mutated plans that would answer wrongly, rejected by the checker | **441,167** of 441,167 |
-| sorted key, 0.1% of 60 M rows, one thread | **0.04 ms** against Parquet's 0.28–0.31 ms across runs |
+| mutated plans that would answer wrongly, rejected by the checker | **484,951** of 484,951 |
+| sorted key, 0.1% of 60 M rows, one thread | **0.04 ms** against Parquet's 0.28–0.28 ms across runs |
 
 Derived knowledge helps when it is present, cheap to reach, and not erased by the
 storage layer beneath it. A plain scan was always correct anyway.

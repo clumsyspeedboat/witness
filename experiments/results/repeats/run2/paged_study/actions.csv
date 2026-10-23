@@ -14,11 +14,11 @@ recipe,action,pages
 "FOR(BitPack)",search,41
 "FOR(BitPack)",skip,1505
 "Nullable(BitPack)",skip,796
-"Nullable(Dictionary(BitPack))",scan,3069
 "Nullable(Dictionary(BitPack))",skip,88
 "Nullable(Dictionary(BitPack))",skip_codes,50
-"Nullable(Dictionary(RLE(BitPack)))",scan,325
+"Nullable(Dictionary(BitPack))",translate,3069
 "Nullable(Dictionary(RLE(BitPack)))",skip_codes,1
+"Nullable(Dictionary(RLE(BitPack)))",translate,325
 "Nullable(FOR(BitPack))",accept,43
 "Nullable(FOR(BitPack))",scan,8887
 "Nullable(FOR(BitPack))",skip,74
