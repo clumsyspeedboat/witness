@@ -1,0 +1,25 @@
+evidence layout: 24 pairs from 24 sources, loaded in 157.6s
+pair 1/24: hits/c53_IsDownload_x1 (development), elapsed 168.2s
+pair 2/24: CommonGovernment_1/c24_fk_rec_mat_x1 (development), elapsed 172.4s
+pair 3/24: Physicians_1/c5_bene_unique_cnt_x1 (development), elapsed 186.4s
+pair 4/24: RealEstate2_1/c4_Date_of_Transfer_timestamp (development), elapsed 192.9s
+pair 5/24: TrainsUK2_1/c18_TSC_x1 (development), elapsed 204.7s
+pair 6/24: catalog_returns/c22_cr_return_ship_cost_x100 (development), elapsed 207.4s
+pair 7/24: web_returns/c7_wr_returning_customer_sk_x1 (development), elapsed 209.8s
+pair 8/24: lineitem/c11_l_commitdate_timestamp (development), elapsed 226.5s
+pair 9/24: uci_household_power/sub_metering_2_x1 (heldout), elapsed 235.7s
+pair 10/24: Arade_1/c2_F3_timestamp (heldout), elapsed 240.4s
+pair 11/24: Corporations_1/c21_score_x1 (heldout), elapsed 249.2s
+pair 12/24: Food_1/c4_subscribers_x1 (heldout), elapsed 257.3s
+pair 13/24: HashTags_1/c75_Contains_TheNeighbors_copy_2_x1 (heldout), elapsed 258.1s
+pair 14/24: MedPayment1_1/c5_bene_unique_cnt_x1 (heldout), elapsed 272.0s
+pair 15/24: Medicare2_1/c8_line_srvc_cnt_x1 (heldout), elapsed 285.0s
+pair 16/24: Motos_1/c16_FECHA_timestamp (heldout), elapsed 288.7s
+pair 17/24: PanCreactomy1_1/c3_BENE_DAY_SRVC_CNT_x1 (heldout), elapsed 302.2s
+pair 18/24: Redfin1_1/c12_median_dom_mom_x10 (heldout), elapsed 313.0s
+pair 19/24: Redfin4_1/c35_period_end_timestamp (heldout), elapsed 318.3s
+pair 20/24: SalariesFrance_1/c6_ADECCO_NB_CANDIDATS_x1 (heldout), elapsed 328.0s
+pair 21/24: Uberlandia_1/c15_cod_ibge_da_ue_x1 (heldout), elapsed 333.7s
+pair 22/24: YaleLanguages_1/c14_ID1_x1 (heldout), elapsed 341.1s
+pair 23/24: date_dim/c12_d_fy_quarter_seq_x1 (heldout), elapsed 343.1s
+pair 24/24: time_dim/c2_t_time_x1 (heldout), elapsed 345.4s

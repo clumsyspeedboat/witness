@@ -47,7 +47,7 @@ The eight stages are:
 | 3 | Bloom, min/max, and sparse-fence controls |
 | 4 | logical, delivered, and transferred access measurements |
 | 5 | paged queries (facts, zone map, scan) against Parquet and DuckDB, checker and attestation fault injection, the untimed direct against byte-optimised menu study, 4 Ki and 64 Ki page sizes, and 60 M-row thread scaling |
-| 6 | auxiliary-plan measurements and neutral claim manifest |
+| 6 | self-contained reader and synthetic ordered-region measurements, auxiliary plans, and claim manifest |
 | 7 | generated kernels, physical toy artifacts, and walkthrough |
 | 8 | host provenance and input/output checksums |
 
@@ -58,6 +58,36 @@ the committed canonical CSVs preserve the exact environment-specific values
 reported by the study.
 
 ## Supporting diagnostics
+
+The [native reader and ordered-region study](NATIVE_FILES.md) supplies the
+manuscript's explicitly scoped extension claims from
+`experiments/results/native_reader/confirmed/`. Full remeasurement runs it in
+a fresh directory during stage 6, validates its exports, and then refreshes
+that canonical directory before regenerating claims. Its CSVs are included
+in stage 8's checksum manifest. To run an additional diagnostic without
+replacing the confirmed inputs:
+
+```bash
+WITNESS_NATIVE_RESULT_DIR=experiments/results/native_reader/NEW_RUN \
+  cargo run --locked --release --features experiment --bin native_reader_study
+```
+
+The evidence-layout pilot compares compression around whole compositions with
+compression of packed streams only, with and without 4 KiB chunks:
+
+```bash
+./experiments/run_evidence_layout.sh --smoke
+./experiments/run_evidence_layout.sh
+python3 -m unittest discover -s tests -p test_evidence_layout_summary.py
+```
+
+It uses a fixed development/held-out source split and writes to a new directory
+under `experiments/results/evidence_layout/`. Its frozen promotion rule,
+matched codec controls, timing scope, and output definitions are documented in
+[`src/bin/evidence_layout/README.md`](../src/bin/evidence_layout/README.md).
+Set `WITNESS_EVIDENCE_CPU` to select the query worker's CPU. The runner takes
+a cooperative lock and pins that worker; unrelated host jobs can still contend
+for hardware. The pilot does not feed the claim manifest.
 
 ```bash
 make diagnostics
@@ -106,6 +136,7 @@ uses 16,384.
 | `paged_study/menus.csv` | untimed menu study: per pair, under the direct and the byte-optimised menu, the compositions chosen, selector pages with a derived bound and with order from their bytes or from the writer, page actions under facts and a zone map, and bytes against Zstd Parquet |
 | `paged_scale/*.csv` | large-column queries and thread scaling |
 | `duckdb/*.csv` | checked DuckDB answers, timings, scan counts, and version |
+| `native_reader/confirmed/*.csv` | resident reader initialization/storage and synthetic regional query timings |
 | `experiments/generated/` | frozen generated Rust kernels |
 | `docs/generated/` | worked example, exact layouts, and tiny artifacts |
 

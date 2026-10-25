@@ -9,6 +9,8 @@ pub mod access_real;
 pub mod datasets;
 /// Deterministic five-column example used to generate the public walkthrough.
 pub mod documentation;
+/// Compression placements that leave codec evidence directly readable.
+pub mod evidence_layout;
 /// Source-aware semantic, mapping, and physical invariant census.
 pub mod invariant_census;
 /// Self-contained physical artifacts used by the canonical study.

@@ -23,7 +23,7 @@ pub fn execute_interpreted(
     query: &Query,
     mode: ClosureMode,
 ) -> Result<Execution, String> {
-    validate_query(column.truth.len(), query)?;
+    validate_query(column.len(), query)?;
     let mut session = ReadSession::new(&column.page, mode);
     load_metadata(&column.page, &mut session)?;
     let mut decoded_rows = 0;
@@ -40,18 +40,18 @@ pub fn execute_full_decode(
     query: &Query,
     mode: ClosureMode,
 ) -> Result<Execution, String> {
-    validate_query(column.truth.len(), query)?;
+    validate_query(column.len(), query)?;
     let mut session = ReadSession::new(&column.page, mode);
     load_metadata(&column.page, &mut session)?;
-    let mut values = Vec::with_capacity(column.truth.len());
-    for row in 0..column.truth.len() {
+    let mut values = Vec::with_capacity(column.len());
+    for row in 0..column.len() {
         values.push(get(column, column.decoder.root(), row, &mut session)?);
     }
     let answer = query_materialized(&values, query)?;
     Ok(Execution {
         answer,
         metrics: session.metrics(),
-        decoded_rows: column.truth.len(),
+        decoded_rows: column.len(),
     })
 }
 
@@ -60,7 +60,7 @@ pub fn execute_fused_decode(
     query: &Query,
     mode: ClosureMode,
 ) -> Result<Execution, String> {
-    validate_query(column.truth.len(), query)?;
+    validate_query(column.len(), query)?;
     let mut session = ReadSession::new(&column.page, mode);
     load_metadata(&column.page, &mut session)?;
     let mut decoded_rows = 0;
@@ -120,7 +120,7 @@ fn execute_rows(
         Query::Get { row } => {
             if full_stream {
                 let mut answer = None;
-                for current in 0..column.truth.len() {
+                for current in 0..column.len() {
                     let value = get(column, column.decoder.root(), current, session)?;
                     if current == row {
                         answer = Some(value);
@@ -140,7 +140,7 @@ fn execute_rows(
         }
         Query::Sum { rows } => {
             let domain = if full_stream {
-                Span::new(0, column.truth.len())?
+                Span::new(0, column.len())?
             } else {
                 rows
             };
@@ -159,7 +159,7 @@ fn execute_rows(
         }
         Query::Between { rows, low, high } => {
             let domain = if full_stream {
-                Span::new(0, column.truth.len())?
+                Span::new(0, column.len())?
             } else {
                 rows
             };
@@ -180,7 +180,7 @@ fn execute_rows(
             predicate: Predicate::Between { low, high },
         } => filter_between(
             column,
-            Span::new(0, column.truth.len())?,
+            Span::new(0, column.len())?,
             low,
             high,
             session,
@@ -190,7 +190,7 @@ fn execute_rows(
             predicate: Predicate::Equals { value },
         } => filter_equals(
             column,
-            Span::new(0, column.truth.len())?,
+            Span::new(0, column.len())?,
             value,
             session,
             decoded_rows,
@@ -199,7 +199,7 @@ fn execute_rows(
             predicate: Predicate::Equals { value },
         } => count_matching(
             column,
-            Span::new(0, column.truth.len())?,
+            Span::new(0, column.len())?,
             move |candidate| candidate == value,
             session,
             decoded_rows,
@@ -208,7 +208,7 @@ fn execute_rows(
             predicate: Predicate::Between { low, high },
         } => count_matching(
             column,
-            Span::new(0, column.truth.len())?,
+            Span::new(0, column.len())?,
             move |candidate| low <= candidate && candidate <= high,
             session,
             decoded_rows,

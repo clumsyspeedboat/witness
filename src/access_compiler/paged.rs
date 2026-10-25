@@ -43,7 +43,7 @@ pub struct Page {
 
 impl Page {
     pub fn rows(&self) -> usize {
-        self.column.truth.len()
+        self.column.len()
     }
 
     /// What the reader found when it checked the order of the page's sorted
@@ -310,7 +310,7 @@ pub fn check_dictionaries(column: &EncodedColumn) -> Result<bool, String> {
         return Ok(true);
     }
     let sorted = dictionaries_sorted(column)?;
-    let rows = column.truth.len();
+    let rows = column.len();
     let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
     vector::scan(
         &column.decoder,
@@ -330,6 +330,15 @@ pub struct PagedColumn {
     /// Leading pages that are each non-decreasing and whose seams never
     /// decrease: the column's checked order certificate, kept by `append`.
     ordered_pages: usize,
+    /// Opt-in certificates for maximal dense ordered regions. Uncertified
+    /// gaps retain page-by-page planning; appends never reorder rows.
+    ordered_regions: Option<Vec<Span>>,
+}
+
+pub(crate) struct PageParts {
+    pub column: EncodedColumn,
+    pub stats: Option<(i128, i128)>,
+    pub non_null: usize,
 }
 
 impl PagedColumn {
@@ -342,6 +351,7 @@ impl PagedColumn {
             page_rows,
             rows: 0,
             ordered_pages: 0,
+            ordered_regions: None,
         })
     }
 
@@ -405,6 +415,7 @@ impl PagedColumn {
                 order_verified: OnceLock::new(),
             });
             self.rows += chunk.len();
+            self.extend_region(self.pages.len() - 1);
         }
         Ok(())
     }
@@ -415,47 +426,196 @@ impl PagedColumn {
         !self.pages.is_empty() && self.ordered_pages == self.pages.len()
     }
 
+    /// Retains independent order certificates across broken seams and
+    /// unordered pages. This is opt-in so the canonical planner is unchanged.
+    pub fn enable_ordered_regions(&mut self) {
+        self.ordered_regions = Some(Vec::new());
+        for index in 0..self.pages.len() {
+            self.extend_region(index);
+        }
+    }
+
+    pub fn disable_ordered_regions(&mut self) {
+        self.ordered_regions = None;
+    }
+
+    /// Certified page-index ranges, not logical row ranges.
+    pub fn ordered_regions(&self) -> &[Span] {
+        self.ordered_regions.as_deref().unwrap_or_default()
+    }
+
+    fn extend_region(&mut self, index: usize) {
+        let Some(regions) = &mut self.ordered_regions else {
+            return;
+        };
+        let Some((first, last)) = self.pages[index].ends else {
+            return;
+        };
+        if first > last {
+            return;
+        }
+        if let Some(previous) = regions.last_mut()
+            && previous.end == index
+            && self.pages[index - 1]
+                .ends
+                .is_some_and(|(_, end)| end <= first)
+        {
+            previous.end += 1;
+        } else {
+            regions.push(Span::new(index, index + 1).expect("one page"));
+        }
+    }
+
+    /// Candidate page ranges under the enabled certificates. Uncertified
+    /// pages are always retained. Boundary confirmations use page bytes.
+    pub fn candidate_page_ranges(&self, low: i128, high: i128) -> Result<Vec<Span>, String> {
+        if low > high {
+            return Err("BETWEEN needs low <= high".into());
+        }
+        let candidates = self.candidates_in(&InMemory, low, high)?;
+        let mut ranges = Vec::new();
+        for offset in 0..candidates.len() {
+            let index = candidates.at(offset);
+            push_range(&mut ranges, index, index + 1);
+        }
+        Ok(ranges)
+    }
+
+    /// Constructs a resident column from independently parsed page bytes and
+    /// codec descriptions. No writer oracle or serialized fact set is used.
+    pub(crate) fn from_encoded_pages(
+        page_rows: usize,
+        pages: Vec<PageParts>,
+    ) -> Result<Self, String> {
+        let mut result = Self::new(page_rows)?;
+        for PageParts {
+            column,
+            stats,
+            non_null,
+        } in pages
+        {
+            if !dictionaries_sorted(&column)? {
+                return Err("native dictionary is not sorted as declared".into());
+            }
+            let rows = column.len();
+            if rows == 0 || rows > page_rows || non_null > rows || stats.is_some() != (non_null > 0)
+            {
+                return Err("native page shape or statistics are inconsistent".into());
+            }
+            let facts = derive_invariants(
+                &column.decoder,
+                column.page.layout(),
+                column.page.invariants(),
+            )?;
+            let ends = if facts.contains(
+                column.decoder.root(),
+                FactScope::AllRows,
+                Property::Value(ValueInvariant::NonDecreasing),
+            ) {
+                let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
+                vector::get(&column.decoder, &mut session, 0)?.zip(vector::get(
+                    &column.decoder,
+                    &mut session,
+                    rows - 1,
+                )?)
+            } else {
+                None
+            };
+            let plan = RootFacts::gather(&column, &facts)?;
+            let order_verified = if plan.ordered.is_some() {
+                OnceLock::from(true)
+            } else {
+                OnceLock::new()
+            };
+            result.pages.push(Page {
+                start: result.rows,
+                column,
+                facts,
+                ends,
+                stats,
+                non_null,
+                plan,
+                order_verified,
+            });
+            result.rows = result
+                .rows
+                .checked_add(rows)
+                .ok_or("native column row count overflow")?;
+        }
+        result.recertify();
+        Ok(result)
+    }
+
     /// Pages that can hold a value in `[low, high]` when the column is
     /// ordered: everything before the first page ending at or above `low`
     /// and after the last page starting at or below `high` holds none. The
     /// pages just outside the range are re-read to confirm the boundary.
-    fn candidate_pages(&self, low: i128, high: i128) -> Result<Option<(usize, usize)>, String> {
-        self.candidate_pages_in(&InMemory, low, high)
-    }
-
-    /// `candidate_pages`, confirming the boundary pages from `store`.
-    fn candidate_pages_in(
+    fn candidates_in(
         &self,
         store: &dyn PageStore,
         low: i128,
         high: i128,
-    ) -> Result<Option<(usize, usize)>, String> {
-        if !self.ordered() {
-            return Ok(None);
+    ) -> Result<PageCandidates, String> {
+        if self.ordered() {
+            return self.search_region(store, Span::new(0, self.pages.len())?, low, high);
         }
+        let Some(regions) = &self.ordered_regions else {
+            return Ok(PageCandidates::all(self.pages.len()));
+        };
+        let mut selected = Vec::new();
+        let mut reads = PageCounts::default();
+        let mut previous = 0;
+        for &region in regions {
+            selected.extend(previous..region.start);
+            let found = self.search_region(store, region, low, high)?;
+            selected.extend(found.range.start..found.range.end);
+            reads.add(&found.reads);
+            previous = region.end;
+        }
+        selected.extend(previous..self.pages.len());
+        Ok(PageCandidates {
+            range: Span::new(0, 0)?,
+            selected: Some(selected),
+            reads,
+        })
+    }
+
+    fn search_region(
+        &self,
+        store: &dyn PageStore,
+        region: Span,
+        low: i128,
+        high: i128,
+    ) -> Result<PageCandidates, String> {
         // `append` extends the ordered prefix only with pages that have ends,
         // and seams never decrease, so both page ends are sorted.
-        let first = self
-            .pages
-            .partition_point(|page| page.ends.is_some_and(|(_, last)| last < low));
-        let end = self
-            .pages
-            .partition_point(|page| page.ends.is_some_and(|(start, _)| start <= high));
-        // The two confirming reads go through `store`; they are not added to
-        // a query's I/O counts, being two reads however large the column.
-        let confirm = |index: usize, row_of: fn(&Page) -> usize| -> Result<i128, String> {
+        let first = region.start
+            + self.pages[region.start..region.end]
+                .partition_point(|page| page.ends.is_some_and(|(_, last)| last < low));
+        let end = region.start
+            + self.pages[region.start..region.end]
+                .partition_point(|page| page.ends.is_some_and(|(start, _)| start <= high));
+        let mut reads = PageCounts::default();
+        // Up to two confirming reads per region, included in I/O accounting.
+        let mut confirm = |index: usize, row_of: fn(&Page) -> usize| -> Result<i128, String> {
             let page = &self.pages[index];
             let mut session = store.session(page, index, Access::Plan)?;
-            vector::get(&page.column.decoder, &mut session, row_of(page))?
-                .ok_or_else(|| "ordered page holds a null".into())
+            let value = vector::get(&page.column.decoder, &mut session, row_of(page))?
+                .ok_or_else(|| "ordered page holds a null".to_string())?;
+            reads.account(&session);
+            Ok(value)
         };
-        if first > 0 && confirm(first - 1, |page| page.rows() - 1)? >= low {
+        if first > region.start && confirm(first - 1, |page| page.rows() - 1)? >= low {
             return Err("column order certificate disagrees with its pages".into());
         }
-        if end < self.pages.len() && confirm(end, |_| 0)? <= high {
+        if end < region.end && confirm(end, |_| 0)? <= high {
             return Err("column order certificate disagrees with its pages".into());
         }
-        Ok(Some((first, end.max(first))))
+        Ok(PageCandidates {
+            range: Span::new(first, end.max(first))?,
+            selected: None,
+            reads,
+        })
     }
 
     pub fn pages(&self) -> &[Page] {
@@ -487,6 +647,66 @@ impl PagedColumn {
             .iter()
             .map(|page| page.column.page.bytes().len())
             .sum()
+    }
+}
+
+/// A contiguous range for the original fast path, or sparse candidates for
+/// independent ordered regions. Both keep column row alignment unchanged.
+struct PageCandidates {
+    range: Span,
+    selected: Option<Vec<usize>>,
+    reads: PageCounts,
+}
+
+impl PageCandidates {
+    fn all(pages: usize) -> Self {
+        Self {
+            range: Span::new(0, pages).expect("page range"),
+            selected: None,
+            reads: PageCounts::default(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.selected.as_ref().map_or(self.range.len(), Vec::len)
+    }
+
+    fn at(&self, offset: usize) -> usize {
+        self.selected
+            .as_ref()
+            .map_or_else(|| self.range.start + offset, |pages| pages[offset])
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        let mut reads = self.reads;
+        reads.add(&other.reads);
+        if self.selected.is_none() && other.selected.is_none() {
+            let first = self.range.start.max(other.range.start);
+            let end = self.range.end.min(other.range.end).max(first);
+            return Self {
+                range: Span::new(first, end).expect("intersection"),
+                selected: None,
+                reads,
+            };
+        }
+        let (mut a, mut b) = (0, 0);
+        let mut selected = Vec::new();
+        while a < self.len() && b < other.len() {
+            match self.at(a).cmp(&other.at(b)) {
+                std::cmp::Ordering::Less => a += 1,
+                std::cmp::Ordering::Greater => b += 1,
+                std::cmp::Ordering::Equal => {
+                    selected.push(self.at(a));
+                    a += 1;
+                    b += 1;
+                }
+            }
+        }
+        Self {
+            range: Span::new(0, 0).expect("empty range"),
+            selected: Some(selected),
+            reads,
+        }
     }
 }
 
@@ -1765,14 +1985,13 @@ fn sum_where_with(
     // match; every page outside it is skipped without being planned.
     // The order certificate is a derived fact; planners without the
     // encoding's shortcuts consult every page.
-    let (first, end) = if planning.uses_shortcuts() {
-        selector
-            .candidate_pages_in(selector_store, i128::from(low), i128::from(high))?
-            .unwrap_or((0, selector.pages.len()))
+    let candidates = if planning.uses_shortcuts() {
+        selector.candidates_in(selector_store, i128::from(low), i128::from(high))?
     } else {
-        (0, selector.pages.len())
+        PageCandidates::all(selector.pages.len())
     };
-    counts.skipped += selector.pages.len() - (end - first);
+    counts.add(&candidates.reads);
+    counts.skipped += selector.pages.len() - candidates.len();
     if selector
         .pages
         .iter()
@@ -1784,8 +2003,8 @@ fn sum_where_with(
     if selector_store.plans_from_page_reads() {
         // Each candidate page is read once: planned from that read, and
         // executed from it unless its plan skips it.
-        let page_results = run_pages(end - first, threads, |offset| {
-            let index = first + offset;
+        let page_results = run_pages(candidates.len(), threads, |offset| {
+            let index = candidates.at(offset);
             let selector_page = &selector.pages[index];
             let mut session = selector_store.session(selector_page, index, Access::Execute)?;
             let action = plan_between(selector_page, &mut session, low, high, planning)?;
@@ -1813,8 +2032,8 @@ fn sum_where_with(
     }
     // Pages are planned on the worker pool once there are enough of them;
     // a column of a few pages is planned on the calling thread.
-    let actions = run_pages(end - first, threads, |offset| {
-        let index = first + offset;
+    let actions = run_pages(candidates.len(), threads, |offset| {
+        let index = candidates.at(offset);
         let page = &selector.pages[index];
         let mut session = selector_store.session(page, index, Access::Plan)?;
         let action = plan_between(page, &mut session, low, high, planning)?;
@@ -1824,9 +2043,10 @@ fn sum_where_with(
     })?;
     for (offset, (action, reads)) in actions.into_iter().enumerate() {
         counts.add(&reads);
-        counts.record(&selector.pages[first + offset], &action, planning);
+        let index = candidates.at(offset);
+        counts.record(&selector.pages[index], &action, planning);
         if !matches!(action, PageAction::Skip(_)) {
-            work.push((first + offset, action));
+            work.push((index, action));
         }
     }
     let page_results = run_pages(work.len(), threads, |slot| {
@@ -2091,28 +2311,23 @@ fn aggregate_where_with(
         deleted.check(shape)?;
     }
     // An ordered column narrows the pages any conjunct on it can match.
-    let (mut first_page, mut end_page) = (0, shape.pages.len());
+    let mut candidates = PageCandidates::all(shape.pages.len());
     if planning.uses_shortcuts() {
         for conjunct in conjuncts {
-            if let Some((start, end)) = conjunct
-                .column
-                .candidate_pages(i128::from(conjunct.low), i128::from(conjunct.high))?
-            {
-                first_page = first_page.max(start);
-                end_page = end_page.min(end);
-            }
+            candidates = candidates.intersect(conjunct.column.candidates_in(
+                &InMemory,
+                i128::from(conjunct.low),
+                i128::from(conjunct.high),
+            )?);
         }
     }
-    let end_page = end_page.max(first_page);
-    let mut counts = PageCounts {
-        skipped: shape.pages.len() - (end_page - first_page),
-        ..PageCounts::default()
-    };
+    let mut counts = candidates.reads;
+    counts.skipped += shape.pages.len() - candidates.len();
     let mut work = Vec::new();
     // Each page is planned conjunct by conjunct, stopping at the first skip;
     // pages are planned on the worker pool once there are enough of them.
-    let planned = run_pages(end_page - first_page, threads, |offset| {
-        let index = first_page + offset;
+    let planned = run_pages(candidates.len(), threads, |offset| {
+        let index = candidates.at(offset);
         let mut actions = Vec::with_capacity(conjuncts.len());
         for (slot, conjunct) in conjuncts.iter().enumerate() {
             let page = &conjunct.column.pages[index];
@@ -2131,7 +2346,7 @@ fn aggregate_where_with(
         Ok(Some(actions))
     })?;
     for (offset, actions) in planned.into_iter().enumerate() {
-        let index = first_page + offset;
+        let index = candidates.at(offset);
         let Some(mut actions) = actions else {
             counts.skipped += 1;
             continue;
@@ -2378,7 +2593,13 @@ pub fn between(
     if low > high {
         return Err("BETWEEN needs low <= high".into());
     }
-    let page_results = run_pages(column.pages.len(), threads, |index| {
+    let candidates = if planning.uses_shortcuts() && column.ordered_regions.is_some() {
+        column.candidates_in(&InMemory, i128::from(low), i128::from(high))?
+    } else {
+        PageCandidates::all(column.pages.len())
+    };
+    let page_results = run_pages(candidates.len(), threads, |offset| {
+        let index = candidates.at(offset);
         let page = &column.pages[index];
         let mut session = ReadSession::new_untracked(&page.column.page, ClosureMode::Selective);
         let action = plan_between(page, &mut session, low, high, planning)?;
@@ -2388,8 +2609,10 @@ pub fn between(
         Ok((ranges, counts))
     })?;
     let mut ranges = Vec::new();
-    let mut counts = PageCounts::default();
-    for (index, (page_ranges, page_counts)) in page_results.into_iter().enumerate() {
+    let mut counts = candidates.reads;
+    counts.skipped += column.pages.len() - candidates.len();
+    for (offset, (page_ranges, page_counts)) in page_results.into_iter().enumerate() {
+        let index = candidates.at(offset);
         let start = column.pages[index].start;
         for range in page_ranges {
             push_range(&mut ranges, start + range.start, start + range.end);
@@ -2633,7 +2856,7 @@ impl PagedColumn {
         ) {
             let mut session = ReadSession::new_untracked(&column.page, ClosureMode::Selective);
             let first = vector::get(&column.decoder, &mut session, 0)?;
-            let last = vector::get(&column.decoder, &mut session, column.truth.len() - 1)?;
+            let last = vector::get(&column.decoder, &mut session, column.len() - 1)?;
             first.zip(last)
         } else {
             None
@@ -2664,6 +2887,9 @@ impl PagedColumn {
                 extends
             })
             .count();
+        if self.ordered_regions.is_some() {
+            self.enable_ordered_regions();
+        }
     }
 }
 

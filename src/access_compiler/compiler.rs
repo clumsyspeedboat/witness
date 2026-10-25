@@ -5,7 +5,7 @@ use super::{
 };
 
 pub fn compile(column: &EncodedColumn, query: Query) -> Result<PlanIr, String> {
-    let rows = query_rows(column.truth.len(), &query)?;
+    let rows = query_rows(column.len(), &query)?;
     let mut nodes = Vec::new();
     let metadata = column.page.layout().metadata;
     let metadata_length = column.page.layout().fields[metadata.0].length;

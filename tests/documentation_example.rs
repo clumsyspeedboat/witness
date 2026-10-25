@@ -106,8 +106,9 @@ fn paper_macros(tex: &str) -> Vec<(String, String)> {
 /// block is the one place a number could drift from the evidence without any
 /// study failing, so bind every `\Wit` macro to the generated manifest.
 ///
-/// Every `.tex` below `paper/` is read, including conference subdirectories,
-/// so it does not matter where the manuscript's generated claim file lives.
+/// Every active `.tex` below `paper/` is read, including conference
+/// subdirectories. Review snapshots in `paper/notes/` are historical evidence,
+/// not current manuscripts, and must not be regenerated or tested as current.
 ///
 /// The manuscript is not part of the public artifact, so this check is a no-op
 /// wherever `paper/` is absent rather than a failure for anyone reproducing.
@@ -122,6 +123,9 @@ fn claim_bearing_paper_macros_match_the_manifest() {
         for entry in fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
+            if path == std::path::Path::new("paper/notes") {
+                continue;
+            }
             if entry.file_type().unwrap().is_dir() {
                 directories.push(path);
             } else if path.extension().is_some_and(|suffix| suffix == "tex") {

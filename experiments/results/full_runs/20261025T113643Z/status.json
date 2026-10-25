@@ -1,0 +1,18 @@
+{
+  "run_id": "20261025T113643Z",
+  "source_repository": "/data/experiments/git_repos/witness",
+  "workspace": "/data/experiments/witness_full_runs/20261025T113643Z/workspace",
+  "baseline": "/data/experiments/witness_full_runs/20261025T113643Z/baseline",
+  "source_commit": "98a3117d0e8947f133d4214f26c15db4cbd4b458",
+  "working_tree_patch_sha256": "9d58e142bde0817fb58aed11aacad6e3f340009a548f0570e1712cf78696702a",
+  "phase": "complete",
+  "status": "passed",
+  "started_utc": "2026-10-25T11:39:36.967104+00:00",
+  "exit_code": 0,
+  "updated_utc": "2026-10-25T16:29:45.159743+00:00",
+  "previous_failure": "Diagnostic runners assumed target/release even when CARGO_TARGET_DIR selected another build directory.",
+  "finished_utc": "2026-10-25T16:29:45.159743+00:00",
+  "final_documentation_recheck_utc": "2026-10-25T16:34:55.987533+00:00",
+  "rust_tests_passed": 219,
+  "python_tests_passed": 13
+}

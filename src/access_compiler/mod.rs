@@ -13,6 +13,7 @@ mod ids;
 mod interpreter;
 mod invariants;
 mod layout;
+pub mod native_file;
 pub mod paged;
 pub mod paged_file;
 mod plan;

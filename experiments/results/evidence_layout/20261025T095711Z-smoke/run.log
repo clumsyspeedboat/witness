@@ -1,0 +1,4 @@
+evidence layout: 3 pairs from 3 sources, loaded in 8.4ms
+pair 1/3: case0/selector (smoke), elapsed 2.1s
+pair 2/3: case1/selector (smoke), elapsed 4.0s
+pair 3/3: case2/selector (smoke), elapsed 5.8s

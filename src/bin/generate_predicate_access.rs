@@ -8,6 +8,20 @@ const GENERATED_DIR: &str = "experiments/generated/predicate_access";
 const DEFAULT_RESULT_DIR: &str = "experiments/results/predicate_pipeline";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|argument| argument == "--source-only") {
+        let (columns, _) = predicate_access_corpus()?;
+        let encoded = columns
+            .iter()
+            .map(|column| column.size_selected.clone())
+            .chain(columns.iter().map(|column| column.access_ready.clone()))
+            .collect::<Vec<_>>();
+        fs::create_dir_all(GENERATED_DIR)?;
+        fs::write(
+            format!("{GENERATED_DIR}/generated.rs"),
+            generate_rust_module(&encoded)?,
+        )?;
+        return Ok(());
+    }
     fs::create_dir_all(GENERATED_DIR)?;
     let result_dir =
         std::env::var("WITNESS_PREDICATE_RESULT_DIR").unwrap_or_else(|_| DEFAULT_RESULT_DIR.into());

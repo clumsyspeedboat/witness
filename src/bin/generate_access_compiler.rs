@@ -12,6 +12,18 @@ const GENERATED_DIR: &str = "experiments/generated/access_compiler";
 const RESULT_DIR: &str = "experiments/results/access_compiler";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|argument| argument == "--source-only") {
+        let columns = heldout_cases()
+            .iter()
+            .map(|case| encode(&case.recipe, input_for(case, ROWS)))
+            .collect::<Result<Vec<_>, _>>()?;
+        fs::create_dir_all(GENERATED_DIR)?;
+        fs::write(
+            format!("{GENERATED_DIR}/generated.rs"),
+            generate_rust_module(&columns)?,
+        )?;
+        return Ok(());
+    }
     fs::create_dir_all(GENERATED_DIR)?;
     fs::create_dir_all(format!("{RESULT_DIR}/pages"))?;
     let cases = heldout_cases();

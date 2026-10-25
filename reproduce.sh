@@ -83,7 +83,19 @@ cargo run --locked --release --features experiment --bin paged_cold_study
 python3 experiments/duckdb_baseline.py
 ./experiments/run_repeats.sh
 
-printf '6/8 auxiliary plans and claim manifest\n'
+printf '6/8 native reader, ordered regions, auxiliary plans, and claim manifest\n'
+# Keep each new measurement intact, then refresh the explicitly scoped extension
+# inputs before generating claims. A failed diagnostic never updates confirmed.
+mkdir -p experiments/results/native_reader
+native_run_dir=$(mktemp -d experiments/results/native_reader/remeasure-XXXXXXXX)
+WITNESS_NATIVE_RESULT_DIR="$native_run_dir" ./experiments/run_native_reader.sh
+mkdir -p experiments/results/native_reader/confirmed
+for result in reader.csv regions.csv summary.json summary.md PROVENANCE.txt run.log; do
+  cp -- "$native_run_dir/$result" experiments/results/native_reader/confirmed/
+done
+# Write the completed freeze last; the claim generator validates all cells and
+# requires its source fingerprint to match the main study.
+cp -- "$native_run_dir/freeze.csv" experiments/results/native_reader/confirmed/
 cargo run --locked --release --features experiment --bin claim_manifest -- --measure-additional
 python3 experiments/render_paper_claims.py
 
@@ -129,6 +141,7 @@ printf '8/8 provenance and checksums\n'
     experiments/results/paged_float/*.csv \
     experiments/results/paged_string/*.csv \
     experiments/results/paged_cold/*.csv \
+    experiments/results/native_reader/confirmed/*.csv \
     experiments/results/repeats/*/*/*.csv \
     "$PAIRED_16K"/*.csv \
     experiments/results/additional_plans.csv \

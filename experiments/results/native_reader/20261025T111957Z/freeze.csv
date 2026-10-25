@@ -1,0 +1,9 @@
+key,value
+status,started
+rule_fingerprint,f79bda4f741a544a
+reader_scope,resident_including_checksum_and_descriptor_parsing
+region_scope,synthetic_four_appended_sorted_batches
+page_rows,1024
+rounds,9
+reader_columns,15
+status,complete

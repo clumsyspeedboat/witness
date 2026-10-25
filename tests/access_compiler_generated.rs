@@ -74,6 +74,48 @@ fn replace_page(column: EncodedColumn, bytes: Vec<u8>) -> EncodedColumn {
 const ROWS: usize = 16_384;
 
 #[test]
+fn generated_and_static_operators_do_not_need_the_writer_oracle() {
+    for case in heldout_cases() {
+        let mut column = encode(&case.recipe, input_for(&case, ROWS)).unwrap();
+        let expected_get = Answer::Value(column.truth[ROWS / 2]);
+        let expected_sum = Answer::Sum(
+            column
+                .truth
+                .iter()
+                .flatten()
+                .map(|&value| i128::from(value))
+                .sum(),
+        );
+        column.truth.clear();
+        assert_eq!(
+            generated::GET_FNS[case.id](&column, ROWS / 2, ClosureMode::Selective)
+                .unwrap()
+                .answer,
+            expected_get
+        );
+        assert_eq!(
+            generated::STATIC_GET_FNS[case.id](&column, ROWS / 2, ClosureMode::Selective)
+                .unwrap()
+                .answer,
+            expected_get
+        );
+        let rows = Span::new(0, ROWS).unwrap();
+        assert_eq!(
+            generated::SUM_FNS[case.id](&column, rows, ClosureMode::Selective)
+                .unwrap()
+                .answer,
+            expected_sum
+        );
+        assert_eq!(
+            generated::STATIC_SUM_FNS[case.id](&column, rows, ClosureMode::Selective)
+                .unwrap()
+                .answer,
+            expected_sum
+        );
+    }
+}
+
+#[test]
 fn generated_rust_is_frozen_reproducible_and_correct() {
     assert_eq!(generated::CASE_COUNT, 19);
     assert_eq!(generated::RULE_FINGERPRINT, primitive_rule_fingerprint());

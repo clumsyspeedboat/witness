@@ -110,7 +110,7 @@ fn batchable(column: &EncodedColumn, node: usize) -> Result<bool, String> {
 }
 
 fn validate_plan_contract(column: &EncodedColumn) -> Result<u64, String> {
-    let len = column.truth.len();
+    let len = column.len();
     let full = Span::new(0, len)?;
     let contracts = [
         (
@@ -674,7 +674,11 @@ fn emit_queries(
     let visit = visit_name(case, root);
     let batch = batch.as_deref();
     writeln!(source, "pub fn c{case:02}_get_session(column: &EncodedColumn, row: usize, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if row >= column.truth.len() {{ return Err(\"generated GET outside column\".into()); }}").unwrap();
+    writeln!(
+        source,
+        "    if row >= column.len() {{ return Err(\"generated GET outside column\".into()); }}"
+    )
+    .unwrap();
     writeln!(source, "    load_metadata(&column.page, session)?;").unwrap();
     writeln!(source, "    let value = {get}(session, row)?.map(|value| i64::try_from(value).map_err(|_| \"generated GET value does not fit i64\")).transpose()?;").unwrap();
     writeln!(source, "    Ok(Execution {{ answer: Answer::Value(value), metrics: session.metrics(), decoded_rows: 1 }})").unwrap();
@@ -682,7 +686,7 @@ fn emit_queries(
     writeln!(source, "pub fn c{case:02}_get(column: &EncodedColumn, row: usize, mode: ClosureMode) -> Result<Execution, String> {{ let mut session = ReadSession::new(&column.page, mode); c{case:02}_get_session(column, row, &mut session) }}\n").unwrap();
 
     writeln!(source, "pub fn c{case:02}_sum_session(column: &EncodedColumn, rows: Span, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if rows.start > rows.end || rows.end > column.truth.len() {{ return Err(\"generated SUM range invalid\".into()); }}").unwrap();
+    writeln!(source, "    if rows.start > rows.end || rows.end > column.len() {{ return Err(\"generated SUM range invalid\".into()); }}").unwrap();
     writeln!(
         source,
         "    load_metadata(&column.page, session)?; let mut sum = 0_i128; let mut decoded_rows = 0;"
@@ -702,7 +706,7 @@ fn emit_queries(
     writeln!(source, "pub fn c{case:02}_sum(column: &EncodedColumn, rows: Span, mode: ClosureMode) -> Result<Execution, String> {{ let mut session = ReadSession::new(&column.page, mode); c{case:02}_sum_session(column, rows, &mut session) }}\n").unwrap();
 
     writeln!(source, "pub fn c{case:02}_between_session(column: &EncodedColumn, rows: Span, low: i64, high: i64, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if rows.start > rows.end || rows.end > column.truth.len() || low > high {{ return Err(\"generated BETWEEN invalid\".into()); }}").unwrap();
+    writeln!(source, "    if rows.start > rows.end || rows.end > column.len() || low > high {{ return Err(\"generated BETWEEN invalid\".into()); }}").unwrap();
     writeln!(source, "    load_metadata(&column.page, session)?; let mut ranges = Vec::new(); let mut decoded_rows = 0;").unwrap();
     if let Some(batch) = batch {
         writeln!(source, "    {batch}(session, rows.start, rows.end, &mut |_session, values, first| {{ decoded_rows += values.len(); push_batch_matches(&mut ranges, values, first, i128::from(low), i128::from(high)); Ok(()) }})?;").unwrap();
@@ -713,20 +717,20 @@ fn emit_queries(
     writeln!(source, "}}\n").unwrap();
     writeln!(source, "pub fn c{case:02}_between(column: &EncodedColumn, rows: Span, low: i64, high: i64, mode: ClosureMode) -> Result<Execution, String> {{ let mut session = ReadSession::new(&column.page, mode); c{case:02}_between_session(column, rows, low, high, &mut session) }}\n").unwrap();
 
-    writeln!(source, "pub fn c{case:02}_filter_scan_session(column: &EncodedColumn, low: i64, high: i64, session: &mut ReadSession<'_>) -> Result<Execution, String> {{ c{case:02}_between_session(column, Span::new(0, column.truth.len())?, low, high, session) }}").unwrap();
+    writeln!(source, "pub fn c{case:02}_filter_scan_session(column: &EncodedColumn, low: i64, high: i64, session: &mut ReadSession<'_>) -> Result<Execution, String> {{ c{case:02}_between_session(column, Span::new(0, column.len())?, low, high, session) }}").unwrap();
     writeln!(source, "pub fn c{case:02}_filter_scan(column: &EncodedColumn, low: i64, high: i64, mode: ClosureMode) -> Result<Execution, String> {{ let mut session = ReadSession::new(&column.page, mode); c{case:02}_filter_scan_session(column, low, high, &mut session) }}").unwrap();
     if let FilterLowering::Monotone(nulls) = filter_lowering {
         writeln!(source, "pub fn c{case:02}_filter_session(column: &EncodedColumn, low: i64, high: i64, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
         writeln!(source, "    if low > high {{ return Err(\"generated FILTER bounds are invalid\".into()); }} load_metadata(&column.page, session)?; let mut decoded_rows = 0;").unwrap();
         let lower = monotone_comparison(nulls, "value", "i128::from(low)", false);
         let upper = monotone_comparison(nulls, "value", "i128::from(high)", true);
-        writeln!(source, "    let mut left = 0; let mut right = column.truth.len(); while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?; decoded_rows += 1; if {lower} {{ left = mid + 1; }} else {{ right = mid; }} }} let start = left;").unwrap();
-        writeln!(source, "    right = column.truth.len(); while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?; decoded_rows += 1; if {upper} {{ left = mid + 1; }} else {{ right = mid; }} }}").unwrap();
+        writeln!(source, "    let mut left = 0; let mut right = column.len(); while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?; decoded_rows += 1; if {lower} {{ left = mid + 1; }} else {{ right = mid; }} }} let start = left;").unwrap();
+        writeln!(source, "    right = column.len(); while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?; decoded_rows += 1; if {upper} {{ left = mid + 1; }} else {{ right = mid; }} }}").unwrap();
         writeln!(source, "    let ranges = if start < left {{ vec![Span::new(start, left)?] }} else {{ Vec::new() }}; Ok(Execution {{ answer: Answer::Ranges(ranges), metrics: session.metrics(), decoded_rows }}) }}").unwrap();
     } else if let FilterLowering::Piecewise(max_rows) = filter_lowering {
         writeln!(source, "pub fn c{case:02}_filter_session(column: &EncodedColumn, low: i64, high: i64, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
         writeln!(source, "    if low > high {{ return Err(\"generated FILTER bounds are invalid\".into()); }} load_metadata(&column.page, session)?; let mut ranges = Vec::new(); let mut decoded_rows = 0;").unwrap();
-        writeln!(source, "    let mut block_start = 0; while block_start < column.truth.len() {{ let block_end = (block_start + {max_rows}).min(column.truth.len()); let mut left = block_start; let mut right = block_end; while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?.ok_or(\"piecewise monotone block contained null\")?; decoded_rows += 1; if value < i128::from(low) {{ left = mid + 1; }} else {{ right = mid; }} }} let start = left; right = block_end; while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?.ok_or(\"piecewise monotone block contained null\")?; decoded_rows += 1; if value <= i128::from(high) {{ left = mid + 1; }} else {{ right = mid; }} }} if start < left {{ push_range(&mut ranges, start, left); }} block_start = block_end; }}").unwrap();
+        writeln!(source, "    let mut block_start = 0; while block_start < column.len() {{ let block_end = (block_start + {max_rows}).min(column.len()); let mut left = block_start; let mut right = block_end; while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?.ok_or(\"piecewise monotone block contained null\")?; decoded_rows += 1; if value < i128::from(low) {{ left = mid + 1; }} else {{ right = mid; }} }} let start = left; right = block_end; while left < right {{ let mid = left + (right - left) / 2; let value = {get}(session, mid)?.ok_or(\"piecewise monotone block contained null\")?; decoded_rows += 1; if value <= i128::from(high) {{ left = mid + 1; }} else {{ right = mid; }} }} if start < left {{ push_range(&mut ranges, start, left); }} block_start = block_end; }}").unwrap();
         writeln!(source, "    Ok(Execution {{ answer: Answer::Ranges(ranges), metrics: session.metrics(), decoded_rows }}) }}").unwrap();
     } else if let FilterLowering::Dictionary {
         ids,
@@ -741,9 +745,9 @@ fn emit_queries(
         writeln!(source, "    right = {entries}; while left < right {{ let mid = left + (right - left) / 2; if session.read_i64(FieldId({dictionary}), mid)? <= high {{ left = mid + 1; }} else {{ right = mid; }} }} let high_id = left;").unwrap();
         if batches.contains(&ids) {
             let ids_batch = batch_name(case, ids);
-            writeln!(source, "    let mut ranges = Vec::new(); let mut decoded_rows = 0; if low_id < high_id {{ {ids_batch}(session, 0, column.truth.len(), &mut |_session, codes, first| {{ decoded_rows += codes.len(); if codes.iter().any(|&id| !(0..{entries}).contains(&id)) {{ return Err(\"generated dictionary id is outside table\".into()); }}\npush_batch_matches(&mut ranges, codes, first, low_id as i128, high_id as i128 - 1); Ok(()) }})?; }}").unwrap();
+            writeln!(source, "    let mut ranges = Vec::new(); let mut decoded_rows = 0; if low_id < high_id {{ {ids_batch}(session, 0, column.len(), &mut |_session, codes, first| {{ decoded_rows += codes.len(); if codes.iter().any(|&id| !(0..{entries}).contains(&id)) {{ return Err(\"generated dictionary id is outside table\".into()); }}\npush_batch_matches(&mut ranges, codes, first, low_id as i128, high_id as i128 - 1); Ok(()) }})?; }}").unwrap();
         } else {
-            writeln!(source, "    let mut ranges = Vec::new(); let mut decoded_rows = 0; if low_id < high_id {{ {ids_visit}(session, 0, column.truth.len(), &mut |_session, id, start, end| {{ decoded_rows += end - start; let id = usize::try_from(id.ok_or(\"generated dictionary id is null\")?).map_err(|_| \"generated dictionary id does not fit usize\")?; if id >= {entries} {{ return Err(\"generated dictionary id is outside table\".into()); }}\nif low_id <= id && id < high_id {{ push_range(&mut ranges, start, end); }} Ok(()) }})?; }}").unwrap();
+            writeln!(source, "    let mut ranges = Vec::new(); let mut decoded_rows = 0; if low_id < high_id {{ {ids_visit}(session, 0, column.len(), &mut |_session, id, start, end| {{ decoded_rows += end - start; let id = usize::try_from(id.ok_or(\"generated dictionary id is null\")?).map_err(|_| \"generated dictionary id does not fit usize\")?; if id >= {entries} {{ return Err(\"generated dictionary id is outside table\".into()); }}\nif low_id <= id && id < high_id {{ push_range(&mut ranges, start, end); }} Ok(()) }})?; }}").unwrap();
         }
         writeln!(source, "    Ok(Execution {{ answer: Answer::Ranges(ranges), metrics: session.metrics(), decoded_rows }}) }}").unwrap();
     } else {
@@ -769,7 +773,7 @@ fn emit_queries(
             let static_ids = static_name(case, ids);
             writeln!(source, "pub fn c{case:02}_static_filter(column: &EncodedColumn, low: i64, high: i64, mode: ClosureMode) -> Result<Execution, String> {{ static_dictionary_filter::<{dictionary}, {entries}, {static_ids}>(column, low, high, mode) }}\n").unwrap();
         }
-        FilterLowering::Scan => writeln!(source, "pub fn c{case:02}_static_filter(column: &EncodedColumn, low: i64, high: i64, mode: ClosureMode) -> Result<Execution, String> {{ static_between::<{static_root}>(column, Span::new(0, column.truth.len())?, low, high, mode) }}\n").unwrap(),
+        FilterLowering::Scan => writeln!(source, "pub fn c{case:02}_static_filter(column: &EncodedColumn, low: i64, high: i64, mode: ClosureMode) -> Result<Execution, String> {{ static_between::<{static_root}>(column, Span::new(0, column.len())?, low, high, mode) }}\n").unwrap(),
     }
     Ok(())
 }
@@ -799,7 +803,7 @@ fn monotone_comparison(nulls: NullPlacement, value: &str, bound: &str, inclusive
 }
 
 fn emit_sum_ranges(source: &mut String, case: usize, visit: &str, batch: Option<&str>) {
-    writeln!(source, "fn c{case:02}_validate_ranges(column: &EncodedColumn, ranges: &[Span]) -> Result<(), String> {{ let mut previous = 0; for range in ranges {{ if range.start > range.end || range.end > column.truth.len() || range.start < previous {{ return Err(\"generated selection ranges are invalid\".into()); }} previous = range.end; }} Ok(()) }}").unwrap();
+    writeln!(source, "fn c{case:02}_validate_ranges(column: &EncodedColumn, ranges: &[Span]) -> Result<(), String> {{ let mut previous = 0; for range in ranges {{ if range.start > range.end || range.end > column.len() || range.start < previous {{ return Err(\"generated selection ranges are invalid\".into()); }} previous = range.end; }} Ok(()) }}").unwrap();
     writeln!(source, "pub fn c{case:02}_sum_ranges_session(column: &EncodedColumn, ranges: &[Span], session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
     writeln!(source, "    c{case:02}_validate_ranges(column, ranges)?; load_metadata(&column.page, session)?; let mut sum = 0_i128; let mut decoded_rows = 0;").unwrap();
     if let Some(batch) = batch {
@@ -813,9 +817,9 @@ fn emit_sum_ranges(source: &mut String, case: usize, visit: &str, batch: Option<
     writeln!(source, "pub fn c{case:02}_fused_sum_ranges_session(column: &EncodedColumn, ranges: &[Span], session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
     writeln!(source, "    c{case:02}_validate_ranges(column, ranges)?; load_metadata(&column.page, session)?; let mut sum = 0_i128; let mut decoded_rows = 0; let mut range_index = 0;").unwrap();
     if let Some(batch) = batch {
-        writeln!(source, "    {batch}(session, 0, column.truth.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); let end = first + values.len(); while range_index < ranges.len() && ranges[range_index].end <= first {{ range_index += 1; }} let mut probe = range_index; while probe < ranges.len() && ranges[probe].start < end {{ let overlap_start = first.max(ranges[probe].start); let overlap_end = end.min(ranges[probe].end); if overlap_start < overlap_end {{ sum = sum_batch(sum, &values[overlap_start - first..overlap_end - first])?; }}\nif ranges[probe].end <= end {{ probe += 1; }} else {{ break; }} }} range_index = probe; Ok(()) }})?;").unwrap();
+        writeln!(source, "    {batch}(session, 0, column.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); let end = first + values.len(); while range_index < ranges.len() && ranges[range_index].end <= first {{ range_index += 1; }} let mut probe = range_index; while probe < ranges.len() && ranges[probe].start < end {{ let overlap_start = first.max(ranges[probe].start); let overlap_end = end.min(ranges[probe].end); if overlap_start < overlap_end {{ sum = sum_batch(sum, &values[overlap_start - first..overlap_end - first])?; }}\nif ranges[probe].end <= end {{ probe += 1; }} else {{ break; }} }} range_index = probe; Ok(()) }})?;").unwrap();
     } else {
-        writeln!(source, "    {visit}(session, 0, column.truth.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; while range_index < ranges.len() && ranges[range_index].end <= start {{ range_index += 1; }} let mut probe = range_index; while probe < ranges.len() && ranges[probe].start < end {{ let overlap_start = start.max(ranges[probe].start); let overlap_end = end.min(ranges[probe].end); if overlap_start < overlap_end && let Some(value) = value {{ sum = sum.checked_add(value.checked_mul((overlap_end - overlap_start) as i128).ok_or(\"generated fused selected SUM product overflow\")?).ok_or(\"generated fused selected SUM overflow\")?; }}\nif ranges[probe].end <= end {{ probe += 1; }} else {{ break; }} }} range_index = probe; Ok(()) }})?;").unwrap();
+        writeln!(source, "    {visit}(session, 0, column.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; while range_index < ranges.len() && ranges[range_index].end <= start {{ range_index += 1; }} let mut probe = range_index; while probe < ranges.len() && ranges[probe].start < end {{ let overlap_start = start.max(ranges[probe].start); let overlap_end = end.min(ranges[probe].end); if overlap_start < overlap_end && let Some(value) = value {{ sum = sum.checked_add(value.checked_mul((overlap_end - overlap_start) as i128).ok_or(\"generated fused selected SUM product overflow\")?).ok_or(\"generated fused selected SUM overflow\")?; }}\nif ranges[probe].end <= end {{ probe += 1; }} else {{ break; }} }} range_index = probe; Ok(()) }})?;").unwrap();
     }
     writeln!(source, "    Ok(Execution {{ answer: Answer::Sum(sum), metrics: session.metrics(), decoded_rows }}) }}").unwrap();
     writeln!(source, "pub fn c{case:02}_fused_sum_ranges(column: &EncodedColumn, ranges: &[Span], mode: ClosureMode) -> Result<Execution, String> {{ let mut session = ReadSession::new(&column.page, mode); c{case:02}_fused_sum_ranges_session(column, ranges, &mut session) }}\n").unwrap();
@@ -832,22 +836,22 @@ fn emit_materializer(source: &mut String, case: usize, visit: &str, batch: Optio
     writeln!(source, "    let mut session = ReadSession::new(&column.page, mode); load_metadata(&column.page, &mut session)?;").unwrap();
     writeln!(
         source,
-        "    let mut values = Vec::with_capacity(column.truth.len());"
+        "    let mut values = Vec::with_capacity(column.len());"
     )
     .unwrap();
     if let Some(batch) = batch {
-        writeln!(source, "    {batch}(&mut session, 0, column.truth.len(), &mut |_session, decoded, _first| {{ values.extend(decoded.iter().map(|value| Some(*value))); Ok(()) }})?;").unwrap();
+        writeln!(source, "    {batch}(&mut session, 0, column.len(), &mut |_session, decoded, _first| {{ values.extend(decoded.iter().map(|value| Some(*value))); Ok(()) }})?;").unwrap();
     } else {
-        writeln!(source, "    {visit}(&mut session, 0, column.truth.len(), &mut |_session, value, start, end| {{ for _ in start..end {{ values.push(value); }} Ok(()) }})?;").unwrap();
+        writeln!(source, "    {visit}(&mut session, 0, column.len(), &mut |_session, value, start, end| {{ for _ in start..end {{ values.push(value); }} Ok(()) }})?;").unwrap();
     }
-    writeln!(source, "    if values.len() != column.truth.len() {{ return Err(\"generated materializer returned the wrong row count\".into()); }}").unwrap();
+    writeln!(source, "    if values.len() != column.len() {{ return Err(\"generated materializer returned the wrong row count\".into()); }}").unwrap();
     writeln!(source, "    Ok((values, session.metrics()))").unwrap();
     writeln!(source, "}}\n").unwrap();
 }
 
 fn emit_materialized_queries(source: &mut String, case: usize) {
     writeln!(source, "pub fn c{case:02}_materialized_get(column: &EncodedColumn, row: usize, mode: ClosureMode) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if row >= column.truth.len() {{ return Err(\"materialized GET outside column\".into()); }} let (values, metrics) = c{case:02}_materialize(column, mode)?;").unwrap();
+    writeln!(source, "    if row >= column.len() {{ return Err(\"materialized GET outside column\".into()); }} let (values, metrics) = c{case:02}_materialize(column, mode)?;").unwrap();
     writeln!(source, "    let value = values[row].map(|value| i64::try_from(value).map_err(|_| \"materialized GET value does not fit i64\")).transpose()?;").unwrap();
     writeln!(
         source,
@@ -857,7 +861,7 @@ fn emit_materialized_queries(source: &mut String, case: usize) {
     writeln!(source, "}}\n").unwrap();
 
     writeln!(source, "pub fn c{case:02}_materialized_sum(column: &EncodedColumn, rows: Span, mode: ClosureMode) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if rows.start > rows.end || rows.end > column.truth.len() {{ return Err(\"materialized SUM range invalid\".into()); }} let (values, metrics) = c{case:02}_materialize(column, mode)?; let mut sum = 0_i128;").unwrap();
+    writeln!(source, "    if rows.start > rows.end || rows.end > column.len() {{ return Err(\"materialized SUM range invalid\".into()); }} let (values, metrics) = c{case:02}_materialize(column, mode)?; let mut sum = 0_i128;").unwrap();
     writeln!(source, "    for value in values[rows.start..rows.end].iter().flatten() {{ sum = sum.checked_add(*value).ok_or(\"materialized SUM overflow\")?; }}").unwrap();
     writeln!(
         source,
@@ -867,7 +871,7 @@ fn emit_materialized_queries(source: &mut String, case: usize) {
     writeln!(source, "}}\n").unwrap();
 
     writeln!(source, "pub fn c{case:02}_materialized_between(column: &EncodedColumn, rows: Span, low: i64, high: i64, mode: ClosureMode) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if rows.start > rows.end || rows.end > column.truth.len() || low > high {{ return Err(\"materialized BETWEEN invalid\".into()); }} let (values, metrics) = c{case:02}_materialize(column, mode)?; let mut ranges = Vec::new();").unwrap();
+    writeln!(source, "    if rows.start > rows.end || rows.end > column.len() || low > high {{ return Err(\"materialized BETWEEN invalid\".into()); }} let (values, metrics) = c{case:02}_materialize(column, mode)?; let mut ranges = Vec::new();").unwrap();
     writeln!(source, "    for (offset, value) in values[rows.start..rows.end].iter().enumerate() {{ if value.is_some_and(|value| i128::from(low) <= value && value <= i128::from(high)) {{ let row = rows.start + offset; push_range(&mut ranges, row, row + 1); }} }}").unwrap();
     writeln!(source, "    Ok(Execution {{ answer: Answer::Ranges(ranges), metrics, decoded_rows: values.len() }})").unwrap();
     writeln!(source, "}}\n").unwrap();
@@ -875,22 +879,22 @@ fn emit_materialized_queries(source: &mut String, case: usize) {
 
 fn emit_fused_queries(source: &mut String, case: usize, visit: &str, batch: Option<&str>) {
     writeln!(source, "pub fn c{case:02}_fused_get_session(column: &EncodedColumn, row: usize, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if row >= column.truth.len() {{ return Err(\"fused GET outside column\".into()); }} load_metadata(&column.page, session)?; let mut answer = None; let mut decoded_rows = 0;").unwrap();
+    writeln!(source, "    if row >= column.len() {{ return Err(\"fused GET outside column\".into()); }} load_metadata(&column.page, session)?; let mut answer = None; let mut decoded_rows = 0;").unwrap();
     if let Some(batch) = batch {
-        writeln!(source, "    {batch}(session, 0, column.truth.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); if first <= row && row < first + values.len() {{ answer = Some(Some(i64::try_from(values[row - first]).map_err(|_| \"fused GET value does not fit i64\")?)); }} Ok(()) }})?;").unwrap();
+        writeln!(source, "    {batch}(session, 0, column.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); if first <= row && row < first + values.len() {{ answer = Some(Some(i64::try_from(values[row - first]).map_err(|_| \"fused GET value does not fit i64\")?)); }} Ok(()) }})?;").unwrap();
     } else {
-        writeln!(source, "    {visit}(session, 0, column.truth.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; if start <= row && row < end {{ answer = Some(value.map(|value| i64::try_from(value).map_err(|_| \"fused GET value does not fit i64\")).transpose()?); }} Ok(()) }})?;").unwrap();
+        writeln!(source, "    {visit}(session, 0, column.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; if start <= row && row < end {{ answer = Some(value.map(|value| i64::try_from(value).map_err(|_| \"fused GET value does not fit i64\")).transpose()?); }} Ok(()) }})?;").unwrap();
     }
     writeln!(source, "    Ok(Execution {{ answer: Answer::Value(answer.ok_or(\"fused GET missed row\")?), metrics: session.metrics(), decoded_rows }})").unwrap();
     writeln!(source, "}}\n").unwrap();
     writeln!(source, "pub fn c{case:02}_fused_get(column: &EncodedColumn, row: usize, mode: ClosureMode) -> Result<Execution, String> {{ let mut session = ReadSession::new(&column.page, mode); c{case:02}_fused_get_session(column, row, &mut session) }}\n").unwrap();
 
     writeln!(source, "pub fn c{case:02}_fused_sum_session(column: &EncodedColumn, rows: Span, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if rows.start > rows.end || rows.end > column.truth.len() {{ return Err(\"fused SUM range invalid\".into()); }} load_metadata(&column.page, session)?; let mut sum = 0_i128; let mut decoded_rows = 0;").unwrap();
+    writeln!(source, "    if rows.start > rows.end || rows.end > column.len() {{ return Err(\"fused SUM range invalid\".into()); }} load_metadata(&column.page, session)?; let mut sum = 0_i128; let mut decoded_rows = 0;").unwrap();
     if let Some(batch) = batch {
-        writeln!(source, "    {batch}(session, 0, column.truth.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); let overlap_start = first.max(rows.start); let overlap_end = (first + values.len()).min(rows.end); if overlap_start < overlap_end {{ sum = sum_batch(sum, &values[overlap_start - first..overlap_end - first])?; }} Ok(()) }})?;").unwrap();
+        writeln!(source, "    {batch}(session, 0, column.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); let overlap_start = first.max(rows.start); let overlap_end = (first + values.len()).min(rows.end); if overlap_start < overlap_end {{ sum = sum_batch(sum, &values[overlap_start - first..overlap_end - first])?; }} Ok(()) }})?;").unwrap();
     } else {
-        writeln!(source, "    {visit}(session, 0, column.truth.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; let overlap_start = start.max(rows.start); let overlap_end = end.min(rows.end); if overlap_start < overlap_end && let Some(value) = value {{ sum = sum.checked_add(value.checked_mul((overlap_end - overlap_start) as i128).ok_or(\"fused SUM product overflow\")?).ok_or(\"fused SUM overflow\")?; }} Ok(()) }})?;").unwrap();
+        writeln!(source, "    {visit}(session, 0, column.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; let overlap_start = start.max(rows.start); let overlap_end = end.min(rows.end); if overlap_start < overlap_end && let Some(value) = value {{ sum = sum.checked_add(value.checked_mul((overlap_end - overlap_start) as i128).ok_or(\"fused SUM product overflow\")?).ok_or(\"fused SUM overflow\")?; }} Ok(()) }})?;").unwrap();
     }
     writeln!(
         source,
@@ -901,11 +905,11 @@ fn emit_fused_queries(source: &mut String, case: usize, visit: &str, batch: Opti
     writeln!(source, "pub fn c{case:02}_fused_sum(column: &EncodedColumn, rows: Span, mode: ClosureMode) -> Result<Execution, String> {{ let mut session = ReadSession::new(&column.page, mode); c{case:02}_fused_sum_session(column, rows, &mut session) }}\n").unwrap();
 
     writeln!(source, "pub fn c{case:02}_fused_between_session(column: &EncodedColumn, rows: Span, low: i64, high: i64, session: &mut ReadSession<'_>) -> Result<Execution, String> {{").unwrap();
-    writeln!(source, "    if rows.start > rows.end || rows.end > column.truth.len() || low > high {{ return Err(\"fused BETWEEN invalid\".into()); }} load_metadata(&column.page, session)?; let mut ranges = Vec::new(); let mut decoded_rows = 0;").unwrap();
+    writeln!(source, "    if rows.start > rows.end || rows.end > column.len() || low > high {{ return Err(\"fused BETWEEN invalid\".into()); }} load_metadata(&column.page, session)?; let mut ranges = Vec::new(); let mut decoded_rows = 0;").unwrap();
     if let Some(batch) = batch {
-        writeln!(source, "    {batch}(session, 0, column.truth.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); let overlap_start = first.max(rows.start); let overlap_end = (first + values.len()).min(rows.end); if overlap_start < overlap_end {{ push_batch_matches(&mut ranges, &values[overlap_start - first..overlap_end - first], overlap_start, i128::from(low), i128::from(high)); }} Ok(()) }})?;").unwrap();
+        writeln!(source, "    {batch}(session, 0, column.len(), &mut |_session, values, first| {{ decoded_rows += values.len(); let overlap_start = first.max(rows.start); let overlap_end = (first + values.len()).min(rows.end); if overlap_start < overlap_end {{ push_batch_matches(&mut ranges, &values[overlap_start - first..overlap_end - first], overlap_start, i128::from(low), i128::from(high)); }} Ok(()) }})?;").unwrap();
     } else {
-        writeln!(source, "    {visit}(session, 0, column.truth.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; let overlap_start = start.max(rows.start); let overlap_end = end.min(rows.end); if overlap_start < overlap_end && value.is_some_and(|value| i128::from(low) <= value && value <= i128::from(high)) {{ push_range(&mut ranges, overlap_start, overlap_end); }} Ok(()) }})?;").unwrap();
+        writeln!(source, "    {visit}(session, 0, column.len(), &mut |_session, value, start, end| {{ decoded_rows += end - start; let overlap_start = start.max(rows.start); let overlap_end = end.min(rows.end); if overlap_start < overlap_end && value.is_some_and(|value| i128::from(low) <= value && value <= i128::from(high)) {{ push_range(&mut ranges, overlap_start, overlap_end); }} Ok(()) }})?;").unwrap();
     }
     writeln!(source, "    Ok(Execution {{ answer: Answer::Ranges(ranges), metrics: session.metrics(), decoded_rows }})").unwrap();
     writeln!(source, "}}\n").unwrap();

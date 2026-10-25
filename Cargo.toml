@@ -87,6 +87,21 @@ path = "tests/chunked_frames.rs"
 required-features = ["experiment"]
 
 [[test]]
+name = "evidence_layout"
+path = "tests/evidence_layout.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "native_reader"
+path = "tests/native_reader.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "ordered_regions"
+path = "tests/ordered_regions.rs"
+required-features = ["experiment"]
+
+[[test]]
 name = "bounds"
 path = "tests/bounds.rs"
 required-features = ["experiment"]
@@ -187,6 +202,21 @@ required-features = ["experiment"]
 [[bin]]
 name = "paged_study"
 path = "src/bin/paged_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "evidence_layout_study"
+path = "src/bin/evidence_layout_study.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "native_query"
+path = "src/bin/native_query.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "native_reader_study"
+path = "src/bin/native_reader_study.rs"
 required-features = ["experiment"]
 
 [[bin]]

@@ -1,0 +1,16 @@
+key,value
+status,started
+rule_fingerprint,a3706a5cdcb90cf6
+page_rows,16384
+rounds,9
+chunk_bytes,4096
+smoke,false
+all_pairs,false
+partition,fnv1a_group_source_mod3_zero_is_development
+selection,8_development_16_heldout_sources_one_pair_each
+byte_ratio_threshold,0.80
+latency_ratio_threshold,1.05
+pairs,24
+sources,24
+status,complete
+elapsed_seconds,345.441

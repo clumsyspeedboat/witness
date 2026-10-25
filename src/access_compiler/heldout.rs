@@ -192,6 +192,7 @@ pub fn primitive_rule_fingerprint() -> u64 {
         include_str!("static_baseline.rs"),
         include_str!("vector.rs"),
         include_str!("paged.rs"),
+        include_str!("native_file.rs"),
     );
     RULES.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)

@@ -16,6 +16,7 @@ const CENSUS: &str = "experiments/results/invariant_census";
 const CERTIFICATES: &str = "experiments/results/certificate_study";
 const REAL_ACCESS: &str = "experiments/results/real_access";
 const ADDITIONAL: &str = "experiments/results/additional_plans.csv";
+const NATIVE_READER: &str = "experiments/results/native_reader/confirmed";
 const OUTPUT: &str = "experiments/results/claim_manifest.csv";
 
 #[derive(Default)]
@@ -873,9 +874,246 @@ fn main() -> Result<(), Box<dyn Error>> {
     page_fact_claims(&mut out)?;
     distribution_claims(&mut out)?;
     breakdown_claims(&mut out)?;
+    native_reader_claims(&mut out)?;
 
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
+    Ok(())
+}
+
+/// A separate, explicitly confirmed diagnostic: resident native-container
+/// initialization and warm queries over four appended sorted batches. These
+/// claims never fall back to an older diagnostic directory or change the
+/// canonical benchmark's scope. An absent directory is allowed for older
+/// artifacts; an incomplete or inconsistent confirmed directory is not.
+fn native_reader_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    if !std::path::Path::new(NATIVE_READER).try_exists()? {
+        return Ok(());
+    }
+    let freeze = key_value_csv(&format!("{NATIVE_READER}/freeze.csv"))?;
+    for (key, expected) in [
+        ("status", "complete"),
+        (
+            "reader_scope",
+            "resident_including_checksum_and_descriptor_parsing",
+        ),
+        ("region_scope", "synthetic_four_appended_sorted_batches"),
+    ] {
+        if lookup(&freeze, key)? != expected {
+            return Err(format!("{NATIVE_READER}: unexpected {key}").into());
+        }
+    }
+    let current = read_csv(&format!("{CURRENT}/freeze.csv"))?;
+    let current_fingerprint = current.field(
+        current
+            .first()
+            .ok_or("canonical freeze has no result row")?,
+        "rule_fingerprint",
+    )?;
+    let fingerprint = |value: &str| u64::from_str_radix(value.trim_start_matches("0x"), 16);
+    if fingerprint(lookup(&freeze, "rule_fingerprint")?)? != fingerprint(&current_fingerprint)? {
+        return Err("native diagnostic and canonical study fingerprints differ".into());
+    }
+    let page_rows = lookup(&freeze, "page_rows")?.parse::<usize>()?;
+    let rounds = lookup(&freeze, "rounds")?.parse::<usize>()?;
+    let columns = lookup(&freeze, "reader_columns")?.parse::<usize>()?;
+    if page_rows == 0 || rounds == 0 || columns == 0 {
+        return Err("native diagnostic has an empty study shape".into());
+    }
+    let reader = read_csv(&format!("{NATIVE_READER}/reader.csv"))?;
+    if reader.len() != columns {
+        return Err("native reader row count differs from its completed freeze".into());
+    }
+    let mut sources = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    let mut page_bytes = 0_u128;
+    let mut descriptor_bytes = 0_u128;
+    let mut initialization = Vec::new();
+    let mut max_rows = 0;
+    for row in &reader {
+        let group = reader.field(row, "group")?;
+        let source = reader.field(row, "source")?;
+        let column = reader.field(row, "column")?;
+        if group.is_empty() || source.is_empty() || column.is_empty() {
+            return Err("native reader contains an empty column identity".into());
+        }
+        sources.insert((group.clone(), source.clone()));
+        if !keys.insert((group, source, column)) {
+            return Err("native reader contains a duplicate column".into());
+        }
+        let integer =
+            |name| -> Result<usize, Box<dyn Error>> { Ok(reader.field(row, name)?.parse()?) };
+        let rows = integer("rows")?;
+        let pages = integer("pages")?;
+        let payload = integer("page_bytes")?;
+        let file = integer("file_bytes")?;
+        let descriptor = integer("descriptor_bytes")?;
+        let matched = integer("matched")?;
+        reader.field(row, "sum")?.parse::<i128>()?;
+        if rows == 0
+            || pages != rows.div_ceil(page_rows)
+            || payload == 0
+            || descriptor == 0
+            || payload.checked_add(descriptor) != Some(file)
+            || matched == 0
+            || matched > rows
+        {
+            return Err("native reader has inconsistent sizes or result counts".into());
+        }
+        let open_ns = reader.field(row, "open_ns")?.parse::<f64>()?;
+        let first_query_ns = reader.field(row, "first_query_ns")?.parse::<f64>()?;
+        if !open_ns.is_finite()
+            || open_ns <= 0.0
+            || !first_query_ns.is_finite()
+            || first_query_ns <= 0.0
+        {
+            return Err("native reader has a nonpositive or nonfinite timing".into());
+        }
+        initialization.push(open_ns / 1e6);
+        page_bytes += payload as u128;
+        descriptor_bytes += descriptor as u128;
+        max_rows = max_rows.max(rows);
+    }
+    // Earlier diagnostic freezes omitted the input cap. The largest measured
+    // column records the observed cap; newer freezes can state it explicitly.
+    let row_cap = freeze
+        .get("row_cap")
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(max_rows);
+    if row_cap < max_rows {
+        return Err("native reader exceeds its frozen row cap".into());
+    }
+    define(out, "WitNativeColumns", &columns.to_string());
+    define(out, "WitNativeSources", &sources.len().to_string());
+    define(out, "WitNativeAllCases", &format!("{columns}/{columns}"));
+    define(
+        out,
+        "WitNativePageRows",
+        &group_digits(&page_rows.to_string()),
+    );
+    define(out, "WitNativeRowCap", &group_digits(&row_cap.to_string()));
+    define(
+        out,
+        "WitNativeOverheadPercent",
+        &format!("{:.2}", 100.0 * descriptor_bytes as f64 / page_bytes as f64),
+    );
+    // One from_bytes sample per column, with bytes already resident. This is
+    // neither filesystem-open latency nor a median of repeated timed opens.
+    define(
+        out,
+        "WitNativeInitMs",
+        &format!("{:.3}", median(&initialization)),
+    );
+
+    let regions = read_csv(&format!("{NATIVE_READER}/regions.csv"))?;
+    let page_counts = [64_usize, 512, 4_096];
+    let selectivities = ["0.001", "0.010", "0.100", "0.500"];
+    let arms = ["original", "regions", "zonemapplus_regions"];
+    let mut cells = BTreeMap::new();
+    for row in &regions {
+        let integer =
+            |name| -> Result<usize, Box<dyn Error>> { Ok(regions.field(row, name)?.parse()?) };
+        let pages = integer("pages")?;
+        let requested = regions.field(row, "requested")?;
+        let arm = regions.field(row, "arm")?;
+        let batches = integer("batches")?;
+        let ordered_regions = integer("regions")?;
+        let candidates = integer("candidate_pages")?;
+        let matched = integer("matched")?;
+        let sum = regions.field(row, "sum")?.parse::<i128>()?;
+        let timing = ["p25_ns", "median_ns", "p75_ns"]
+            .map(|name| regions.field(row, name)?.parse::<f64>().map_err(Into::into))
+            .into_iter()
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        if !page_counts.contains(&pages)
+            || !selectivities.contains(&requested.as_str())
+            || !arms.contains(&arm.as_str())
+            || batches != 4
+            || ordered_regions != if arm == "original" { 0 } else { batches }
+            || candidates == 0
+            || candidates > pages
+            || (arm == "original" && candidates != pages)
+            || matched == 0
+            || matched > pages * page_rows
+            || timing.iter().any(|time| !time.is_finite() || *time <= 0.0)
+            || timing[0] > timing[1]
+            || timing[1] > timing[2]
+        {
+            return Err("region diagnostic has an invalid cell or timing".into());
+        }
+        let key = (pages, requested, arm);
+        if cells
+            .insert(key, (matched, sum, candidates, timing[1] / 1e6))
+            .is_some()
+        {
+            return Err("region diagnostic contains a duplicate cell".into());
+        }
+    }
+    for pages in page_counts {
+        for requested in selectivities {
+            let reference = cells
+                .get(&(pages, requested.to_string(), "original".to_string()))
+                .ok_or("region diagnostic lacks an original cell")?;
+            for arm in arms {
+                let cell = cells
+                    .get(&(pages, requested.to_string(), arm.to_string()))
+                    .ok_or("region diagnostic lacks an arm")?;
+                if (cell.0, cell.1) != (reference.0, reference.1) {
+                    return Err("region diagnostic arms disagree on SUM or COUNT".into());
+                }
+            }
+            let facts = &cells[&(pages, requested.to_string(), "regions".to_string())];
+            let zone = &cells[&(
+                pages,
+                requested.to_string(),
+                "zonemapplus_regions".to_string(),
+            )];
+            if facts.2 != zone.2 {
+                return Err("region diagnostic arms disagree on candidate pages".into());
+            }
+        }
+    }
+    for (label, arm) in [
+        ("Original", "original"),
+        ("Facts", "regions"),
+        ("ZonePlus", "zonemapplus_regions"),
+    ] {
+        for (suffix, requested) in [("Tenth", "0.001"), ("Fifty", "0.500")] {
+            let mut coordinates = String::new();
+            for pages in page_counts {
+                let cell = &cells[&(pages, requested.to_string(), arm.to_string())];
+                write!(coordinates, "({pages},{:.6}) ", cell.3)?;
+            }
+            define(
+                out,
+                &format!("WitRegion{label}{suffix}Plot"),
+                coordinates.trim_end(),
+            );
+        }
+    }
+    let pages = *page_counts
+        .last()
+        .ok_or("region study has no page counts")?;
+    let original = &cells[&(pages, "0.001".to_string(), "original".to_string())];
+    let selective = &cells[&(pages, "0.001".to_string(), "regions".to_string())];
+    define(out, "WitRegionPages", &group_digits(&pages.to_string()));
+    define(
+        out,
+        "WitRegionBatches",
+        &regions.field(&regions[0], "batches")?,
+    );
+    define(out, "WitRegionRounds", &rounds.to_string());
+    define(
+        out,
+        "WitRegionSelectiveCandidates",
+        &selective.2.to_string(),
+    );
+    define(
+        out,
+        "WitRegionSelectiveSpeedup",
+        &format!("{:.1}", original.3 / selective.3),
+    );
     Ok(())
 }
 

@@ -11,5 +11,5 @@ NUMA node3 CPU(s):                    24-31,56-63
 TARGET SOURCE   FSTYPE OPTIONS
 /data  /dev/sda xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=128,swidth=640,noquota
 NAME ROTA TYPE  SIZE MODEL
-sda     0 disk 17,5T MR408i-o Gen11
-sdb     0 disk  1,5T MR408i-o Gen11
+sda     0 disk 17.5T MR408i-o Gen11
+sdb     0 disk  1.5T MR408i-o Gen11

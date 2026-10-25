@@ -90,7 +90,7 @@ The claim-bearing predicate experiment includes:
 - complete predicate-to-SUM answers checked for equality before timing.
 
 The source-bootstrap interval for access-ready Witness versus the Parquet
-boundary path is [0.08, 0.16], below parity.
+boundary path is [0.08, 0.17], below parity.
 
 ### PCodec and ORC
 
@@ -108,7 +108,7 @@ These are separately budgeted control certificates. They do not become
 | Probe class | candidate fraction | modeled bytes / scan |
 |---|---:|---:|
 | absent | 0.000 | 0.172 |
-| rare | 0.064 | 0.242 |
+| rare | 0.013 | 0.186 |
 | frequent | 1.000 | 1.172 |
 | mixed IN | 1.000 | 1.172 |
 

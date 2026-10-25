@@ -7,6 +7,7 @@ const GENERATED_DIR: &str = "experiments/generated/documentation_example";
 const ARTIFACT_DIR: &str = "docs/generated/artifacts";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let source_only = std::env::args().any(|argument| argument == "--source-only");
     fs::create_dir_all(GENERATED_DIR)?;
     fs::create_dir_all(ARTIFACT_DIR)?;
     let examples = example_columns();
@@ -15,6 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|example| encode(&example.recipe, example.input()))
         .collect::<Result<Vec<_>, _>>()?;
     for (example, column) in examples.iter().zip(&columns) {
+        if source_only {
+            continue;
+        }
         column
             .page
             .write(format!("{ARTIFACT_DIR}/{}.acp", example.name))?;

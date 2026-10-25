@@ -15,5 +15,5 @@ TARGET SOURCE                            FSTYPE OPTIONS
 TARGET   SOURCE FSTYPE OPTIONS
 /dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64
 NAME ROTA TYPE  SIZE MODEL
-sda     0 disk 17,5T MR408i-o Gen11
-sdb     0 disk  1,5T MR408i-o Gen11
+sda     0 disk 17.5T MR408i-o Gen11
+sdb     0 disk  1.5T MR408i-o Gen11

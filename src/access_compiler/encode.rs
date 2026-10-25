@@ -160,7 +160,20 @@ pub struct EncodedColumn {
     pub recipe: Recipe,
     pub decoder: DecoderIr,
     pub page: SerializedPage,
+    /// Writer/test oracle only; a file reader leaves this empty. Query
+    /// cardinality comes from the validated decoder, never from this vector.
     pub truth: Vec<Option<i64>>,
+}
+
+impl EncodedColumn {
+    pub fn len(&self) -> usize {
+        // DecoderIr::new validates and caches the root's logical length.
+        self.decoder.len().expect("validated decoder length")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Clone, Debug)]

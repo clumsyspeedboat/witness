@@ -89,6 +89,7 @@ impl DecoderNode {
 pub struct DecoderIr {
     nodes: Vec<DecoderNode>,
     root: NodeId,
+    len: usize,
 }
 
 impl DecoderIr {
@@ -107,7 +108,8 @@ impl DecoderIr {
             }
             validate_node(index, node, &nodes)?;
         }
-        Ok(Self { nodes, root })
+        let len = nodes[root.0].len(&nodes)?;
+        Ok(Self { nodes, root, len })
     }
 
     pub fn nodes(&self) -> &[DecoderNode] {
@@ -125,7 +127,7 @@ impl DecoderIr {
     }
 
     pub fn len(&self) -> Result<usize, String> {
-        self.node(self.root)?.len(&self.nodes)
+        Ok(self.len)
     }
 
     pub fn is_empty(&self) -> Result<bool, String> {

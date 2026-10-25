@@ -1,0 +1,26 @@
+generated_utc=2026-10-25T09:57:11Z
+git_commit=98a3117d0e8947f133d4214f26c15db4cbd4b458
+git_branch=evidence-preserving-layout
+cpu_affinity=0
+timing_scope=resident; single-threaded; OS scheduling is shared
+rustc 1.96.0 (ac68faa20 2026-05-25)
+Linux e1-g0001 6.8.0-88-generic #89-Ubuntu SMP PREEMPT_DYNAMIC Sat Oct 11 01:02:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+ M Cargo.toml
+ M experiments/render_paper_claims.py
+ M src/experiment/mod.rs
+ M tests/documentation_example.rs
+?? experiments/results/evidence_layout/
+?? experiments/run_evidence_layout.sh
+?? experiments/summarize_evidence_layout.py
+?? src/bin/evidence_layout/
+?? src/bin/evidence_layout_study.rs
+?? src/experiment/evidence_layout.rs
+?? tests/evidence_layout.rs
+e3625dda0169891596a632b3d74f0de1b6b45185b989874ead3301417b0a9640  Cargo.lock
+4816061362d53a56cd1b3e5739ff5ae36ab12242ae2ac0988c3a12959f04b7f5  INPUTS.sha256
+daa49dbac1fdb8b6221197e769c7e8152bdffc202947868414c875149b217c29  src/experiment/evidence_layout.rs
+2ded2281908b98264c166d67e876e4e82023f026023d9d548263519ed13e7750  src/bin/evidence_layout_study.rs
+502a53f0338324bc9566305ce2859be0a78f85f52608442d4b102fb3dc1baceb  src/bin/evidence_layout/measure.rs
+349b8ad09368bfcc38c641aee212587648eb5ae7fcb15da7f92a06c04fb36221  src/bin/evidence_layout/README.md
+3cf34d58aea518b9c7e31f7db5eb5a69c29998df9369b015044495400b336ca6  experiments/summarize_evidence_layout.py
+43c5c0ee0d9455d1de95f19a75388b71dac311d74bf28db48d0ade34d8276e9d  target/release/evidence_layout_study

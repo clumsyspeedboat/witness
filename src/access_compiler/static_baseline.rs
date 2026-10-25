@@ -601,7 +601,7 @@ pub fn static_get<D: StaticDecoder>(
     row: usize,
     mode: ClosureMode,
 ) -> Result<Execution, String> {
-    if row >= column.truth.len() {
+    if row >= column.len() {
         return Err("static GET outside column".into());
     }
     let mut session = ReadSession::new(&column.page, mode);
@@ -732,7 +732,7 @@ pub fn static_monotone_filter<D: StaticDecoder>(
     load_metadata(&column.page, &mut session)?;
     let mut decoded_rows = 0;
     let mut left = 0;
-    let mut right = column.truth.len();
+    let mut right = column.len();
     while left < right {
         let mid = left + (right - left) / 2;
         let value = D::get(&mut session, mid)?;
@@ -744,7 +744,7 @@ pub fn static_monotone_filter<D: StaticDecoder>(
         }
     }
     let start = left;
-    right = column.truth.len();
+    right = column.len();
     while left < right {
         let mid = left + (right - left) / 2;
         let value = D::get(&mut session, mid)?;
@@ -782,8 +782,8 @@ pub fn static_piecewise_monotone_filter<D: StaticDecoder>(
     let mut ranges = Vec::new();
     let mut decoded_rows = 0;
     let mut block_start = 0;
-    while block_start < column.truth.len() {
-        let block_end = (block_start + max_rows).min(column.truth.len());
+    while block_start < column.len() {
+        let block_end = (block_start + max_rows).min(column.len());
         let start = piecewise_boundary::<D>(
             &mut session,
             block_start,
@@ -875,7 +875,7 @@ pub fn static_dictionary_filter<
         Ids::batch(
             &mut session,
             0,
-            column.truth.len(),
+            column.len(),
             &mut |_session, codes, first| {
                 decoded_rows += codes.len();
                 if codes.iter().any(|&id| !(0..ENTRIES as i128).contains(&id)) {
@@ -895,7 +895,7 @@ pub fn static_dictionary_filter<
         Ids::visit(
             &mut session,
             0,
-            column.truth.len(),
+            column.len(),
             &mut |_session, id, start, end| {
                 decoded_rows += end - start;
                 let id = usize::try_from(id.ok_or("static dictionary id is null")?)
@@ -937,7 +937,7 @@ fn monotone_before(
 }
 
 fn validate_rows(column: &EncodedColumn, rows: Span) -> Result<(), String> {
-    if rows.start > rows.end || rows.end > column.truth.len() {
+    if rows.start > rows.end || rows.end > column.len() {
         Err("static query range invalid".into())
     } else {
         Ok(())

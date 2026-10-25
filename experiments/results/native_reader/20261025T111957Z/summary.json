@@ -1,0 +1,95 @@
+{
+  "status": "complete",
+  "reader_columns": 15,
+  "reader_sources": 15,
+  "descriptor_bytes": 115976,
+  "descriptor_over_page_bytes": 0.1043956043956044,
+  "median_open_ms": 0.155443,
+  "region_comparisons": [
+    {
+      "pages": 64,
+      "selectivity": 0.001,
+      "candidate_pages": 8,
+      "speedup_over_original": 2.153767118833643,
+      "facts_over_same_shortcuts": 1.0343858044206475
+    },
+    {
+      "pages": 64,
+      "selectivity": 0.01,
+      "candidate_pages": 8,
+      "speedup_over_original": 2.049756937889371,
+      "facts_over_same_shortcuts": 1.0285062437047197
+    },
+    {
+      "pages": 64,
+      "selectivity": 0.1,
+      "candidate_pages": 8,
+      "speedup_over_original": 1.754876812026487,
+      "facts_over_same_shortcuts": 1.0210668290985034
+    },
+    {
+      "pages": 64,
+      "selectivity": 0.5,
+      "candidate_pages": 32,
+      "speedup_over_original": 1.1815737599628304,
+      "facts_over_same_shortcuts": 1.1157091890408453
+    },
+    {
+      "pages": 512,
+      "selectivity": 0.001,
+      "candidate_pages": 8,
+      "speedup_over_original": 10.958547747826659,
+      "facts_over_same_shortcuts": 1.030787982755118
+    },
+    {
+      "pages": 512,
+      "selectivity": 0.01,
+      "candidate_pages": 8,
+      "speedup_over_original": 8.630669636875252,
+      "facts_over_same_shortcuts": 1.0238189145159906
+    },
+    {
+      "pages": 512,
+      "selectivity": 0.1,
+      "candidate_pages": 56,
+      "speedup_over_original": 2.5709922419129447,
+      "facts_over_same_shortcuts": 1.091852076693479
+    },
+    {
+      "pages": 512,
+      "selectivity": 0.5,
+      "candidate_pages": 256,
+      "speedup_over_original": 1.240909160936481,
+      "facts_over_same_shortcuts": 1.1162741371947111
+    },
+    {
+      "pages": 4096,
+      "selectivity": 0.001,
+      "candidate_pages": 8,
+      "speedup_over_original": 47.192164830629544,
+      "facts_over_same_shortcuts": 1.023013666597381
+    },
+    {
+      "pages": 4096,
+      "selectivity": 0.01,
+      "candidate_pages": 48,
+      "speedup_over_original": 15.33308880659118,
+      "facts_over_same_shortcuts": 1.0936677083535524
+    },
+    {
+      "pages": 4096,
+      "selectivity": 0.1,
+      "candidate_pages": 416,
+      "speedup_over_original": 2.9464707090926106,
+      "facts_over_same_shortcuts": 1.1153207829702274
+    },
+    {
+      "pages": 4096,
+      "selectivity": 0.5,
+      "candidate_pages": 2048,
+      "speedup_over_original": 1.349333590437212,
+      "facts_over_same_shortcuts": 1.2630359671151146
+    }
+  ],
+  "scope": "resident reader initialization; synthetic appended-batch query diagnostic"
+}

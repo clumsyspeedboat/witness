@@ -8,6 +8,18 @@ const GENERATED_DIR: &str = "experiments/generated/real_access";
 const RESULT_DIR: &str = "experiments/results/real_access";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|argument| argument == "--source-only") {
+        let columns = real_access_columns()?
+            .into_iter()
+            .map(|column| column.size_selected)
+            .collect::<Vec<_>>();
+        fs::create_dir_all(GENERATED_DIR)?;
+        fs::write(
+            format!("{GENERATED_DIR}/generated.rs"),
+            generate_rust_module(&columns)?,
+        )?;
+        return Ok(());
+    }
     fs::create_dir_all(GENERATED_DIR)?;
     fs::create_dir_all(format!("{RESULT_DIR}/pages"))?;
     let columns = real_access_columns()?;

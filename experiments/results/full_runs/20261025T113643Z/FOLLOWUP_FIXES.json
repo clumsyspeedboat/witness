@@ -1,0 +1,22 @@
+{
+  "runner": {
+    "fixed_utc": "2026-10-25T16:20:38.016167+00:00",
+    "issue": "Diagnostic runners assumed target/release even when CARGO_TARGET_DIR selected another build directory.",
+    "fix": "Resolve Cargo target_directory via cargo metadata and execute/checksum that binary.",
+    "changed_files": {
+      "experiments/run_native_reader.sh": "bd7e82169c2b87ca6b3258bc6e57ed672503d659a2e0b3cc7d62988e44d807ad",
+      "experiments/run_evidence_layout.sh": "a860217b45212680fc8d48a2fdc77bbf19343954d41567cfc2c2bafdc3e6248b"
+    },
+    "canonical_reproduction": "all eight stages completed before this runner-only failure; rerun only unfinished postchecks"
+  },
+  "documentation": {
+    "issue": "Fresh measurements left numerical public prose stale; the final currency test caught the mismatch.",
+    "fix": "Claim renderer now refreshes anchored numeric phrases and table cells atomically, preserving author whitespace.",
+    "regression_tests": "Four Python renderer tests; current/frozen and rerun Rust documentation checks pass.",
+    "files": {
+      "experiments/render_paper_claims.py": "b5e2a3ac55eee4ff42f88029dd802ca81a38b6ea0a1eef9818b551b618e9261c",
+      "experiments/render_docs_claims.py": "385ef50277e86a45983855a7d0ba6c068a0124c0df62a94ed33d04aa2359ab2b",
+      "tests/test_render_docs_claims.py": "51fcdf26aa0ddefb19a50a33096d08f5fb449299886208f6196c2cef8c143153"
+    }
+  }
+}

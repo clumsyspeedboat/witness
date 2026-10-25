@@ -20,15 +20,15 @@ These constraints are part of the result.
   The separate paged study compares complete queries across multiple pages;
   its medians summarize the fixed workload rather than a population sample.
 - Access-ready Witness versus the Parquet boundary-search path has source
-  median 0.15x with a 95% bootstrap interval [0.08, 0.16]. The interval sits
+  median 0.15x with a 95% bootstrap interval [0.08, 0.17]. The interval sits
   below parity, but the 32 sources are not 32 independent draws: NAB
   contributes several columns per archive family. A two-stage cluster bootstrap
   (families, then sources within each) gives [0.06, 0.27]. Collapsing each
-  family to a single draw instead gives 0.25x [0.09, 1.15], which spans parity,
+  family to a single draw instead gives 0.25x [0.10, 1.15], which spans parity,
   but that weights a one-column family like a ten-column one and the singleton
   families are the worst cases. Distribution-free, 9 of the 12 families favour
   the compiled plan: a Wilcoxon signed-rank test on the log ratios gives a
-  two-sided p=0.016. The weaker sign test, which discards magnitude, gives a
+  two-sided p=0.016 The weaker sign test, which discards magnitude, gives a
   one-sided p=0.073 on the same data. Read the separation as evidence for the
   mechanism on this corpus, not as a population-level claim.
 - Monotone and no-fact classes are imbalanced. The no-fact class has six
@@ -68,7 +68,7 @@ These constraints are part of the result.
   cloud caches, or direct I/O.
 - The cold XFS result is one host and one bundle: 20.44 MiB of required closure
   in a 27.68 MiB file. Minimal per-page reads issued 1,083 calls and took
-  1.29x a full read; coalescing issued 119 calls and reached 1.00x. This is a
+  1.26x a full read; coalescing issued 119 calls and reached 1.00x. This is a
   mechanism result, not a device-universal constant.
 - "Cold" in that experiment means the OS page cache was evicted with
   `posix_fadvise(POSIX_FADV_DONTNEED)` before each repeat. That call is
@@ -146,19 +146,22 @@ These constraints are part of the result.
   every dictionary id lies inside its table. A full check of the ids costs a
   decode of the page, so it is made once, at sealing, and not by the reader;
   a forged order moves no id outside its table.
-- The codec tree (codecs, widths, fields, dictionary sizes) travels beside a
-  page in memory rather than inside its bytes, so a paged file is read with
-  the column it was written from. Dictionary order is verified against the
-  page's bytes when the page is sealed, and again by the reader, once per
-  page for as long as it holds the column, before a plan relies on it.
+- The legacy cold-read container keeps codec trees beside pages and is read
+  with the column it was written from. The experimental
+  [native reader](NATIVE_FILES.md) serializes codec descriptions and rebuilds
+  facts without writer objects or oracle vectors. It loads/checksums the
+  entire file and verifies declared dictionary order at initialization;
+  this does not establish unread-page cold-I/O performance. The legacy
+  reader verifies root dictionary order once before planning relies on it.
 - Planning in place from a file reads a dictionary it must search in one
   request rather than one request per probe. That issues fewer requests but
   reads every entry of a large dictionary; fetching only small tables whole and
   probing large ones would balance the two, and is not yet done.
-- A footer of derived bounds is checked against every page a query reads;
-  pages a query skips or accepts without reading rely on it. One page appended
-  out of order ends the column certificate, and the column is then planned
-  page by page.
+- A footer of derived bounds is audited on scanned selector pages; skipped
+  and accepted entries remain trusted. One out-of-order append disables
+  the default whole-column certificate. The opt-in ordered-region extension
+  retains independently certified page ranges and plans uncertified gaps
+  page by page; its applicability and overhead depend on the data.
 - Certificates are generated and consumed by the same Rust implementation.
   An independent reader implementation has not yet validated the format.
 - The rule grammar is finite. “Optimal” means the selected plan under this

@@ -1,0 +1,13 @@
+generated_utc=2026-10-25T16:20:38Z
+git_commit=98a3117d0e8947f133d4214f26c15db4cbd4b458
+git_branch=
+cpu_affinity=0
+timing_scope=resident; initialization measured separately; shared host
+rustc 1.96.0 (ac68faa20 2026-05-25)
+e3625dda0169891596a632b3d74f0de1b6b45185b989874ead3301417b0a9640  Cargo.lock
+123e2ea8148dda861e88503ad9d6e721cf32caedf0b6761df8021ec8807f814d  src/access_compiler/native_file.rs
+dd1962cff33dc313776da56d9ebe65a7776cb480973884f0eb93880450e5f67d  src/access_compiler/paged.rs
+f1473164d50191c8066a899c4c43e7c26b93284711eac315921a25f6ce710d2e  src/access_compiler/decoder.rs
+00b7380ad3333a86d9c53c2a57bab996d261436fc2378c0c434678fd5fd7c14d  src/access_compiler/encode.rs
+aba0723404682f2efc69dcb8be1f59e7a47d3c6809ea3f07810e66cadf7807b6  src/bin/native_reader_study.rs
+fb0b1e476f6bd14c76c69bf100c6d7aa92a5e37612ad1d96d1987301c48ed611  /data/experiments/git_repos/witness/target/release/native_reader_study
