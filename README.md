@@ -31,9 +31,8 @@ selects the pinned toolchain in `rust-toolchain.toml`. Initial builds need
 network access for Rust dependencies. From a fresh clone:
 
 ```bash
-git clone https://github.com/clumsyspeedboat/witness.git
+git clone --depth 1 --branch main https://github.com/clumsyspeedboat/witness.git
 cd witness
-git switch main
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r experiments/requirements.txt
