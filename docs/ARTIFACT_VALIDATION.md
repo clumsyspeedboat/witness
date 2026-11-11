@@ -6,6 +6,8 @@ the exported source was rebuilt and tested at the new checkout path.
 
 - `make verify`: passed formatting, Clippy with warnings denied, 240 Rust tests,
   24 Python tests, and byte-identical regeneration of the claim manifest.
+- Data-free execution smoke test: passed 16 shapes, 704 warm query cells,
+  and 1,008 total-timing cells, with exact-answer checks.
 - Python virtual-environment installation of pinned DuckDB 1.5.3: passed.
 - Existing downloaded corpus inventory: all 2,221 pinned files verified.
 - Confirmed prepared-query result checksums: passed.
