@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "Witness: query compilation from invariants witnessed by compressed column layouts"
+title: "Witness: What an Encoding Knows"
 type: software
 version: 0.2.0
 license: Apache-2.0
@@ -8,7 +8,9 @@ repository-code: "https://github.com/clumsyspeedboat/witness"
 authors:
   - family-names: Mondal
     given-names: Rahul
+    orcid: "https://orcid.org/0000-0001-7673-9811"
     affiliation: Technische Hochschule Ingolstadt
   - family-names: Cato
     given-names: Patrick
+    orcid: "https://orcid.org/0000-0003-2310-6433"
     affiliation: Technische Hochschule Ingolstadt

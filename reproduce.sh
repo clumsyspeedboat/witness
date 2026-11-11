@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 # Rebuild every claim-bearing result from pinned corpus slices.
 set -euo pipefail
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+
+case "${1:-}" in
+  --help|-h)
+    printf 'Usage: ./reproduce.sh [--check|--help]\n\nNo arguments: fetch pinned inputs and remeasure all studies (hours; replaces local results).\n--check: validate code and committed evidence without downloading corpora.\n'
+    exit 0 ;;
+  --check) exec ./experiments/verify_artifact.sh ;;
+  '') ;;
+  *) printf 'Unknown argument: %s (use --help)\n' "$1" >&2; exit 2 ;;
+esac
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -11,7 +21,7 @@ need() {
     exit 1
   }
 }
-for command in cargo rustc make python3 sha256sum; do
+for command in cargo rustc make python3 sha256sum curl git rg flock taskset lscpu; do
   need "$command"
 done
 python3 -c 'import duckdb' 2>/dev/null || {
@@ -83,7 +93,7 @@ cargo run --locked --release --features experiment --bin paged_cold_study
 python3 experiments/duckdb_baseline.py
 ./experiments/run_repeats.sh
 
-printf '6/8 native reader, ordered regions, auxiliary plans, and claim manifest\n'
+printf '6/8 native reader, query optimization, auxiliary plans, and claim manifest\n'
 # Keep each new measurement intact, then refresh the explicitly scoped extension
 # inputs before generating claims. A failed diagnostic never updates confirmed.
 mkdir -p experiments/results/native_reader
@@ -96,6 +106,21 @@ done
 # Write the completed freeze last; the claim generator validates all cells and
 # requires its source fingerprint to match the main study.
 cp -- "$native_run_dir/freeze.csv" experiments/results/native_reader/confirmed/
+printf '6a/8 prepared-query and access-cost diagnostic (all pairs)\n'
+mkdir -p experiments/results/query_optimization
+query_run_dir=$(mktemp -d experiments/results/query_optimization/remeasure-XXXXXXXX)
+WITNESS_QUERY_OPTIMIZATION_RESULT_DIR="$query_run_dir" \
+  ./experiments/run_query_optimization.sh --all
+python3 experiments/summarize_query_optimization.py "$query_run_dir"
+mkdir -p experiments/results/query_optimization/confirmed
+for result in queries.csv shapes.csv totals.csv summary.json summary.md PROVENANCE.txt run.log; do
+  cp -- "$query_run_dir/$result" experiments/results/query_optimization/confirmed/
+done
+# Publish the complete freeze only after every validated file is in place.
+cp -- "$query_run_dir/freeze.csv" experiments/results/query_optimization/confirmed/
+(cd experiments/results/query_optimization/confirmed && \
+  sha256sum freeze.csv queries.csv shapes.csv totals.csv summary.json summary.md \
+    > CHECKSUMS.sha256 && sha256sum -c CHECKSUMS.sha256)
 cargo run --locked --release --features experiment --bin claim_manifest -- --measure-additional
 python3 experiments/render_paper_claims.py
 
@@ -142,6 +167,9 @@ printf '8/8 provenance and checksums\n'
     experiments/results/paged_string/*.csv \
     experiments/results/paged_cold/*.csv \
     experiments/results/native_reader/confirmed/*.csv \
+    experiments/results/query_optimization/confirmed/*.csv \
+    experiments/results/query_optimization/confirmed/summary.json \
+    experiments/results/query_optimization/confirmed/summary.md \
     experiments/results/repeats/*/*/*.csv \
     "$PAIRED_16K"/*.csv \
     experiments/results/additional_plans.csv \

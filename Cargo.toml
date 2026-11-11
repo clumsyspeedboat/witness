@@ -275,3 +275,18 @@ path = "src/bin/documentation_example.rs"
 required-features = ["experiment"]
 
 # examples live under experiments/ (single empirical parent dir)
+
+[[test]]
+name = "prepared_queries"
+path = "tests/prepared_queries.rs"
+required-features = ["experiment"]
+
+[[test]]
+name = "access_cost_planning"
+path = "tests/access_cost_planning.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "query_optimization_study"
+path = "src/bin/query_optimization_study.rs"
+required-features = ["experiment"]

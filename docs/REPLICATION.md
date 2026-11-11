@@ -19,9 +19,12 @@ git diff --exit-code experiments/results/claim_manifest.csv
 `claim_manifest.csv` contains every scalar, table row, and plot coordinate
 derived for the submitted study. The generator reads only canonical CSVs and
 uses a fixed bootstrap seed.
-If a local manuscript is present, `make claims` also refreshes every
-`paper/**/claim.tex` from that manifest, and the paper drift test checks every
-`.tex` file below `paper/`.
+The public clone contains no manuscript files. Optional local manuscript
+rendering is not needed to regenerate or check the public artifact.
+
+For the complete data-free verification path, use `make verify` (also available
+as `./reproduce.sh --check`). Install the prerequisites and activate the Python
+virtual environment as described in the root README first.
 
 ## Full remeasurement
 
@@ -31,7 +34,7 @@ If a local manuscript is present, `make claims` also refreshes every
 
 It needs Rust, Python 3 with the pinned `duckdb` package
 (`pip install -r experiments/requirements.txt`), and
-about 30 GB of free disk for the Parquet files the paged studies export for
+at least 60 GB of free disk overall, including roughly 30 GB for the Parquet files the paged studies export for
 DuckDB (`experiments/results/paged_*/parquet/`, ignored by git).
 
 This one command fetches all corpus inputs, verifies `INPUTS.sha256`, applies
@@ -47,7 +50,7 @@ The eight stages are:
 | 3 | Bloom, min/max, and sparse-fence controls |
 | 4 | logical, delivered, and transferred access measurements |
 | 5 | paged queries (facts, zone map, scan) against Parquet and DuckDB, checker and attestation fault injection, the untimed direct against byte-optimised menu study, 4 Ki and 64 Ki page sizes, and 60 M-row thread scaling |
-| 6 | self-contained reader and synthetic ordered-region measurements, auxiliary plans, and claim manifest |
+| 6 | self-contained reader, prepared-query/access-cost diagnostics, synthetic ordered-region measurements, auxiliary plans, and claim manifest |
 | 7 | generated kernels, physical toy artifacts, and walkthrough |
 | 8 | host provenance and input/output checksums |
 
@@ -160,3 +163,11 @@ Tests cover invariant soundness, restart seams, nullable and patched streams,
 dictionary/RLE/frame compositions, descriptor tampering, malformed inputs,
 generated/interpreted/handwritten answer equality, physical access closure,
 certificate refinement, and generated-artifact drift.
+
+## Isolated verification record
+
+The submission preparation verifies an exported checkout with no `paper/`,
+local corpus cache, manuscript tools, or absolute-path result symlinks. It runs
+`make verify`, `make claims`, and the data-free query-optimization smoke study.
+A full multi-hour remeasurement is not performed as part of this packaging
+check; the committed per-study provenance describes the measured runs.

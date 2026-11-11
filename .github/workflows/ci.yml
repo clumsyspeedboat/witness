@@ -7,8 +7,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rust-toolchain.toml pins the compiler, rustfmt and clippy.
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --release --all-targets --all-features --locked -- -D warnings
-      # The corpus is not vendored, so CI runs the suite that needs no downloads.
-      - run: cargo test --release --all-features --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Same data-free path documented for a fresh reviewer clone.
+      - run: make verify
+      - run: ./experiments/run_query_optimization.sh --smoke

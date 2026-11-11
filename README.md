@@ -2,62 +2,86 @@
 
 Research artifact for *What an Encoding Knows*.
 
-> **A storage format does not merely hold values — it *proves* things about
-> them.** Witness derives those proofs from the bytes, requires every query plan
-> to cite the one it relies on, and falls back to a recorded scan when it cannot.
+Witness derives bounds, order, and dictionary mappings through composed codecs,
+tracks their row scope and evidence source, and checks the query actions that
+use them. The artifact includes the implementation, tests, frozen generated
+kernels, and canonical measurements. Manuscripts, review notes, and downloaded
+papers are excluded.
 
-Columnar formats are judged on **size** and **decode speed**. This artifact
-measures a third axis — **evidence**: what the bytes entail about the values, and
-therefore which algorithms are legal at all.
+Structural guarantees assume valid decoding and correct rules. Verified facts
+assume unchanged bytes; writer flags and cached summaries retain their stated
+trust requirements. The checker catches supported plan inconsistencies, not
+arbitrary corruption or false writer assertions. Unsigned deltas guarantee order
+between restart anchors, not across them. The main planner uses fixed priorities;
+optional cost/prepared-context diagnostics are separate from the main ablation.
 
-### A proof that costs nothing
+## Start here: fresh clone
 
-Store twelve timestamps as an anchor plus the gaps between them, gaps *unsigned*:
+Use Linux with Rust (via rustup), Python 3.10+, and a C/C++ build toolchain.
+On Ubuntu/Debian, install the system prerequisites:
 
-```text
-value   1000  1003  1004  1004  1007  1012  1012  1015  …
-          │     +3    +1    +0    +3    +5    +0    +3   <- unsigned: no minus sign exists
-       anchor
-        64 bits + 11 x 7 bits = 141 bits          raw: 12 x 64 = 768 bits
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libssl-dev curl git make \
+  python3 python3-venv util-linux ripgrep unzip
 ```
 
-The column **cannot** decrease — disorder is unwriteable — so binary search is a
-legal substitute for a scan. The proof costs **zero extra bytes**: the data is
-the evidence.
+Install Rust using [rustup](https://rustup.rs/) if needed; Cargo automatically
+selects the pinned toolchain in `rust-toolchain.toml`. Initial builds need
+network access for Rust dependencies. From a fresh clone:
 
-### A proof alone is worthless
+```bash
+git clone https://github.com/clumsyspeedboat/witness.git
+cd witness
+git switch main
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r experiments/requirements.txt
+make verify
+```
 
-| | bytes not reachable | bytes reachable |
-|---|---|---|
-| **order proved** | sealed in a frame: true, unusable | **boundary search authorized** |
-| **nothing proved** | scan | restart anchors, nothing to spend |
+`make verify` runs formatting, Clippy, Rust/Python tests, and regeneration of the
+claim manifest, checking it against the committed evidence. It downloads no
+corpora and runs no full benchmark suite. It may take several minutes or longer
+on the first build. **Start with this path**, then choose remeasurement below.
 
-Order and reachability are independent. In the census **0.0%** of columns hold
-the free structural proof *and* fast access: beyond 256 rows the two requirements
-contradict each other. Paged columns resolve this differently: every page proves
-or certifies its own order, and appending a page checks one seam to keep the
-whole column certified.
+```bash
+# Reconstruct the exact reported values from committed CSVs; no corpus needed.
+make claims
 
-### An encoding already carries a zone map
+# Remeasure all claim-bearing studies; downloads inputs and replaces local results.
+./reproduce.sh
+```
 
-A frame-of-reference base is the exact minimum of its page, and the bit width
-bounds the maximum; a sorted dictionary holds the exact minimum and maximum in
-its first and last entries. Witness derives these bounds as facts, at no byte
-cost, and a page whose bound excludes a predicate is skipped, while one whose
-bound lies inside it is accepted without decoding. A sorted dictionary also
-lists every value its page holds, so a page whose dictionary has no entry in
-the predicate is skipped even where its bounds straddle it: a skip no zone map
-can make.
+A full run can take several hours or longer depending on hardware and downloads.
+Allow at least 60 GB free disk (more is prudent for build intermediates) and
+substantial RAM for SF10 data. Run on an otherwise idle Linux machine with network
+access to the documented data sources and DuckDB extensions. The cold study
+attempts OS-cache eviction but cannot flush storage-controller caches; timings
+will differ across machines. Do not interpret remeasurement as exact recovery
+of the authors' timing values. Use a separate clone for new runs if you want to
+keep the committed measurements untouched.
 
-### Why this is not a cost model
+A data-free execution smoke test is available after verification:
 
-| | conventional optimiser | Witness |
-|---|---|---|
-| index-scan vs scan is a… | **cost** decision | **legality** decision |
-| picking wrong gives… | a slow answer | **the wrong answer** |
-| so the check is… | a term in a cost model | **a gate, re-verified before running** |
+```bash
+./experiments/run_query_optimization.sh --smoke
+```
 
-### What is measured
+It writes a new timestamped diagnostic directory and checks exact answers. It
+never promotes smoke data to the confirmed natural-data results. Full
+replication details and scoped extension measurements are in
+[Replication](docs/REPLICATION.md) and
+[Query optimizations](docs/QUERY_OPTIMIZATIONS.md).
+
+### Supporting whole-column diagnostics
+
+These earlier diagnostics are separate from the main paged-query ablation below.
+In the whole-column census, **0.0%** combine structural unsigned-delta order
+with cheap direct access under the tested policies. Facts and cheap access are
+separate requirements; a licensed search is not necessarily the cheapest path.
+
+
 
 A census of **1784** columns from **93** sources, and a query study of **152**
 cells over **32** sources at 131,072 rows per column.
@@ -92,6 +116,12 @@ them on TPC-H SF10 lineitem on 1 to 64 threads.
 | queries a zone map with a neighbour's or truncated statistics answers wrongly | **88** and **645** of 1,166; planned from facts, none |
 | mutated plans that would answer wrongly, rejected by the checker | **484,951** of 484,951 |
 | sorted key, 0.1% of 60 M rows, one thread | **0.04 ms** against Parquet's 0.31 ms (0.28–0.31 ms across runs) |
+
+The integer median against the plain zone map is unchanged. A zone map given
+the same shortcuts performs similarly: these comparisons isolate bound source
+and shortcut availability, rather than establishing a faster search algorithm.
+String gains use dictionary order; the matched-shortcut control removes almost
+all of the difference. All result tables above are regenerated from the manifest.
 
 Derived knowledge helps when it is present, cheap to reach, and not erased by the
 storage layer beneath it. A plain scan was always correct anyway.

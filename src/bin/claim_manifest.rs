@@ -17,6 +17,7 @@ const CERTIFICATES: &str = "experiments/results/certificate_study";
 const REAL_ACCESS: &str = "experiments/results/real_access";
 const ADDITIONAL: &str = "experiments/results/additional_plans.csv";
 const NATIVE_READER: &str = "experiments/results/native_reader/confirmed";
+const QUERY_OPTIMIZATION: &str = "experiments/results/query_optimization/confirmed";
 const OUTPUT: &str = "experiments/results/claim_manifest.csv";
 
 #[derive(Default)]
@@ -875,10 +876,468 @@ fn main() -> Result<(), Box<dyn Error>> {
     distribution_claims(&mut out)?;
     breakdown_claims(&mut out)?;
     native_reader_claims(&mut out)?;
+    query_optimization_claims(&mut out)?;
 
     out.write(OUTPUT)?;
     println!("wrote {OUTPUT}");
     Ok(())
+}
+
+/// A separately confirmed query-context diagnostic. Its fingerprint and
+/// source sample are reported on their own; it is never merged into the
+/// frozen main ablation. A missing extension keeps older checkouts usable,
+/// while a present but incomplete result is an error.
+fn query_optimization_claims(out: &mut ClaimManifest) -> Result<(), Box<dyn Error>> {
+    if !std::path::Path::new(QUERY_OPTIMIZATION).try_exists()? {
+        return Ok(());
+    }
+
+    let freeze = key_value_csv(&format!("{QUERY_OPTIMIZATION}/freeze.csv"))?;
+    for (key, expected) in [
+        ("status", "complete"),
+        ("mode", "all"),
+        ("selection", "all_canonical_pairs"),
+        ("partition", "fnv1a_group_source_mod3_zero_is_development"),
+        ("cost_gate", "no_measured_query_tuning"),
+    ] {
+        if lookup(&freeze, key)? != expected {
+            return Err(format!("{QUERY_OPTIMIZATION}: unexpected {key}").into());
+        }
+    }
+    let fingerprint = lookup(&freeze, "rule_fingerprint")?.clone();
+    if fingerprint.len() != 16 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("query optimization has an invalid source fingerprint".into());
+    }
+
+    let shapes = read_csv(&format!("{QUERY_OPTIMIZATION}/shapes.csv"))?;
+    let expected_shapes = lookup(&freeze, "cases")?.parse::<usize>()?;
+    if shapes.len() != expected_shapes {
+        return Err("query optimization shape count disagrees with its freeze".into());
+    }
+    let mut shape_keys = BTreeSet::new();
+    let mut case_shapes = BTreeMap::<String, BTreeSet<(usize, String)>>::new();
+    let mut case_meta = BTreeMap::<String, (String, String, String)>::new();
+    let mut shape_pages = BTreeMap::<(String, String, String), usize>::new();
+    let mut shape_predicates = BTreeMap::<(String, String, String), usize>::new();
+    for row in &shapes {
+        let case = shapes.field(row, "case")?;
+        let split = shapes.field(row, "split")?;
+        let group = shapes.field(row, "group")?;
+        let source = shapes.field(row, "source")?;
+        let page_rows = shapes.field(row, "page_rows")?.parse::<usize>()?;
+        let layout = shapes.field(row, "layout")?;
+        let rows = shapes.field(row, "rows")?.parse::<usize>()?;
+        let pages = shapes.field(row, "pages")?.parse::<usize>()?;
+        let multi_page_regions = shapes.field(row, "multi_page_regions")?.parse::<usize>()?;
+        let globally_ordered = shapes.field(row, "global_ordered")?;
+        if shapes.field(row, "rule_fingerprint")? != fingerprint
+            || !matches!(page_rows, 1_024 | 16_384)
+            || !matches!(layout.as_str(), "direct" | "whole" | "payload" | "compact")
+            || (page_rows == 1_024 && layout != "direct")
+            || rows == 0
+            || pages != rows.div_ceil(page_rows)
+            || !matches!(globally_ordered.as_str(), "true" | "false")
+        {
+            return Err("query optimization contains an invalid shape".into());
+        }
+        let shape_key = (case.clone(), page_rows, layout.clone());
+        if !shape_keys.insert(shape_key) {
+            return Err("query optimization contains a duplicate shape".into());
+        }
+        case_shapes
+            .entry(case.clone())
+            .or_default()
+            .insert((page_rows, layout.clone()));
+        let metadata = (split.clone(), group.clone(), source.clone());
+        if case_meta
+            .insert(case.clone(), metadata.clone())
+            .is_some_and(|old| old != metadata)
+        {
+            return Err("one query optimization case has inconsistent source metadata".into());
+        }
+        shape_pages.insert((case.clone(), page_rows.to_string(), layout.clone()), pages);
+        shape_predicates.insert(
+            (case.clone(), page_rows.to_string(), layout.clone()),
+            shapes.field(row, "predicates")?.parse()?,
+        );
+        let _ = multi_page_regions;
+    }
+    let natural_cases: BTreeSet<_> = case_meta
+        .iter()
+        .filter(|(_, (split, _, _))| split != "synthetic")
+        .map(|(case, _)| case.clone())
+        .collect();
+    let natural_sources: BTreeSet<_> = case_meta
+        .values()
+        .filter(|(split, _, _)| split != "synthetic")
+        .map(|(_, group, source)| (group.clone(), source.clone()))
+        .collect();
+    if natural_cases.len() != lookup(&freeze, "pairs")?.parse::<usize>()?
+        || natural_sources.len() != lookup(&freeze, "sources")?.parse::<usize>()?
+    {
+        return Err("query optimization source counts disagree with its freeze".into());
+    }
+    let expected_shapes = BTreeSet::from([
+        (1_024, "direct".to_string()),
+        (16_384, "direct".to_string()),
+        (16_384, "whole".to_string()),
+        (16_384, "payload".to_string()),
+        (16_384, "compact".to_string()),
+    ]);
+    for (case, shapes) in &case_shapes {
+        let expected = if case_meta[case].0 == "synthetic" {
+            BTreeSet::from([(1_024, "direct".to_string())])
+        } else {
+            expected_shapes.clone()
+        };
+        if shapes != &expected {
+            return Err("query optimization case has incomplete layout coverage".into());
+        }
+    }
+
+    const ARMS: [&str; 11] = [
+        "facts_default",
+        "facts_prepared",
+        "facts_regions",
+        "facts_regions_prepared",
+        "zonemapplus_default",
+        "zonemapplus_prepared",
+        "zonemapplus_regions",
+        "zonemapplus_regions_prepared",
+        "facts_cost_prepared",
+        "zonemapplus_cost_prepared",
+        "scan_prepared",
+    ];
+    let queries = read_csv(&format!("{QUERY_OPTIMIZATION}/queries.csv"))?;
+    let mut query_cells =
+        BTreeMap::<(String, String, String, String), BTreeMap<String, (f64, String, String)>>::new(
+        );
+    let mut query_shape_counts = BTreeMap::<(String, String, String), usize>::new();
+    for row in &queries {
+        let case = queries.field(row, "case")?;
+        let page_rows = queries.field(row, "page_rows")?;
+        let layout = queries.field(row, "layout")?;
+        let predicate = queries.field(row, "predicate")?;
+        let arm = queries.field(row, "arm")?;
+        let key = (case.clone(), page_rows.clone(), layout.clone(), predicate);
+        let pages = *shape_pages
+            .get(&(case.clone(), page_rows.clone(), layout.clone()))
+            .ok_or("query optimization query refers to an unknown shape")?;
+        if !ARMS.contains(&arm.as_str()) || queries.field(row, "rule_fingerprint")? != fingerprint {
+            return Err("query optimization query has an unknown arm or fingerprint".into());
+        }
+        let expected_sum = queries.field(row, "expected_sum")?;
+        let expected_count = queries.field(row, "expected_count")?;
+        let sum = queries.field(row, "sum")?;
+        let matched = queries.field(row, "matched")?;
+        if expected_sum != sum || expected_count != matched {
+            return Err("query optimization arm disagrees with the exact answer".into());
+        }
+        let times = ["p25_ns", "median_ns", "p75_ns"]
+            .map(|name| queries.field(row, name)?.parse::<f64>().map_err(Into::into))
+            .into_iter()
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        if times.iter().any(|time| !time.is_finite() || *time <= 0.0)
+            || times[0] > times[1]
+            || times[1] > times[2]
+        {
+            return Err("query optimization contains an invalid timing".into());
+        }
+        let candidate_pages = queries.field(row, "candidate_pages")?.parse::<usize>()?;
+        let mut action_pages = 0;
+        for name in ["skipped", "accepted", "searched", "translated", "scanned"] {
+            action_pages += queries.field(row, name)?.parse::<usize>()?;
+        }
+        if candidate_pages > pages || action_pages != pages {
+            return Err("query optimization page actions do not sum to pages".into());
+        }
+        let arms = query_cells.entry(key).or_default();
+        let first_arm_for_predicate = arms.is_empty();
+        if arms
+            .insert(arm, (times[1], expected_sum, expected_count))
+            .is_some()
+        {
+            return Err("query optimization contains a duplicate arm cell".into());
+        }
+        if first_arm_for_predicate {
+            *query_shape_counts
+                .entry((case, page_rows, layout))
+                .or_default() += 1;
+        }
+    }
+    if query_cells
+        .values()
+        .any(|arms| arms.len() != ARMS.len() || ARMS.iter().any(|arm| !arms.contains_key(*arm)))
+    {
+        return Err("query optimization has incomplete planner coverage".into());
+    }
+    for ((case, page_rows, layout), predicates) in &query_shape_counts {
+        if *predicates
+            != *shape_predicates
+                .get(&(case.clone(), page_rows.clone(), layout.clone()))
+                .ok_or("query optimization shape is missing")?
+        {
+            return Err("query optimization predicate count disagrees with its shape".into());
+        }
+    }
+    if query_shape_counts.len() != shape_keys.len() {
+        return Err("query optimization is missing query cells for a shape".into());
+    }
+
+    const TOTAL_ARMS: [&str; 6] = [
+        "facts_default",
+        "facts_prepared",
+        "facts_regions_prepared",
+        "zonemapplus_default",
+        "zonemapplus_prepared",
+        "zonemapplus_regions_prepared",
+    ];
+    const REPETITIONS: [usize; 6] = [1, 2, 4, 8, 16, 32];
+    let totals = read_csv(&format!("{QUERY_OPTIMIZATION}/totals.csv"))?;
+    let mut total_cells = BTreeMap::<
+        (String, String, String, String, usize),
+        BTreeMap<String, (String, String)>,
+    >::new();
+    for row in &totals {
+        let case = totals.field(row, "case")?;
+        let page_rows = totals.field(row, "page_rows")?;
+        let layout = totals.field(row, "layout")?;
+        let predicate = totals.field(row, "predicate")?;
+        let repetitions = totals.field(row, "repetitions")?.parse::<usize>()?;
+        let arm = totals.field(row, "arm")?;
+        let key = (
+            case.clone(),
+            page_rows.clone(),
+            layout.clone(),
+            predicate.clone(),
+            repetitions,
+        );
+        if !TOTAL_ARMS.contains(&arm.as_str())
+            || !REPETITIONS.contains(&repetitions)
+            || layout != "direct"
+            || totals.field(row, "rule_fingerprint")? != fingerprint
+        {
+            return Err("query optimization has an invalid total cell".into());
+        }
+        let expected = query_cells
+            .get(&(case, page_rows, layout, predicate))
+            .and_then(|arms| arms.get("facts_default"))
+            .ok_or("query optimization total has no matching exact query")?;
+        let sum = totals.field(row, "sum")?;
+        let matched = totals.field(row, "matched")?;
+        if sum != expected.1 || matched != expected.2 {
+            return Err("query optimization total disagrees with the exact answer".into());
+        }
+        let times = ["p25_ns", "median_ns", "p75_ns"]
+            .map(|name| totals.field(row, name)?.parse::<f64>().map_err(Into::into))
+            .into_iter()
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        if times.iter().any(|time| !time.is_finite() || *time <= 0.0)
+            || times[0] > times[1]
+            || times[1] > times[2]
+        {
+            return Err("query optimization total contains an invalid timing".into());
+        }
+        if total_cells
+            .entry(key)
+            .or_default()
+            .insert(arm, (sum, matched))
+            .is_some()
+        {
+            return Err("query optimization contains a duplicate total cell".into());
+        }
+    }
+    for (case, page_rows, layout, predicate) in query_cells.keys() {
+        if layout != "direct" {
+            continue;
+        }
+        for repetitions in REPETITIONS {
+            let arms = total_cells
+                .get(&(
+                    case.clone(),
+                    page_rows.clone(),
+                    layout.clone(),
+                    predicate.clone(),
+                    repetitions,
+                ))
+                .ok_or("query optimization lacks a repeated-query total cell")?;
+            if arms.len() != TOTAL_ARMS.len()
+                || TOTAL_ARMS.iter().any(|arm| !arms.contains_key(*arm))
+            {
+                return Err("query optimization has incomplete total-arm coverage".into());
+            }
+        }
+    }
+    let expected_total_keys = query_cells
+        .keys()
+        .filter(|(_, _, layout, _)| layout == "direct")
+        .count()
+        * REPETITIONS.len();
+    if total_cells.len() != expected_total_keys {
+        return Err("query optimization total matrix has unexpected cells".into());
+    }
+
+    // The warm direct-layout comparison is paired by predicate and clustered
+    // by source, so multiple selectors from one table do not become
+    // independent source observations.
+    let mut prepared_by_source = BTreeMap::<(String, String), Vec<f64>>::new();
+    let mut heldout_pairs = BTreeSet::new();
+    for ((case, _page_rows, layout, _), arms) in &query_cells {
+        let Some((split, group, source)) = case_meta.get(case) else {
+            return Err("query optimization case has no source metadata".into());
+        };
+        if split == "heldout" && layout == "direct" {
+            heldout_pairs.insert(case.clone());
+            if let Some((prepared, _, _)) = arms.get("facts_prepared")
+                && let Some((default, _, _)) = arms.get("facts_default")
+            {
+                prepared_by_source
+                    .entry((group.clone(), source.clone()))
+                    .or_default()
+                    .push(prepared / default);
+            }
+        }
+    }
+    let source_geomeans: Vec<_> = prepared_by_source
+        .values()
+        .map(|ratios| geometric_mean(ratios))
+        .collect();
+    if source_geomeans.is_empty() || prepared_by_source.len() < 2 {
+        return Err("query optimization lacks independent held-out sources".into());
+    }
+    let (ci_low, ci_high) = source_bootstrap_geometric_ci(&source_geomeans, 1_000);
+    define(out, "WitOptPairs", &lookup(&freeze, "pairs")?.clone());
+    define(out, "WitOptSources", &lookup(&freeze, "sources")?.clone());
+    define(out, "WitOptRuleFingerprint", &fingerprint);
+    define(out, "WitOptHeldoutPairs", &heldout_pairs.len().to_string());
+    define(
+        out,
+        "WitOptHeldoutSources",
+        &prepared_by_source.len().to_string(),
+    );
+    define(
+        out,
+        "WitOptPreparedHeldoutSourceRatio",
+        &format!("{:.3}", geometric_mean(&source_geomeans)),
+    );
+    define(out, "WitOptPreparedHeldoutCiLow", &format!("{ci_low:.3}"));
+    define(out, "WitOptPreparedHeldoutCiHigh", &format!("{ci_high:.3}"));
+
+    // Plot each synthetic scaling arm from the same completed diagnostic.
+    // Resident warm time excludes setup for every arm; setup and repeated
+    // queries are separately charged in totals.csv.
+    let plotted_arms = [
+        ("Default", "facts_default"),
+        ("Regions", "facts_regions"),
+        ("PreparedRegions", "facts_regions_prepared"),
+        ("ZonePlusPreparedRegions", "zonemapplus_regions_prepared"),
+    ];
+    for (suffix, requested) in [("Tenth", "0.001"), ("Fifty", "0.500")] {
+        for (label, arm) in plotted_arms {
+            let mut points = BTreeMap::<usize, f64>::new();
+            for row in &queries {
+                if queries.field(row, "requested")? != requested
+                    || queries.field(row, "arm")? != arm
+                    || queries.field(row, "page_rows")? != "1024"
+                    || queries.field(row, "layout")? != "direct"
+                {
+                    continue;
+                }
+                let case = queries.field(row, "case")?;
+                let Some(("synthetic", _, source)) = case_meta
+                    .get(&case)
+                    .map(|v| (v.0.as_str(), v.1.as_str(), v.2.as_str()))
+                else {
+                    continue;
+                };
+                let Some(pages) = source
+                    .strip_prefix("four_batches_")
+                    .and_then(|n| n.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                let median_ns = queries.field(row, "median_ns")?.parse::<f64>()?;
+                if points.insert(pages, median_ns / 1e6).is_some() {
+                    return Err("query optimization plot has duplicate scaling points".into());
+                }
+            }
+            if points.keys().copied().collect::<Vec<_>>() != [64, 512, 4_096] {
+                return Err("query optimization plot lacks a synthetic scale point".into());
+            }
+            let coordinates = points
+                .iter()
+                .map(|(pages, milliseconds)| format!("({pages},{milliseconds:.6})"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            define(
+                out,
+                &format!("WitOptRegion{label}{suffix}Plot"),
+                &coordinates,
+            );
+        }
+    }
+    let selected_case = case_meta
+        .iter()
+        .find(|(_, (split, _, source))| split == "synthetic" && source == "four_batches_4096")
+        .map(|(case, _)| case.clone())
+        .ok_or("query optimization lacks its 4,096-page synthetic case")?;
+    let selective = query_cells
+        .iter()
+        .find(|((case, page_rows, layout, predicate), _)| {
+            case == &selected_case && page_rows == "1024" && layout == "direct" && predicate == "0"
+        })
+        .map(|(_, arms)| arms)
+        .ok_or("query optimization lacks its selective 4,096-page cell")?;
+    let prepared = selective
+        .get("facts_regions_prepared")
+        .ok_or("prepared regional arm is missing")?;
+    let unprepared = selective
+        .get("facts_regions")
+        .ok_or("unprepared regional arm is missing")?;
+    let requested = queries
+        .iter()
+        .find(|row| {
+            queries.field(row, "case").ok().as_deref() == Some(selected_case.as_str())
+                && queries.field(row, "predicate").ok().as_deref() == Some("0")
+        })
+        .ok_or("query optimization lacks the selective predicate metadata")?;
+    if queries.field(requested, "requested")? != "0.001" {
+        return Err("query optimization selective synthetic cell is not 0.1%".into());
+    }
+    let prepared_ratio = prepared.0 / unprepared.0;
+    define(
+        out,
+        "WitOptPreparedSelectiveSpeedup",
+        &format!("{:.2}", 1.0 / prepared_ratio),
+    );
+    define(
+        out,
+        "WitOptPreparedSelectiveRatio",
+        &format!("{prepared_ratio:.3}"),
+    );
+    define(out, "WitOptRegionPages", "4,096");
+    define(out, "WitOptPageRows", "1,024");
+    define(out, "WitOptRounds", &lookup(&freeze, "rounds")?.clone());
+    Ok(())
+}
+
+fn source_bootstrap_geometric_ci(values: &[f64], repetitions: usize) -> (f64, f64) {
+    assert!(!values.is_empty());
+    let mut state = 0x6a09_e667_f3bc_c909_u64;
+    let mut estimates = Vec::with_capacity(repetitions);
+    let mut sample = Vec::with_capacity(values.len());
+    for _ in 0..repetitions {
+        sample.clear();
+        for _ in 0..values.len() {
+            sample.push(values[xorshift64(&mut state) as usize % values.len()]);
+        }
+        estimates.push(geometric_mean(&sample));
+    }
+    estimates.sort_by(f64::total_cmp);
+    (
+        estimates[(repetitions * 25 / 1_000).min(repetitions - 1)],
+        estimates[(repetitions * 975 / 1_000).min(repetitions - 1)],
+    )
 }
 
 /// A separate, explicitly confirmed diagnostic: resident native-container
@@ -5375,5 +5834,14 @@ mod tests {
     fn cluster_bootstrap_collapses_on_a_degenerate_sample() {
         let clusters = vec![vec![0.42, 0.42], vec![0.42], vec![0.42, 0.42, 0.42]];
         assert_eq!(cluster_bootstrap_median_ci(&clusters, 500), (0.42, 0.42));
+    }
+
+    #[test]
+    fn source_geometric_bootstrap_is_bounded_and_reproducible() {
+        let values = [0.8, 0.9, 1.0, 1.1, 1.2];
+        let interval = source_bootstrap_geometric_ci(&values, 1_000);
+        assert!(interval.0 <= interval.1);
+        assert!(interval.0 >= 0.8 && interval.1 <= 1.2);
+        assert_eq!(interval, source_bootstrap_geometric_ci(&values, 1_000));
     }
 }

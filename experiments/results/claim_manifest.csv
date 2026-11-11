@@ -750,3 +750,24 @@ WitRegionBatches,4
 WitRegionRounds,9
 WitRegionSelectiveCandidates,8
 WitRegionSelectiveSpeedup,48.6
+WitOptPairs,364
+WitOptSources,63
+WitOptRuleFingerprint,c32bdf9a1fb23e74
+WitOptHeldoutPairs,293
+WitOptHeldoutSources,50
+WitOptPreparedHeldoutSourceRatio,0.992
+WitOptPreparedHeldoutCiLow,0.991
+WitOptPreparedHeldoutCiHigh,0.994
+WitOptRegionDefaultTenthPlot,"(64,0.017578) (512,0.107548) (4096,0.928258)"
+WitOptRegionRegionsTenthPlot,"(64,0.007886) (512,0.009756) (4096,0.023005)"
+WitOptRegionPreparedRegionsTenthPlot,"(64,0.007727) (512,0.008501) (4096,0.010848)"
+WitOptRegionZonePlusPreparedRegionsTenthPlot,"(64,0.007411) (512,0.008144) (4096,0.010482)"
+WitOptRegionDefaultFiftyPlot,"(64,0.035707) (512,0.300219) (4096,2.925687)"
+WitOptRegionRegionsFiftyPlot,"(64,0.030444) (512,0.246376) (4096,2.406501)"
+WitOptRegionPreparedRegionsFiftyPlot,"(64,0.030226) (512,0.241906) (4096,2.282815)"
+WitOptRegionZonePlusPreparedRegionsFiftyPlot,"(64,0.026842) (512,0.211769) (4096,1.780224)"
+WitOptPreparedSelectiveSpeedup,2.12
+WitOptPreparedSelectiveRatio,0.472
+WitOptRegionPages,"4,096"
+WitOptPageRows,"1,024"
+WitOptRounds,9

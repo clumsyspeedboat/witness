@@ -9,6 +9,11 @@
 //! a fact that holds on some pages but not the column, a column that grows
 //! by appending pages, and work that runs on pages in parallel.
 
+mod access_cost;
+mod prepared;
+
+pub use prepared::{PreparedAggregate, PreparedSum};
+
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -92,6 +97,8 @@ struct RootFacts {
     /// carry through it. The reader confirms that order before a planner
     /// uses any of them.
     ordered: Option<RootDictionary>,
+    /// Structural access work, prepared independently of predicate timings.
+    access_cost: access_cost::AccessCost,
 }
 
 /// A dictionary whose entries are a page's non-null values: the page's
@@ -150,6 +157,7 @@ impl RootFacts {
             dictionary,
             listed: root_dictionary(decoder, false),
             ordered,
+            access_cost: access_cost::AccessCost::gather(column, ordered)?,
         })
     }
 }
@@ -854,6 +862,9 @@ pub enum Planning {
     /// Every fact the page proves: bounds to skip and accept, order to
     /// search, a sorted dictionary to translate, the column certificate.
     Facts,
+    /// Facts with a structural access-cost gate that may prefer a scan to
+    /// a licensed search or code translation. The fixed ablation is unchanged.
+    FactsCost,
     ScanOnly,
     /// A plain zone map: exact per-page minima and maxima stored by the
     /// writer, used to skip and accept pages and nothing else. It isolates
@@ -870,6 +881,9 @@ pub enum Planning {
     /// `Facts` uses. Against `Facts` it isolates stored against derived
     /// bounds with the shortcuts held equal.
     StoredStatisticsPlus,
+    /// The same access-cost gate as `FactsCost`, with stored bounds and
+    /// exactly the same encoding shortcuts and executor.
+    StoredStatisticsPlusCost,
     /// A zone map's skips and accepts plus a dictionary filter, as Parquet
     /// readers prune by a dictionary page: a page whose dictionary holds no
     /// entry in the predicate is skipped without its ids being read. Entries
@@ -889,10 +903,12 @@ impl Planning {
     pub fn label(self) -> &'static str {
         match self {
             Self::Facts => "facts",
+            Self::FactsCost => "facts_cost",
             Self::ScanOnly => "scan",
             Self::StoredStatistics => "zonemap",
             Self::FactBounds => "factbounds",
             Self::StoredStatisticsPlus => "zonemapplus",
+            Self::StoredStatisticsPlusCost => "zonemapplus_cost",
             Self::StoredStatisticsDictionary => "zonemapdict",
             Self::DerivedFooter => "footer",
         }
@@ -904,6 +920,7 @@ impl Planning {
             self,
             Self::StoredStatistics
                 | Self::StoredStatisticsPlus
+                | Self::StoredStatisticsPlusCost
                 | Self::StoredStatisticsDictionary
                 | Self::DerivedFooter
         )
@@ -911,13 +928,25 @@ impl Planning {
 
     /// Whether bounds derived from the encoding decide skips and accepts.
     pub fn uses_bounds(self) -> bool {
-        matches!(self, Self::Facts | Self::FactBounds)
+        matches!(self, Self::Facts | Self::FactsCost | Self::FactBounds)
     }
 
     /// Whether encoding facts may license a search, a code translation, or
     /// the column certificate.
     pub fn uses_shortcuts(self) -> bool {
-        matches!(self, Self::Facts | Self::StoredStatisticsPlus)
+        matches!(
+            self,
+            Self::Facts
+                | Self::FactsCost
+                | Self::StoredStatisticsPlus
+                | Self::StoredStatisticsPlusCost
+        )
+    }
+
+    /// Whether a licensed search/translation may be declined based on the
+    /// same structural work estimate, regardless of the source of bounds.
+    pub fn uses_costs(self) -> bool {
+        matches!(self, Self::FactsCost | Self::StoredStatisticsPlusCost)
     }
 
     /// Whether a page's dictionary entries, tested one by one, may skip a
@@ -985,7 +1014,13 @@ pub fn plan_between_unchecked(
             action => action,
         }
     };
-    Ok(action)
+    Ok(
+        if planning.uses_costs() && page.plan.access_cost.prefers_scan(&action) {
+            PageAction::Scan
+        } else {
+            action
+        },
+    )
 }
 
 /// Whether `licence` cites the order-preserving mapping of a dictionary: the
@@ -1956,9 +1991,22 @@ pub fn sum_where_live_in(
 }
 
 fn sum_where_with(
-    (selector, selector_store): (&PagedColumn, &dyn PageStore),
-    (value, value_store): (&PagedColumn, &dyn PageStore),
+    selector: (&PagedColumn, &dyn PageStore),
+    value: (&PagedColumn, &dyn PageStore),
     deleted: Option<&DeletionVector>,
+    bounds: (i64, i64),
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    if bounds.0 > bounds.1 {
+        return Err("BETWEEN needs low <= high".into());
+    }
+    prepared::PreparedSum::from_parts(selector, value, deleted)?
+        .execute(bounds.0, bounds.1, planning, threads)
+}
+
+fn sum_where_prepared(
+    prepared: &prepared::PreparedSum<'_>,
     (low, high): (i64, i64),
     planning: Planning,
     threads: usize,
@@ -1966,15 +2014,9 @@ fn sum_where_with(
     if low > high {
         return Err("BETWEEN needs low <= high".into());
     }
-    if selector.rows != value.rows
-        || selector.page_rows != value.page_rows
-        || selector.pages.len() != value.pages.len()
-    {
-        return Err("SUM WHERE needs two columns paged alike".into());
-    }
-    if let Some(deleted) = deleted {
-        deleted.check(selector)?;
-    }
+    let (selector, selector_store) = prepared.selector;
+    let (value, value_store) = prepared.value;
+    let deleted = prepared.deleted;
     let dead = |index: usize| deleted.and_then(|deleted| deleted.page(index));
     // Every page is planned first, then only pages left with work are
     // executed; both phases share the worker pool, so a query that skips
@@ -1992,14 +2034,6 @@ fn sum_where_with(
     };
     counts.add(&candidates.reads);
     counts.skipped += selector.pages.len() - candidates.len();
-    if selector
-        .pages
-        .iter()
-        .zip(&value.pages)
-        .any(|(left, right)| left.start != right.start || left.rows() != right.rows())
-    {
-        return Err("SUM WHERE pages cover different rows".into());
-    }
     if selector_store.plans_from_page_reads() {
         // Each candidate page is read once: planned from that read, and
         // executed from it unless its plan skips it.
@@ -2276,40 +2310,19 @@ fn aggregate_where_with(
     planning: Planning,
     threads: usize,
 ) -> Result<(i128, usize, PageCounts), String> {
-    let Some(first) = conjuncts.first() else {
-        return Err("a conjunctive query needs a conjunct".into());
-    };
-    let shape = first.column;
-    let mut columns = conjuncts
-        .iter()
-        .map(|conjunct| conjunct.column)
-        .collect::<Vec<_>>();
-    match aggregate {
-        Aggregate::Count => {}
-        Aggregate::Sum(value) => columns.push(value),
-        Aggregate::SumProduct(left, right) => columns.extend([left, right]),
-    }
-    for column in &columns {
-        if column.rows != shape.rows
-            || column.page_rows != shape.page_rows
-            || column.pages.len() != shape.pages.len()
-            || column
-                .pages
-                .iter()
-                .zip(&shape.pages)
-                .any(|(page, other)| page.start != other.start || page.rows() != other.rows())
-        {
-            return Err("a conjunctive query needs columns paged alike".into());
-        }
-    }
-    for conjunct in conjuncts {
-        if conjunct.low > conjunct.high {
-            return Err("BETWEEN needs low <= high".into());
-        }
-    }
-    if let Some(deleted) = deleted {
-        deleted.check(shape)?;
-    }
+    let aligned = prepared::AlignedAggregate::new(conjuncts, aggregate, deleted)?;
+    aggregate_where_prepared(&aligned, planning, threads)
+}
+
+fn aggregate_where_prepared(
+    prepared: &prepared::AlignedAggregate<'_, '_>,
+    planning: Planning,
+    threads: usize,
+) -> Result<(i128, usize, PageCounts), String> {
+    let conjuncts = prepared.conjuncts;
+    let shape = conjuncts[0].column;
+    let aggregate = prepared.aggregate;
+    let deleted = prepared.deleted;
     // An ordered column narrows the pages any conjunct on it can match.
     let mut candidates = PageCandidates::all(shape.pages.len());
     if planning.uses_shortcuts() {

@@ -1,5 +1,5 @@
 # Witness: build, test, and reproduce the study.
-.PHONY: build test core-test fetch-study claims walkthrough diagnostics reproduce
+.PHONY: build test core-test fetch-study claims walkthrough diagnostics reproduce verify
 
 build:
 	cargo build --locked --release --features experiment
@@ -32,3 +32,7 @@ diagnostics:
 
 reproduce:
 	./reproduce.sh
+
+# Fast reviewer path: committed evidence and executable checks, no corpus download.
+verify:
+	./experiments/verify_artifact.sh

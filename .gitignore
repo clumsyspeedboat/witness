@@ -35,3 +35,13 @@
 
 # Local assistant worktrees and state.
 /.claude/
+
+# Local Python environment and analysis caches.
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+
+# Local monitoring symlinks and unpromoted engineering diagnostics.
+/experiments/results/full_runs/
+/experiments/results/query_optimization/*
+!/experiments/results/query_optimization/confirmed/
