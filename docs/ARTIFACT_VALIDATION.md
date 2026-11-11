@@ -16,7 +16,17 @@ the exported source was rebuilt and tested at the new checkout path.
   retained; fresh timing values depend on the reviewer's machine.
 
 The root README documents the tested fast path and the separate full run.
-The `icde2027-submission` tag identifies the fixed submission snapshot. No
+The `v1.0.0` tag identifies the final ICDE submission snapshot;
+`icde2027-submission` preserves the preceding packaging snapshot. No
 manuscript PDF, TeX source, review notes, or downloaded comparison papers are
 included. Historical Git objects remain available; use the documented shallow
 clone or the release source archive to avoid fetching development history.
+
+Final manuscript audit: all 705 claim definitions match canonical values; 179
+are referenced by the current manuscript. Independent calculations reproduce
+headline ratios and mutation counts. The final PDF matches a fresh source build.
+49 targeted code/paper tests passed. No full benchmark rerun was performed.
+Independent asset/statistical checks also reproduce the five figure renders,
+11 external table sources, Figure 4 group counts/ratios, and a consistent
+source-cluster bootstrap interval. The audit is evidence reconciliation, not
+a mechanical proof of all claims or an independent rerun of every experiment.

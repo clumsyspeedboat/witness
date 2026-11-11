@@ -1,6 +1,6 @@
 [package]
 name = "witness"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 description = "Research demonstrator: deriving typed invariants from composed columnar encodings and compiling queries that exploit them."
 license = "Apache-2.0"

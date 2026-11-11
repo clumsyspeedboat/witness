@@ -2,6 +2,10 @@
 
 Research artifact for *What an Encoding Knows*.
 
+Fixed ICDE 2027 submission snapshot: **[v1.0.0](https://github.com/clumsyspeedboat/witness/releases/tag/v1.0.0)**.
+Use `--branch v1.0.0` instead of `--branch main` in the clone command below
+to reproduce the submission version independently of future updates.
+
 Witness derives bounds, order, and dictionary mappings through composed codecs,
 tracks their row scope and evidence source, and checks the query actions that
 use them. The artifact includes the implementation, tests, frozen generated
